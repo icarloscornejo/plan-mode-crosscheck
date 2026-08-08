@@ -1,0 +1,13 @@
+{
+  "name": "plan-mode-crosscheck",
+  "owner": {
+    "name": "Carlos Cornejo"
+  },
+  "plugins": [
+    {
+      "name": "plan-mode-crosscheck",
+      "source": "./",
+      "description": "Independent Codex CLI research injected as context during Plan Mode."
+    }
+  ]
+}

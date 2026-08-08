@@ -1,0 +1,16 @@
+{
+  "description": "Plan Mode Crosscheck: independent Codex CLI research injected as additionalContext during Plan Mode.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

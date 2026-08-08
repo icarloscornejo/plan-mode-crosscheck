@@ -1,0 +1,19 @@
+{
+  "name": "plan-mode-crosscheck",
+  "displayName": "Plan Mode Crosscheck",
+  "version": "1.0.0",
+  "description": "During Plan Mode, sends your prompt to an independent Codex CLI model (read-only sandbox) to research the repo in parallel, then injects its findings as additional context before Claude drafts the plan. Requires Codex CLI installed and logged in with ChatGPT.",
+  "author": {
+    "name": "Carlos Cornejo"
+  },
+  "homepage": "https://github.com/icarloscornejo/plan-mode-crosscheck",
+  "repository": "https://github.com/icarloscornejo/plan-mode-crosscheck",
+  "license": "MIT",
+  "keywords": [
+    "plan-mode",
+    "codex",
+    "second-opinion",
+    "claude-code",
+    "research"
+  ]
+}
