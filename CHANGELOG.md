@@ -2,6 +2,20 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 2.0.1
+
+- Default `CROSSCHECK_EFFORT` changed from `high` to `medium`: live testing
+  after 2.0.0 showed `high` taking up to ~11 minutes on a resume-then-fresh
+  fallback (300s resume timeout, then a 646s fresh call), well past the
+  `CROSSCHECK_WAIT_SECS` window, so the research missed its own delivery
+  window. `medium` matches what the author already gets better results with
+  day to day.
+- Fixed a duration-reporting bug: when a `resume` call times out and falls
+  back to `fresh`, the background runner now resets its start clock before
+  the fresh attempt, instead of measuring the fresh call's duration from the
+  moment the failed resume started. The old behavior could log a `WARN` over
+  100% of budget for a fresh call that never actually ran that long.
+
 ## 2.0.0
 
 **Breaking change in behavior** (no config migration needed, same plugin

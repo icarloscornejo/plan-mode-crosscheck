@@ -88,7 +88,7 @@ All optional, all environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `CROSSCHECK_MODEL` | `gpt-5.6-sol` | Model passed to `codex exec -m`. |
-| `CROSSCHECK_EFFORT` | `high` | `model_reasoning_effort` passed to Codex. |
+| `CROSSCHECK_EFFORT` | `medium` | `model_reasoning_effort` passed to Codex. |
 | `CROSSCHECK_FRESH_TIMEOUT` | `600` | Budget (seconds) for a fresh Codex thread, running in the background. |
 | `CROSSCHECK_RESUME_TIMEOUT` | `300` | Budget (seconds) for resuming an existing thread. |
 | `CROSSCHECK_TIMEOUT` | unset | If set, overrides both of the above at once. |
@@ -159,7 +159,7 @@ auth problem, `auth=ok` in the same line confirms that. It means Codex
 didn't finish investigating within its budget. Since the actual call now
 runs in the background instead of blocking a hook, this should be rare; if
 you still hit it, either raise `CROSSCHECK_FRESH_TIMEOUT` /
-`CROSSCHECK_RESUME_TIMEOUT`, or lower `CROSSCHECK_EFFORT` to `medium` for a
+`CROSSCHECK_RESUME_TIMEOUT`, or lower `CROSSCHECK_EFFORT` to `low` for a
 faster (if shallower) pass.
 
 **No research ever shows up, and nothing useful in the log either.** Check

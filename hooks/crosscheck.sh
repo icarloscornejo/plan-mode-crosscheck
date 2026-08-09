@@ -439,7 +439,7 @@ run_research_job() {
   turns="$(jq -r '.turns // 0' "$spec_file" 2>/dev/null)"
   budget="$(jq -r '.budget // 300' "$spec_file" 2>/dev/null)"
   CROSSCHECK_MODEL="$(jq -r '.model // "gpt-5.6-sol"' "$spec_file" 2>/dev/null)"
-  CROSSCHECK_EFFORT="$(jq -r '.effort // "high"' "$spec_file" 2>/dev/null)"
+  CROSSCHECK_EFFORT="$(jq -r '.effort // "medium"' "$spec_file" 2>/dev/null)"
   state_file="$(jq -r '.state_file // empty' "$spec_file" 2>/dev/null)"
   research_file="$(jq -r '.research_file // empty' "$spec_file" 2>/dev/null)"
   done_file="$(jq -r '.done_file // empty' "$spec_file" 2>/dev/null)"
@@ -467,6 +467,11 @@ run_research_job() {
       log "resume of $tid failed (rc=$rc, auth=$(auth_status)), falling back to fresh (background), cwd=$cwd"
       rm -f "$json_file"
       kind="fresh"; tid=""; budget="$CROSSCHECK_FRESH_TIMEOUT"
+      # Reset the clock here: otherwise duration/pct below would count the
+      # failed resume's own time against the fresh call's budget, reporting
+      # a misleadingly inflated (even >100%) duration for work the fresh
+      # call never actually spent.
+      script_start_ts=$(date +%s)
       json_file="$(run_codex fresh "" "$budget")"
       rc=$?
       [ -n "$json_file" ] && TEMP_FILES+=("$json_file")
@@ -975,7 +980,7 @@ session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/nul
 command -v codex >/dev/null 2>&1 || { log "codex not found on PATH, skipping, cwd=$cwd"; exit 0; }
 
 CROSSCHECK_MODEL="${CROSSCHECK_MODEL:-gpt-5.6-sol}"
-CROSSCHECK_EFFORT="${CROSSCHECK_EFFORT:-high}"
+CROSSCHECK_EFFORT="${CROSSCHECK_EFFORT:-medium}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 # Prune state older than 7 days; best-effort, never fatal.
