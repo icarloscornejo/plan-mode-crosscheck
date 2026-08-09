@@ -1,5 +1,5 @@
 {
-  "description": "Plan Mode Crosscheck: independent Codex CLI research injected as additionalContext during Plan Mode.",
+  "description": "Plan Mode Crosscheck: independent Codex CLI research, launched in the background as soon as Plan Mode starts (manual Shift+Tab or Claude calling EnterPlanMode itself), delivered as blocking context when ExitPlanMode is about to run.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,7 +7,31 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh",
-            "timeout": 300
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "EnterPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh",
+            "timeout": 150
           }
         ]
       }
