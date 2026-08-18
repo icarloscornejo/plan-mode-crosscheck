@@ -1,8 +1,8 @@
 {
   "name": "plan-mode-crosscheck",
   "displayName": "Plan Mode Crosscheck",
-  "version": "2.0.1",
-  "description": "Launches an independent Codex CLI model (read-only sandbox) to research the repo in the background as soon as Plan Mode starts, manually or automatically, then delivers its findings as blocking context right before Claude would finalize the plan. Requires Codex CLI installed and logged in with ChatGPT.",
+  "version": "3.0.0",
+  "description": "Gates ExitPlanMode on an explicit decision about an independent Codex CLI audit of the finished plan (a separate model, read-only sandbox), offered via a crosscheck skill also invocable manually as /crosscheck at any point in a conversation. Requires Codex CLI installed and logged in with ChatGPT.",
   "author": {
     "name": "Carlos Cornejo"
   },

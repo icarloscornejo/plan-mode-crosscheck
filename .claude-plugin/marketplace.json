@@ -7,7 +7,7 @@
     {
       "name": "plan-mode-crosscheck",
       "source": "./",
-      "description": "Independent Codex CLI research injected as context during Plan Mode."
+      "description": "Independent Codex CLI audit of the finished Plan Mode plan, or on demand via /crosscheck."
     }
   ]
 }
