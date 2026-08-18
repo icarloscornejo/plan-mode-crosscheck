@@ -1,38 +1,34 @@
 # Plan Mode Crosscheck
 
-**Get an independent second opinion on your codebase before Claude finalizes
-a plan.** When Plan Mode starts, this plugin launches an independent model
-via [Codex CLI](https://github.com/openai/codex) (OpenAI's coding CLI,
-running in a read-only sandbox against your repo) in the background, at the
-same time Claude explores the repo itself. Just before Claude would show you
-the finished plan, the research is delivered back so Claude reconciles it
-into the plan first. Two independent takes on the same codebase, one plan.
+**Get an independent second opinion from [Codex CLI](https://github.com/openai/codex)
+(OpenAI's coding CLI, a separate model, a separate process, a read-only view of
+your repo) on a finished Plan Mode plan, or on whatever's being discussed right
+now.**
 
-Fires on **both** ways of entering Plan Mode:
-- Manual: you press Shift+Tab (or otherwise pre-select Plan Mode) before
-  typing.
-- Automatic: Claude decides mid-turn to call `EnterPlanMode` itself while
-  handling a request you sent in the default mode. (This is the common case
-  when your `CLAUDE.md` tells Claude to use Plan Mode proactively for
-  non-trivial tasks. It's also the route the plugin's first version missed
-  entirely, since `permission_mode` at the moment you submit a prompt is
-  still `"default"` right up until `EnterPlanMode` actually runs.)
+Two ways to trigger it:
 
-Genuinely parallel, not sequential: the `codex exec` call is launched
-detached the instant Plan Mode starts and runs for as long as it needs,
-while Claude does its own exploration in the same window. By the time Claude
-is ready to call `ExitPlanMode`, the research has usually been sitting
-finished for minutes already, so the delivery step is close to instant.
+- **Automatic, on `ExitPlanMode`.** When Claude finishes a plan and tries to
+  show it to you, this plugin denies that call once and asks Claude to check
+  with you first: do you want Codex to independently audit this plan before
+  you see it? Say yes and Claude runs the audit, reconciles anything it finds,
+  and shows you the plan. Say no and it shows you the plan as-is.
+- **Manual, `/crosscheck`, any time.** Ask for a second opinion mid-conversation
+  on whatever's currently being discussed, no plan required.
 
-Stateful across the Plan Mode session: the first prompt starts a fresh Codex
-thread, follow-up prompts resume that same thread, so the crosscheck model
-keeps its own research context instead of starting over each time. Threads
-auto-expire after 2 hours or 8 turns to keep them from drifting off-topic.
+Both routes run the same Codex CLI call, in the background, so you keep
+working (or reading) while it runs.
 
-Fails open: if Codex isn't installed, isn't logged in, times out, or errors
-in any way, the hook silently does nothing and Claude proceeds exactly as it
-would without this plugin. It never blocks Plan Mode for more than the wait
-budget below, and even that only delays `ExitPlanMode` once.
+## Why this shape, not "research the whole time in the background"
+
+Earlier versions of this plugin launched Codex the instant Plan Mode started
+and fed it whatever your most recent chat message happened to be, on the
+theory that running in parallel with Claude's own exploration was worth more
+than waiting. In practice that meant Codex was as likely to receive a bare
+"go ahead" or "sounds good" as an actual task description, and it would
+confidently investigate the wrong thing. A finished plan does not have that
+problem: it is, by construction, a complete, self-contained description of
+what's being built. Trading the parallelism for a research target that's
+actually worth researching turned out to be a better deal.
 
 ## Prerequisites
 
@@ -41,9 +37,9 @@ budget below, and even that only delays `ExitPlanMode` once.
   `Logged in using ChatGPT`.
 - `jq` installed (used for all JSON parsing).
 
-If either of the first two isn't true, the hook fails open silently, no error
-shown to you. Check `<state dir>/logs/crosscheck.log` (see below) if research
-never seems to show up.
+If either of the first two isn't true, `/crosscheck` and the plan-review flow
+will tell you so directly, a failed tool result, not a silent no-op. See
+[Failure handling](#failure-handling) below.
 
 ## Install
 
@@ -52,56 +48,67 @@ claude plugin marketplace add https://github.com/icarloscornejo/plan-mode-crossc
 claude plugin install plan-mode-crosscheck@plan-mode-crosscheck
 ```
 
-That's it: the hooks register automatically once the plugin is enabled, no
-manual edits to `settings.json`.
+That's it: the hook and the `crosscheck` skill register automatically once the
+plugin is enabled, no manual edits to `settings.json`.
 
 ## How it actually works
 
-Three hook registrations, one script (`hooks/crosscheck.sh`), dispatched by
-`hook_event_name`:
+One hook, one skill.
 
-1. **`UserPromptSubmit`** always runs first and caches your prompt text (so
-   the automatic route below has something to work with). If the session is
-   already in Plan Mode at this point (manual entry, or a follow-up prompt
-   mid-session), it also launches research in the background right away.
-2. **`PostToolUse`, matcher `EnterPlanMode`**: the automatic-entry route.
-   Picks up the prompt cached a moment ago and launches research in the
-   background, since `UserPromptSubmit` couldn't (the mode hadn't flipped
-   to `"plan"` yet when it ran).
-3. **`PreToolUse`, matcher `ExitPlanMode`**: the harvest. Polls for the
-   background research to finish (up to `CROSSCHECK_WAIT_SECS`, usually
-   near-instant since it's had minutes already), then **denies the
-   `ExitPlanMode` call once**, with the research as the deny reason. Claude
-   sees that, reconciles the plan against it, and calls `ExitPlanMode`
-   again, which this time is allowed straight through. You'll briefly see a
-   denied tool call in the transcript, that's expected, not an error.
+**Hook** (`hooks/crosscheck.sh`, `PreToolUse` on `ExitPlanMode`): pure bash and
+`jq`, no Codex call. It hashes the plan text (`tool_input.plan`) and checks a
+small state file for that hash:
 
-Whichever route launches, a fresh prompt always supersedes a prior in-flight
-one for the same session: the old background job is killed and its output
-discarded, so `ExitPlanMode` never delivers research for a question you're
-not asking anymore.
+- No decision on record yet: mark it `pending`, **deny** the `ExitPlanMode`
+  call with a reason telling Claude to ask you and invoke the `crosscheck`
+  skill.
+- Already `reviewed` or `skipped` for this exact plan text: **allow**.
+
+Because the hook never calls Codex itself, it returns in a fraction of a
+second every time. There's nothing to wait on.
+
+**Skill** (`skills/crosscheck/SKILL.md`, invoked by Claude after the deny, or
+by you via `/crosscheck`): assembles the actual request (the plan plus the
+original task, or whatever's live in the conversation for a manual
+`/crosscheck`), runs `hooks/crosscheck.sh --run` in the background via the
+`Bash` tool, waits for the result, and relays the findings to you in its own
+words rather than dumping the raw report. On the plan-review path, a
+successful run marks that plan's hash `reviewed`, which is what lets the next
+`ExitPlanMode` call through.
+
+If the plan changes after being reviewed or skipped, its hash changes too, and
+the whole cycle starts over for the new text. You can't silently carry a stale
+approval forward onto a plan that's since been edited.
+
+## Failure handling
+
+If Codex isn't installed, isn't logged in, or times out, `hooks/crosscheck.sh
+--run` exits nonzero and says why on stderr. This is not silent: the skill is
+instructed to tell you the audit failed and why, mark that plan's hash
+`skipped` so you aren't stuck waiting on a broken external tool, and continue.
+You always find out; you're never blocked indefinitely.
 
 ## Configuration
 
-All optional, all environment variables:
+All optional, all environment variables, read by `hooks/crosscheck.sh --run`:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CROSSCHECK_MODEL` | `gpt-5.6-sol` | Model passed to `codex exec -m`. |
-| `CROSSCHECK_EFFORT` | `medium` | `model_reasoning_effort` passed to Codex. |
-| `CROSSCHECK_FRESH_TIMEOUT` | `600` | Budget (seconds) for a fresh Codex thread, running in the background. |
-| `CROSSCHECK_RESUME_TIMEOUT` | `300` | Budget (seconds) for resuming an existing thread. |
-| `CROSSCHECK_TIMEOUT` | unset | If set, overrides both of the above at once. |
-| `CROSSCHECK_WAIT_SECS` | `120` | How long the `ExitPlanMode` harvest polls for research before giving up and allowing the call through unmodified. If you raise this, also raise the `timeout` on the `PreToolUse`/`ExitPlanMode` hook in `hooks/hooks.json` to match (it needs a little margin on top). |
+| `CROSSCHECK_EFFORT` | `medium` | `model_reasoning_effort` passed to Codex. See below for why this isn't `high` by default. |
+| `CROSSCHECK_TIMEOUT` | `600` | Budget, in seconds, for the Codex call. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
 
-**About the default model:** `gpt-5.6-sol` is what the author uses day to
-day; it may not be available on every Codex CLI account or region. If Codex
-fails with that default and you don't know why, set `CROSSCHECK_MODEL` to
-whatever model your own `codex exec` normally uses. If you need broader
-default-model support (auto-detecting what's available, or falling back to
-Codex's own configured default instead of forcing `-m`), please open a GitHub
-issue rather than assuming it's not welcome. It's just not built yet.
+**About the default model:** `gpt-5.6-sol` is what the author uses day to day;
+it may not be available on every Codex CLI account or region. If Codex fails
+with that default and you don't know why, set `CROSSCHECK_MODEL` to whatever
+model your own `codex exec` normally uses.
+
+**About the default effort:** `medium`, not `high`. Measured in practice,
+`high` reasoning effort took Codex up to roughly 11 minutes on some plan
+reviews. That's a real cost even with nothing else waiting on it, and one good
+result at `high` isn't evidence it's worth paying by default: set
+`CROSSCHECK_EFFORT=high` yourself if you want to try it for a specific review.
 
 ### Where logs and state live
 
@@ -114,27 +121,18 @@ Resolved in this order:
 
 Inside that directory: `logs/crosscheck.log` (structured, one line per run),
 `logs/crosscheck.stderr.log` (Codex's own stderr, timestamped and delimited
-per call), and `state/` (per Plan-Mode-session files: cached prompt,
-in-flight thread state, research body, and the small marker files that
-coordinate the background job with the `ExitPlanMode` harvest, all pruned
-after 7 days).
-
-## In-prompt escape hatches
-
-- `[nocheck]` anywhere in a prompt skips the crosscheck for that one prompt
-  only, without disabling the plugin for the rest of the session. Also
-  clears any cached prompt, so an automatic `EnterPlanMode` later in the
-  same turn doesn't end up researching an older, unrelated prompt instead.
-- `[freshcheck]` forces a brand-new Codex thread instead of resuming the
-  current one, useful if you've changed topic within the same Plan Mode
-  session and don't want stale context carried over.
-
-Both markers are stripped before the prompt reaches Codex.
+per call), and `state/`, one small JSON file per plan hash (`pending`,
+`reviewed`, or `skipped`), a `reports/` subdirectory holding the full text of
+every Codex report (so a large one that doesn't fit inline in a tool result is
+never lost, just pointed at), and a `tmp/` subdirectory the skill uses to stage
+prompt files before a run. Everything under `state/` is pruned after 7 days.
 
 ## Kill switch
 
 Touch `<state dir>/state/DISABLED` to disable the hook entirely until you
 remove that file. No restart needed; it's checked on every hook invocation.
+This does not affect manual `/crosscheck`, which is a separate, unblocked path
+by design.
 
 ## Verifying it works
 
@@ -142,44 +140,45 @@ remove that file. No restart needed; it's checked on every hook invocation.
 ${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh --selftest
 ```
 
-Runs the full pipeline (dispatch, background launch, dedup, the
-`ExitPlanMode` harvest and its deny/allow behavior, state persistence, byte
-budgeting) against a stubbed Codex binary, no real API calls, no ChatGPT
-auth needed, finishes in a few seconds. This is the fastest way to confirm
-the plugin's own logic works after any change. It does not confirm Codex CLI
-itself is installed and authenticated correctly, or that the real,
-end-to-end automatic and manual routes work inside an actual Claude Code
-session, for that, enter Plan Mode both ways for real and check
-`logs/crosscheck.log`.
+Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
+`--run` in both modes against a stubbed Codex binary, `--skip`, argument
+validation, state-root resolution) with no real API calls and no ChatGPT auth
+needed, finishes in a few seconds. This is the fastest way to confirm the
+plugin's own logic works after any change. It does not confirm Codex CLI
+itself is installed and authenticated, or that the skill behaves correctly
+inside an actual Claude Code session. For that, try both routes for real
+(`/crosscheck`, and a real Plan Mode session through to `ExitPlanMode`) and
+check `logs/crosscheck.log`.
 
 ## Troubleshooting
 
-**`codex exec (...) failed, rc=124` in the log.** `124` is a timeout, not an
-auth problem, `auth=ok` in the same line confirms that. It means Codex
-didn't finish investigating within its budget. Since the actual call now
-runs in the background instead of blocking a hook, this should be rare; if
-you still hit it, either raise `CROSSCHECK_FRESH_TIMEOUT` /
-`CROSSCHECK_RESUME_TIMEOUT`, or lower `CROSSCHECK_EFFORT` to `low` for a
+**Deny reason never shows up on `ExitPlanMode`, or shows up but Claude never
+asks me anything.** Confirm the hook is registered: `claude plugin list`
+should show `plan-mode-crosscheck` enabled, and changes to `hooks/hooks.json`
+need `/reload-plugins` or a restart to take effect (unlike `SKILL.md`, which
+applies immediately).
+
+**`crosscheck --run: codex exec failed` in the log.** Check `auth=` on the
+same log line: `auth=NOT_LOGGED_IN` means `codex login status` needs
+attention; `auth=ok` with a timeout means Codex didn't finish within
+`CROSSCHECK_TIMEOUT`, raise it, or lower `CROSSCHECK_EFFORT` to `low` for a
 faster (if shallower) pass.
 
-**No research ever shows up, and nothing useful in the log either.** Check
-`codex login status` and that `codex` and `jq` are both on `PATH` in the
-environment Claude Code's hooks actually run in (not just your interactive
-shell, some setups differ).
-
-**Research shows up for manual Plan Mode entry but not automatic entry, or
-vice versa.** Confirm both hook registrations are present in
-`hooks/hooks.json` (`PostToolUse`/`EnterPlanMode` for automatic,
-`UserPromptSubmit` for manual) and that your Claude Code version actually
-sends `hook_event_name` and `tool_name` on those events, this plugin depends
-on both.
+**`ExitPlanMode` keeps getting denied no matter what I answer.** The hash is
+keyed to the exact plan text. If Claude revises the plan after you say yes but
+before the audit finishes, or between reviews, that's a new hash and a fresh
+decision is expected. If it's denying without ever asking you anything, Claude
+isn't following the deny reason's instructions: check whether the `crosscheck`
+skill is actually being invoked (visible as a background `Bash` task with a
+descriptive label) rather than skipped.
 
 ## How it's different from just asking Claude twice
 
 Codex runs as a genuinely separate process, separate model, separate context
-window, with its own read-only view of the repo, running in parallel with
-Claude's own exploration rather than after it. It doesn't see Claude's
-reasoning and Claude doesn't see Codex's reasoning until the delivery step
-explicitly hands it over. The injected context tells Claude to treat the
-research as evidence to validate, not ground truth to repeat, so a Codex
-mistake doesn't silently become a Claude mistake.
+window, with its own read-only view of the repo. It doesn't see Claude's
+reasoning, and Claude doesn't see Codex's reasoning until the skill relays it.
+The plan-review prompt specifically instructs Codex to derive the task's real
+requirements from the repository itself before judging the plan, rather than
+just checking the plan for internal consistency. The goal is catching what the
+plan didn't think to mention, not just whether the plan is coherent on its own
+terms.
