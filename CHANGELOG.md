@@ -2,6 +2,25 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.0.1
+
+Live end-to-end testing of 3.0.0 (real `EnterPlanMode`/`ExitPlanMode` cycle,
+not just `--selftest` against a stubbed Codex) surfaced that the `crosscheck`
+skill was calling `${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh` from its own
+`Bash` tool calls, which fails: `CLAUDE_PLUGIN_ROOT` is only substituted
+inside `hooks.json`'s own command definitions, it is not exported into a bare
+`Bash` tool invocation the skill makes on its own. Confirmed live: `env` in
+that context has no `CLAUDE_PLUGIN_ROOT` at all.
+
+Fixed by adding `bin/crosscheck`, a thin wrapper that resolves the actual
+`hooks/crosscheck.sh` path relative to its own location rather than via any
+environment variable. Claude Code adds an enabled plugin's own `bin/`
+directory to `PATH`, so the skill now invokes a bare `crosscheck` command
+instead. The `README.md`'s own `--selftest` instructions had the same latent
+bug for a human running it from an arbitrary terminal (`CLAUDE_PLUGIN_ROOT`
+is a Claude-Code-hook-only substitution, not a real shell environment
+variable), fixed to use a repo-relative path instead.
+
 ## 3.0.0
 
 **Breaking change, full redesign of when and how the crosscheck runs.**

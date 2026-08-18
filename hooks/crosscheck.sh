@@ -8,7 +8,7 @@
 # ExitPlanMode once and trusting Claude to reconcile it. Both of those turned
 # out to be load-bearing mistakes: the "last raw prompt" is frequently a bare
 # acknowledgement ("vamos!") with none of the actual task in it, and "deny
-# once, then trust" is not an observable contract -- nothing stops Claude from
+# once, then trust" is not an observable contract: nothing stops Claude from
 # retrying ExitPlanMode without actually doing what the deny reason asked.
 #
 # v3 fixes both by moving the question to the one moment a coherent research
@@ -29,7 +29,7 @@
 #      it returns in well under its 15s hook timeout every time.
 #   2. `--run --mode research|plan-review --prompt-file PATH [--hash HASH]`:
 #      the actual Codex CLI call. Invoked by the `crosscheck` skill via the
-#      Bash tool with run_in_background, NOT by a hook -- so it can take as
+#      Bash tool with run_in_background, NOT by a hook, so it can take as
 #      long as it needs without racing any hook timeout. On success in
 #      plan-review mode, marks the given hash `reviewed`.
 #   3. `--skip --hash HASH`: marks a hash `skipped` without calling Codex, for
@@ -39,7 +39,7 @@
 # There is no thread reuse across calls. Every `--run` is a fresh Codex
 # thread. This is a deliberate downgrade from v2, not an oversight: v2's
 # fresh/resume thread lifecycle was the direct cause of a real, observed
-# failure mode -- Codex threads hold an exclusive local write lock, so two
+# failure mode: Codex threads hold an exclusive local write lock, so two
 # overlapping calls against the same thread id collide, and the resume
 # fallback silently converted that collision into a full-budget fresh call
 # with the accumulated context thrown away. With no reuse, there is no shared
@@ -50,7 +50,7 @@
 # Fails open on any Codex problem: `--run` exits nonzero and says why on
 # stderr; it does not mark anything `reviewed`. It is the skill's job (see
 # skills/crosscheck/SKILL.md), not this script's, to fall back to `--skip` so
-# a broken Codex install never blocks Plan Mode -- keeping "what happens on
+# a broken Codex install never blocks Plan Mode, keeping "what happens on
 # failure" as a decision the smart layer makes, not one buried in bash.
 #
 # Manual verification: run `crosscheck.sh --selftest` (see run_selftest below).
@@ -81,7 +81,7 @@ LOG_MAX_BYTES=1048576           # 1 MiB
 LOG_KEEP_BYTES=262144           # trim down to 256 KiB, keep the tail
 # Reports/state older than this are pruned on every hook invocation. Plan
 # hashes are content-addressed, not session-scoped, so a stale entry just
-# means "this exact plan text hasn't been seen in a week" -- safe to drop.
+# means "this exact plan text hasn't been seen in a week": safe to drop.
 STATE_MAX_AGE_DAYS=7
 # Above this many bytes, `--run`'s stdout points at the artifact file instead
 # of inlining the report: a tool result is not an unbounded channel any more
@@ -175,13 +175,13 @@ plan_review_instructions='You are an independent, adversarial plan reviewer.
 
 PLAN REVIEW ONLY. Do not implement anything. Do not modify repository files. Your sandbox is read-only.
 
-Do not simply check the plan for internal consistency. First, independently derive the actual obligations of the original request by inspecting the repository yourself -- do not assume the plan already identified the correct scope. Search specifically for: omitted requirements, trust boundaries, secrets/PII handling, persistence and logging, concurrency and cancellation, failure recovery, compatibility, destructive behavior, and missing tests.
+Do not simply check the plan for internal consistency. First, independently derive the actual obligations of the original request by inspecting the repository yourself. Do not assume the plan already identified the correct scope. Search specifically for: omitted requirements, trust boundaries, secrets/PII handling, persistence and logging, concurrency and cancellation, failure recovery, compatibility, destructive behavior, and missing tests.
 
 Only after that independent pass, attack the proposed plan against what you found.
 
 Return ONLY actionable findings, ranked by severity (CRITICAL/HIGH/MEDIUM/LOW). For each:
 1. Severity and a one-line title
-2. Concrete evidence (file/line, repository fact -- not speculation)
+2. Concrete evidence (file/line, repository fact, not speculation)
 3. Consequence if left unaddressed
 4. The required correction
 5. What would prove it is fixed
@@ -349,8 +349,8 @@ run_selftest() {
   # Drop any real CLAUDE_CONFIG_DIR / CROSSCHECK_STATE_DIR inherited from the
   # actual session running this selftest. Without this, every "$run" call
   # below leaks straight through to the REAL profile's plan-mode-crosscheck
-  # directory instead of $tmp_home -- including its DISABLED sentinel, if one
-  # happens to be set -- silently making every check below fail in a way that
+  # directory instead of $tmp_home, including its DISABLED sentinel if one
+  # happens to be set, silently making every check below fail in a way that
   # looks like a logic bug, not an environment leak. Confirmed the hard way.
   unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR
   tmp_home="$(mktemp -d -t crosscheck-selftest)"
@@ -622,7 +622,7 @@ hook_main() {
   esac
 
   # Missing or already-pending: (re)assert pending and deny again. A repeat
-  # call on a still-pending hash means nothing was decided yet -- that is
+  # call on a still-pending hash means nothing was decided yet: that is
   # exactly the case v2's "deny once, then trust" contract could not detect.
   write_plan_state "$hash" "pending" ""
   log "exitplanmode: hash=$hash status=pending, denying"
@@ -632,7 +632,7 @@ hook_main() {
 
 Si dice que SI: invoca la skill crosscheck en modo plan-review (ver skills/crosscheck/SKILL.md de este plugin), pasandole el pedido original y el texto de este plan. Espera el resultado, incorporalo al plan si corresponde, y volve a llamar ExitPlanMode.
 
-Si dice que NO: invoca la skill crosscheck en modo skip para este plan (corre \`\${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh --skip --hash ${hash}\`), y volve a llamar ExitPlanMode.
+Si dice que NO: invoca la skill crosscheck en modo skip para este plan (corre \`crosscheck --skip --hash ${hash}\`), y volve a llamar ExitPlanMode.
 
 Hash de este plan: ${hash}. ExitPlanMode no se va a permitir para este texto exacto de plan hasta que una de las dos rutas quede registrada. Si el plan se edita, el hash cambia y hay que decidir de nuevo."
 

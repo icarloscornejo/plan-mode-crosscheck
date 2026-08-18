@@ -70,11 +70,15 @@ second every time. There's nothing to wait on.
 **Skill** (`skills/crosscheck/SKILL.md`, invoked by Claude after the deny, or
 by you via `/crosscheck`): assembles the actual request (the plan plus the
 original task, or whatever's live in the conversation for a manual
-`/crosscheck`), runs `hooks/crosscheck.sh --run` in the background via the
-`Bash` tool, waits for the result, and relays the findings to you in its own
-words rather than dumping the raw report. On the plan-review path, a
-successful run marks that plan's hash `reviewed`, which is what lets the next
-`ExitPlanMode` call through.
+`/crosscheck`), runs the engine in the background via the `Bash` tool, waits
+for the result, and relays the findings to you in its own words rather than
+dumping the raw report. On the plan-review path, a successful run marks that
+plan's hash `reviewed`, which is what lets the next `ExitPlanMode` call
+through. It invokes the engine as a bare `crosscheck` command rather than a
+full path: this plugin ships a thin wrapper at `bin/crosscheck`, and Claude
+Code adds an enabled plugin's own `bin/` directory to `PATH`, so the skill
+never has to know (or guess wrong, across installs and updates) where the
+plugin actually lives on disk.
 
 If the plan changes after being reviewed or skipped, its hash changes too, and
 the whole cycle starts over for the new text. You can't silently carry a stale
@@ -136,9 +140,15 @@ by design.
 
 ## Verifying it works
 
+From a checkout of this repo:
+
 ```bash
-${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh --selftest
+./hooks/crosscheck.sh --selftest
 ```
+
+Or, from inside a live Claude Code session with the plugin enabled, the bare
+`crosscheck` command works too (see [How it actually
+works](#how-it-actually-works)): `crosscheck --selftest`.
 
 Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
 `--run` in both modes against a stubbed Codex binary, `--skip`, argument
