@@ -1,8 +1,8 @@
 {
   "name": "plan-mode-crosscheck",
   "displayName": "Plan Mode Crosscheck",
-  "version": "3.0.0",
-  "description": "Gates ExitPlanMode on an explicit decision about an independent Codex CLI audit of the finished plan (a separate model, read-only sandbox), offered via a crosscheck skill also invocable manually as /crosscheck at any point in a conversation. Requires Codex CLI installed and logged in with ChatGPT.",
+  "version": "3.0.1",
+  "description": "Get an independent second opinion from Codex CLI (a separate model, read-only sandbox) on a finished Plan Mode plan before you see it, or on demand via /crosscheck at any point in a conversation. Requires Codex CLI installed and logged in with ChatGPT.",
   "author": {
     "name": "Carlos Cornejo"
   },

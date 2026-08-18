@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Thin wrapper so `crosscheck` is callable as a bare command from a live
+# Claude Code session (this plugin's bin/ directory is added to PATH; see
+# https://github.com/anthropics/claude-code/issues/42872).
+#
+# Deliberately NOT relying on $CLAUDE_PLUGIN_ROOT here: that variable is only
+# substituted/exported for commands hooks.json itself invokes, not for a bare
+# Bash tool call the skill makes on its own (confirmed live: it's absent from
+# a normal Bash tool call's environment). Resolving relative to this file's
+# own location instead works from either invocation path.
+set -euo pipefail
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$dir/hooks/crosscheck.sh" "$@"
