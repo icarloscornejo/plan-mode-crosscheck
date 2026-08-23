@@ -56,6 +56,17 @@
 # Manual verification: run `crosscheck.sh --selftest` (see run_selftest below).
 set -uo pipefail
 
+# Prompts, reports, and state can carry secrets or PII (see the note on
+# TMP_DIR pruning further down), and nothing before this line has created a
+# single file or directory yet. A restrictive umask set this early means every
+# directory this script creates from here on defaults to 0700 and every file
+# to 0600, without having to remember an explicit mode at each individual
+# `mkdir`/redirection call site. This only affects this process and its
+# children (including the `codex` subprocess `run_codex` execs); it does not
+# touch permissions on anything that already exists, such as a
+# `CROSSCHECK_STATE_DIR` a user points at a location they manage themselves.
+umask 077
+
 # Resolution precedence for where this plugin's own logs/state live, mirrored
 # from the official security-guidance plugin's hooks/_base.py: an explicit
 # override, then Claude Code's own config-dir env var (covers multi-profile
@@ -215,6 +226,14 @@ resolve_timeout_bin() {
 # crosses a `$(...)` subshell boundary), $5 = resolved timeout binary name.
 # Returns codex's exit code directly (124 on timeout). Always a fresh thread:
 # see the header comment for why v3 dropped resume.
+#
+# The assembled task travels over codex's stdin, never as a process argument:
+# an argv entry is visible to any same-user process inspection (`ps`, /proc,
+# crash collection, diagnostic tooling) regardless of file permissions, and
+# the plan text/findings this carries are exactly the sensitive material this
+# script otherwise goes out of its way to keep at 0600 (see run_bounded state
+# handling below and the umask set at startup). `timeout`/`gtimeout` just exec
+# codex, so stdin passes through untouched.
 run_codex() {
   local instructions="$1" body="$2" budget="$3" json_file="$4" timeout_bin="$5" task rc
   task="${instructions}
@@ -225,14 +244,52 @@ ${body}
   # whole builtin exit 2 and write nothing, silently, because of the
   # 2>/dev/null right after it.
   printf -- '--- %s run ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$STDERR_LOG_FILE" 2>/dev/null
-  "$timeout_bin" "$budget" codex exec --json \
+  printf '%s' "$task" | "$timeout_bin" "$budget" codex exec --json \
     -m "$CROSSCHECK_MODEL" \
     -c "model_reasoning_effort=\"$CROSSCHECK_EFFORT\"" \
     -s read-only \
     --skip-git-repo-check \
-    "$task" </dev/null >"$json_file" 2>>"$STDERR_LOG_FILE"
+    >"$json_file" 2>>"$STDERR_LOG_FILE"
   rc=$?
   return $rc
+}
+
+# Confines $1 (a target file path, may not exist yet) to resolve strictly
+# under $STATE_ROOT, and rejects it if the final path component is itself a
+# symlink. `--out` is accepted verbatim by cmd_run and was, before this
+# function existed, handed straight to atomic_write's `mv`, so a malformed or
+# injected value could overwrite any file the user could write. On success,
+# prints the canonicalized absolute path on stdout and returns 0; otherwise
+# prints nothing and returns 1.
+#
+# Canonicalization is `cd ... && pwd -P`, not `realpath`: the latter isn't
+# guaranteed on stock macOS. The containment check compares with a trailing
+# slash on both sides so a sibling directory that merely shares a prefix
+# (`$STATE_ROOT-evil`) can't be mistaken for a path underneath `$STATE_ROOT`.
+#
+# Scope, stated precisely: this defends against an untrusted or injected path
+# value, and against an ancestor directory being swapped out during the many
+# minutes `run_codex` can take (the caller re-validates after that call, see
+# cmd_run). It does not defend against a concurrent same-user attacker who
+# wins the exact race between this check and the later publish; bash has no
+# portable way to pin a directory across that window, and no test here claims
+# otherwise.
+confine_to_state_root() {
+  local target="$1" dir base canon_dir canon_root
+  dir="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  case "$base" in
+    ''|.|..) return 1 ;;
+  esac
+  mkdir -p "$dir" 2>/dev/null
+  canon_dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+  canon_root="$(cd "$STATE_ROOT" 2>/dev/null && pwd -P)" || return 1
+  case "$canon_dir/" in
+    "$canon_root/"*) : ;;
+    *) return 1 ;;
+  esac
+  [ -L "$canon_dir/$base" ] && return 1
+  printf '%s/%s' "$canon_dir" "$base"
 }
 
 # Plan-hash state: {status, artifact, ts} per hash, one file per hash so
@@ -324,6 +381,15 @@ cmd_run() {
   fi
   [ -n "$artifact_file" ] || artifact_file="$REPORTS_DIR/$(date +%s)-$$.md"
 
+  # Setup: confine --out (or the default path above, checked the same way for
+  # consistency) to $STATE_ROOT before Codex ever runs. See
+  # confine_to_state_root's own comment for exactly what this does and doesn't
+  # protect against.
+  if ! artifact_file="$(confine_to_state_root "$artifact_file")"; then
+    echo "crosscheck --run: --out must resolve to a path under $STATE_ROOT" >&2
+    return 1
+  fi
+
   CROSSCHECK_MODEL="${CROSSCHECK_MODEL:-gpt-5.6-sol}"
   CROSSCHECK_EFFORT="${CROSSCHECK_EFFORT:-medium}"
   local budget="${CROSSCHECK_TIMEOUT:-$CROSSCHECK_TIMEOUT_DEFAULT}"
@@ -356,6 +422,15 @@ cmd_run() {
   if [ -z "$research_output" ]; then
     log "run ($mode) produced empty output"
     echo "crosscheck --run: codex produced no output. See $STDERR_LOG_FILE." >&2
+    return 1
+  fi
+
+  # Re-validate confinement here, not just before Codex ran: `run_codex` can
+  # take several minutes, long enough for an ancestor directory to have been
+  # replaced with a symlink since the first check.
+  if ! artifact_file="$(confine_to_state_root "$artifact_file")"; then
+    log "run ($mode) refused to publish: --out no longer resolves under $STATE_ROOT"
+    echo "crosscheck --run: --out no longer resolves under $STATE_ROOT" >&2
     return 1
   fi
 
@@ -447,17 +522,19 @@ run_selftest() {
     fi
   }
 
-  # Canned stub `codex`: captures every invocation's args (the prompt travels
-  # as a positional arg, not stdin, so a stub that only reads stdin captures
-  # nothing) and emits one thread.started + one item.completed agent_message
-  # line, matching the real `codex exec --json` shape.
-  local stub_bin="$tmp_home/stubbin" capture_file="$tmp_home/stub_args.log"
+  # Canned stub `codex`: captures every invocation's args AND its stdin (the
+  # prompt now travels over stdin, not argv, so both are captured to prove it
+  # went where it should and nowhere else) and emits one thread.started + one
+  # item.completed agent_message line, matching the real `codex exec --json`
+  # shape.
+  local stub_bin="$tmp_home/stubbin" capture_file="$tmp_home/stub_args.log" capture_stdin="$tmp_home/stub_stdin.log"
   mkdir -p "$stub_bin"
   : >"$capture_file"
+  : >"$capture_stdin"
   {
     echo '#!/usr/bin/env bash'
     printf 'printf %%s\\\\n "$*" >>%q\n' "$capture_file"
-    echo 'cat >/dev/null'
+    printf 'cat >>%q\n' "$capture_stdin"
     printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"thread.started", thread_id:"stub-0001"}')'"
     printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"item.completed", item:{type:"agent_message", text:"stub finding: quotes \" backticks ` newline\nhandled fine"}}')'"
   } >"$stub_bin/codex"
@@ -549,7 +626,11 @@ run_selftest() {
 
   # 10. `--run --mode plan-review --hash` with the good stub: writes an
   #     artifact, inlines the (small) report to stdout, marks the hash reviewed.
-  local prompt_file="$tmp_home/prompt.md" out_artifact="$tmp_home/report.md" hash2
+  # out_artifact deliberately lives under the sandboxed state root
+  # ($HOME/.claude/plan-mode-crosscheck), not bare under $tmp_home: --out is
+  # now confined to resolve under $STATE_ROOT (see confine_to_state_root), so
+  # a path outside it would be rejected rather than exercising this test.
+  local prompt_file="$tmp_home/prompt.md" out_artifact="$tmp_home/.claude/plan-mode-crosscheck/state/reports/report.md" hash2
   hash2="$(printf '%s' "$plan_text2" | shasum -a 256 | cut -c1-16)"
   printf 'ORIGINAL REQUEST:\ndo the thing\n\nPROPOSED PLAN:\n%s\n' "$plan_text2" >"$prompt_file"
   out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "$hash2" --out "$out_artifact")"
@@ -558,7 +639,9 @@ run_selftest() {
   check "--run plan-review inlines the small report" "$(printf '%s' "$out" | grep -c 'stub finding')" "1"
   check "--run plan-review writes the artifact file" "$(grep -c 'stub finding' "$out_artifact" 2>/dev/null)" "1"
   check "--run plan-review marks the hash reviewed" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash2}.state" 2>/dev/null)" "reviewed"
-  check "stub codex received the assembled prompt file contents" "$(grep -c 'PROPOSED PLAN' "$capture_file" 2>/dev/null)" "1"
+  check "stub codex received the assembled prompt via stdin" "$(grep -c 'PROPOSED PLAN' "$capture_stdin" 2>/dev/null)" "1"
+  check "stub codex did NOT receive the prompt via argv" "$(grep -c 'PROPOSED PLAN' "$capture_file" 2>/dev/null)" "0"
+  check "stub codex argv contains no plan text at all" "$(grep -c "$plan_text2" "$capture_file" 2>/dev/null)" "0"
   out="$(jq -n --arg cwd "$tmp_home" --arg plan "$plan_text2" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | HOME="$tmp_home" "$run")"
   check "ExitPlanMode after a reviewed hash allows" "$out" ""
 
@@ -578,7 +661,9 @@ run_selftest() {
     printf '%s\n' "printf '%s\n' '$huge_json'"
   } >"$huge_stub/codex"
   chmod +x "$huge_stub/codex"
-  local research_prompt="$tmp_home/research_prompt.md" research_out="$tmp_home/research_report.md"
+  # research_out likewise must live under the sandboxed state root; see the
+  # comment on out_artifact above.
+  local research_prompt="$tmp_home/research_prompt.md" research_out="$tmp_home/.claude/plan-mode-crosscheck/state/reports/research_report.md"
   printf 'investigate the parser module\n' >"$research_prompt"
   out="$(HOME="$tmp_home" PATH="$huge_stub:$PATH" "$run" --run --mode research --prompt-file "$research_prompt" --out "$research_out")"
   rc=$?
@@ -804,6 +889,63 @@ run_selftest() {
   [ -n "$touch_stamp" ] && touch -t "$touch_stamp" "$stale_prompt" 2>/dev/null
   out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":""},"cwd":"%s"}' "$tmp_home" | HOME="$tmp_home" "$run")"
   check "stale TMP_DIR prompt file gets pruned" "$([ -f "$stale_prompt" ] && echo yes || echo no)" "no"
+
+  # 27. --out confinement: absolute paths outside $STATE_ROOT, `..` escapes,
+  #     and a symlinked final component must all be rejected without ever
+  #     invoking codex, while the legitimate in-root path from check 10 above
+  #     already proved the happy path works.
+  : >"$capture_file"
+  local confine_prompt="$tmp_home/confine_prompt.md"
+  printf 'investigate the confinement rules\n' >"$confine_prompt"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$confine_prompt" --out "$tmp_home/outside-root.md" 2>&1 >/dev/null)"
+  rc=$?
+  check "--out outside state root exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "--out outside state root never invoked codex" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+  check "--out outside state root did not write the file" "$([ -e "$tmp_home/outside-root.md" ] && echo yes || echo no)" "no"
+
+  local dotdot_out="$tmp_home/.claude/plan-mode-crosscheck/state/reports/../../../../outside-dotdot.md"
+  : >"$capture_file"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$confine_prompt" --out "$dotdot_out" 2>&1 >/dev/null)"
+  rc=$?
+  check "--out with .. escape exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "--out with .. escape never invoked codex" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+
+  local reports_dir_for_symlink="$tmp_home/.claude/plan-mode-crosscheck/state/reports" symlinked_out
+  mkdir -p "$reports_dir_for_symlink"
+  symlinked_out="$reports_dir_for_symlink/symlinked-out.md"
+  ln -s /etc/hosts "$symlinked_out" 2>/dev/null
+  : >"$capture_file"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$confine_prompt" --out "$symlinked_out" 2>&1 >/dev/null)"
+  rc=$?
+  check "--out onto a symlinked final component exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "--out onto a symlinked final component never invoked codex" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+  rm -f "$symlinked_out"
+
+  # 28. Permissions: under a permissive umask, every directory and file this
+  #     script creates must still come out private (0700 dirs, 0600 files),
+  #     because the script sets its own umask 077 at startup rather than
+  #     relying on the caller's.
+  local perm_home="$tmp_home/permtest"
+  mkdir -p "$perm_home"
+  (
+    umask 000
+    out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":"perm test plan"},"cwd":"%s"}' "$perm_home" \
+      | HOME="$perm_home" "$run" 2>/dev/null)"
+    HOME="$perm_home" "$run" --skip --hash "permtesthash1" >/dev/null 2>&1
+  )
+  # `stat`'s flag for "just the permission bits" differs between BSD (macOS)
+  # and GNU (Linux); try both, whichever exists on this box wins.
+  local perm_state_dir="$perm_home/.claude/plan-mode-crosscheck/state" mode_check
+  mode_check="$(stat -f '%Lp' "$perm_state_dir" 2>/dev/null || stat -c '%a' "$perm_state_dir" 2>/dev/null)"
+  check "umask 000: state dir created 0700" "$mode_check" "700"
+  local perm_state_file
+  perm_state_file="$(find "$perm_state_dir" -maxdepth 1 -type f -name 'plan-*.state' 2>/dev/null | head -1)"
+  if [ -n "$perm_state_file" ]; then
+    mode_check="$(stat -f '%Lp' "$perm_state_file" 2>/dev/null || stat -c '%a' "$perm_state_file" 2>/dev/null)"
+    check "umask 000: state file created 0600" "$mode_check" "600"
+  else
+    check "umask 000: state file created 0600" "missing" "600"
+  fi
 
   rm -rf "$tmp_home"
   echo

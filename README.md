@@ -87,6 +87,21 @@ If the plan changes after being reviewed or skipped, its hash changes too, and
 the whole cycle starts over for the new text. You can't silently carry a stale
 approval forward onto a plan that's since been edited.
 
+## Multiple rounds
+
+If a Codex finding changes the plan text, that's a new hash, and the cycle
+above runs again on it: the hook denies `ExitPlanMode` again, and Claude asks
+again whether to audit. That's not a bug, it's the same one-hash-one-decision
+gate applying to the plan's new text. Round 2, round 3, and so on are all
+independent Codex threads with no memory of earlier rounds; there's no state
+that numbers them against each other or remembers what an earlier round found.
+
+Because each round is independent, the `crosscheck` skill is instructed that
+from round 2 onward it must post every finding from the round that just
+finished as plain chat text, one at a time, **before** asking whether to run
+another round or stop, never as a bare count or trend. A shrinking finding
+count doesn't tell you whether it's safe to stop; the actual findings do.
+
 ## Failure handling
 
 If Codex isn't installed, isn't logged in, or times out, `hooks/crosscheck.sh
@@ -116,6 +131,25 @@ model your own `codex exec` normally uses.
 reviews. That's a real cost even with nothing else waiting on it, and one good
 result at `high` isn't evidence it's worth paying by default: set
 `CROSSCHECK_EFFORT=high` yourself if you want to try it for a specific review.
+
+### Privacy of prompts, reports, and state
+
+Plan text, the original request, and Codex's findings can contain secrets or
+PII, so `hooks/crosscheck.sh` treats all of it as sensitive:
+
+- The prompt handed to `codex exec` travels over its stdin, never as a
+  process argument, so it isn't visible to `ps`, `/proc`, or other
+  same-user process inspection.
+- Everything the script creates under its own state directory (prompts,
+  reports, state files, logs) is created under a `umask 077` the script sets
+  for itself: new directories `0700`, new files `0600`. This only applies to
+  paths the plugin manages; a custom `CROSSCHECK_STATE_DIR` you point
+  elsewhere isn't recursively re-permissioned.
+- `--out` (used internally and by `--selftest`) is confined to resolve
+  strictly under the state root; this protects against an untrusted or
+  injected path value and against an ancestor directory being swapped out
+  during the long Codex call, not against a concurrent same-user attacker
+  winning the exact final rename.
 
 ### Where logs and state live
 
