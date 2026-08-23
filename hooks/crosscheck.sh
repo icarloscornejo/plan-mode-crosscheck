@@ -191,35 +191,47 @@ No descriptive sections. Do not restate or summarize the plan back. Do not list 
 Original request and proposed plan follow:
 ---'
 
-# $1 = instructions template, $2 = path to a file whose contents become the
-# request body, $3 = timeout budget in seconds. Prints the path to a temp file
-# holding the raw `codex exec --json` stream and returns codex's exit code
-# (124 on timeout, courtesy of `timeout`). Always a fresh thread: see the
-# header comment for why v3 dropped resume.
-#
-# Does NOT register the temp file for cleanup itself: this runs inside a
-# `$(...)` command substitution at its call site, a subshell, so an array
-# append here would vanish the instant the subshell exits. Callers must clean
-# up the returned path themselves.
+# Resolves which timeout wrapper to use: prefers GNU `timeout`, falls back to
+# `gtimeout` (Homebrew coreutils on a stock macOS box, where `timeout` itself
+# doesn't exist), prints nothing and returns 1 if neither is on PATH. Same
+# failure class as the mktemp bug this version fixes: without this check,
+# a stock-macOS PATH means Codex never runs and the redirection/exec failure
+# downstream gets misreported as "codex exec failed".
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    printf 'timeout'
+  elif command -v gtimeout >/dev/null 2>&1; then
+    printf 'gtimeout'
+  else
+    return 1
+  fi
+}
+
+# $1 = instructions template, $2 = the already-read request body (a string,
+# not a path: the caller reads the prompt file exactly once and validates
+# that read before this is called, see cmd_run), $3 = timeout budget in
+# seconds, $4 = path to write the raw `codex exec --json` stream to (created
+# and cleaned up by the caller, cmd_run, so ownership of that file never
+# crosses a `$(...)` subshell boundary), $5 = resolved timeout binary name.
+# Returns codex's exit code directly (124 on timeout). Always a fresh thread:
+# see the header comment for why v3 dropped resume.
 run_codex() {
-  local instructions="$1" body_file="$2" budget="$3" task out_file rc
-  out_file="$(mktemp -t crosscheck-json)"
+  local instructions="$1" body="$2" budget="$3" json_file="$4" timeout_bin="$5" task rc
   task="${instructions}
-$(cat "$body_file" 2>/dev/null)
+${body}
 ---"
   # The `--` is load-bearing: a format string starting with `-` (here "---")
   # is otherwise parsed by printf as an unrecognized option, which makes the
   # whole builtin exit 2 and write nothing, silently, because of the
   # 2>/dev/null right after it.
   printf -- '--- %s run ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$STDERR_LOG_FILE" 2>/dev/null
-  timeout "$budget" codex exec --json \
+  "$timeout_bin" "$budget" codex exec --json \
     -m "$CROSSCHECK_MODEL" \
     -c "model_reasoning_effort=\"$CROSSCHECK_EFFORT\"" \
     -s read-only \
     --skip-git-repo-check \
-    "$task" </dev/null >"$out_file" 2>>"$STDERR_LOG_FILE"
+    "$task" </dev/null >"$json_file" 2>>"$STDERR_LOG_FILE"
   rc=$?
-  printf '%s' "$out_file"
   return $rc
 }
 
@@ -243,14 +255,22 @@ write_plan_state() {
 }
 
 # --- `--run`: the actual Codex call, invoked by the skill in the background ---
+#
+# Every failure path below is classified as either a SETUP failure (mktemp,
+# missing dependency, unwritable directory, unreadable prompt: Codex is never
+# invoked) or a CODEX failure (the process ran and returned nonzero, or ran
+# and produced nothing). Setup-failure messages never say "codex exec failed"
+# and never call auth_status: that combination is reserved for the one case
+# it's actually true, so a real Codex problem is never mistaken for a setup
+# problem or vice versa.
 cmd_run() {
-  local mode="" prompt_file="" hash="" out_file=""
+  local mode="" prompt_file="" hash="" artifact_file=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --mode) mode="${2:-}"; shift 2 ;;
       --prompt-file) prompt_file="${2:-}"; shift 2 ;;
       --hash) hash="${2:-}"; shift 2 ;;
-      --out) out_file="${2:-}"; shift 2 ;;
+      --out) artifact_file="${2:-}"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -270,20 +290,60 @@ cmd_run() {
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --run: jq not found on PATH" >&2; return 1; }
   command -v codex >/dev/null 2>&1 || { echo "crosscheck --run: codex not found on PATH" >&2; return 1; }
 
-  mkdir -p "$REPORTS_DIR" 2>/dev/null
-  [ -n "$out_file" ] || out_file="$REPORTS_DIR/$(date +%s)-$$.md"
+  local timeout_bin
+  timeout_bin="$(resolve_timeout_bin)" || {
+    echo "crosscheck --run: neither 'timeout' nor 'gtimeout' found on PATH (install GNU coreutils)" >&2
+    return 1
+  }
+
+  # Setup: read the prompt exactly once, here, and validate the read. A prompt
+  # that becomes unreadable between the -s check above and this read (deleted,
+  # permissions changed) must abort as a setup failure, not silently hand
+  # Codex an empty task that could still end up marked reviewed.
+  local prompt_body
+  if ! prompt_body="$(cat "$prompt_file" 2>>"$STDERR_LOG_FILE")" || [ -z "$prompt_body" ]; then
+    echo "crosscheck --run: could not read --prompt-file $prompt_file. See $STDERR_LOG_FILE." >&2
+    return 1
+  fi
+
+  # Setup: the log directory backs STDERR_LOG_FILE, which run_codex redirects
+  # Codex's own stderr into. If it can't be created or written to, Codex's
+  # invocation itself would fail on that redirection and get misreported as a
+  # Codex failure, exactly the bug this version fixes for mktemp.
+  if ! mkdir -p "$(dirname "$STDERR_LOG_FILE")" 2>/dev/null || ! : >>"$STDERR_LOG_FILE" 2>/dev/null; then
+    echo "crosscheck --run: cannot write to log directory $(dirname "$STDERR_LOG_FILE")" >&2
+    return 1
+  fi
+
+  # Setup: the reports directory backs the default artifact path, and both
+  # code paths below (default and --out) end up doing an atomic_write into
+  # whatever directory holds $artifact_file.
+  if ! mkdir -p "$REPORTS_DIR" 2>/dev/null; then
+    echo "crosscheck --run: cannot create reports directory $REPORTS_DIR" >&2
+    return 1
+  fi
+  [ -n "$artifact_file" ] || artifact_file="$REPORTS_DIR/$(date +%s)-$$.md"
 
   CROSSCHECK_MODEL="${CROSSCHECK_MODEL:-gpt-5.6-sol}"
   CROSSCHECK_EFFORT="${CROSSCHECK_EFFORT:-medium}"
   local budget="${CROSSCHECK_TIMEOUT:-$CROSSCHECK_TIMEOUT_DEFAULT}"
 
+  # Setup: the temp file for codex's raw --json stream. Created directly in
+  # this process (no `$(...)` subshell), so the cleanup trap below is
+  # installed BEFORE Codex ever runs: cancelling mid-run still cleans up.
   local json_file rc
-  json_file="$(run_codex "$instructions" "$prompt_file" "$budget")"
-  rc=$?
-  # Intentional early expansion: capture the concrete path now, not at trap time.
+  json_file="$(mktemp -t crosscheck-json.XXXXXX)" || {
+    echo "crosscheck --run: mktemp failed to create a temp file for the Codex output. See $STDERR_LOG_FILE." >&2
+    return 1
+  }
   # shellcheck disable=SC2064
-  trap "rm -f '$json_file'" EXIT
+  trap "rm -f $(printf '%q' "$json_file")" EXIT
 
+  run_codex "$instructions" "$prompt_body" "$budget" "$json_file" "$timeout_bin"
+  rc=$?
+
+  # Everything past this point is a genuine Codex-side outcome: setup already
+  # succeeded, so rc and auth_status are meaningful and safe to report.
   if [ $rc -ne 0 ] || [ ! -s "$json_file" ]; then
     log "run ($mode) failed rc=$rc auth=$(auth_status)"
     echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)). See $STDERR_LOG_FILE." >&2
@@ -299,12 +359,21 @@ cmd_run() {
     return 1
   fi
 
-  atomic_write "$out_file" "$research_output"
-  log "run ($mode) ready (${#research_output} chars) -> $out_file"
+  if ! atomic_write "$artifact_file" "$research_output"; then
+    log "run ($mode) failed to write artifact $artifact_file"
+    echo "crosscheck --run: failed to write report artifact to $artifact_file" >&2
+    return 1
+  fi
+  log "run ($mode) ready (${#research_output} chars) -> $artifact_file"
 
   if [ "$mode" = "plan-review" ] && [ -n "$hash" ]; then
-    write_plan_state "$hash" "reviewed" "$out_file"
-    log "plan hash=$hash marked reviewed -> $out_file"
+    if write_plan_state "$hash" "reviewed" "$artifact_file"; then
+      log "plan hash=$hash marked reviewed -> $artifact_file"
+    else
+      log "plan hash=$hash: failed to persist reviewed state"
+      echo "crosscheck --run: report written to $artifact_file, but failed to persist reviewed state for hash $hash" >&2
+      return 1
+    fi
   fi
 
   local body_bytes
@@ -312,7 +381,7 @@ cmd_run() {
   if [ "$body_bytes" -le "$STDOUT_INLINE_MAX_BYTES" ]; then
     printf '%s\n' "$research_output"
   else
-    printf 'crosscheck: report is %s bytes, too large to inline safely. Full report written to:\n%s\n\nRead that file directly before summarizing.\n' "$body_bytes" "$out_file"
+    printf 'crosscheck: report is %s bytes, too large to inline safely. Full report written to:\n%s\n\nRead that file directly before summarizing.\n' "$body_bytes" "$artifact_file"
   fi
   return 0
 }
@@ -327,8 +396,14 @@ cmd_skip() {
     echo "crosscheck --skip: --hash is required" >&2
     return 2
   fi
-  mkdir -p "$STATE_DIR" 2>/dev/null
-  write_plan_state "$hash" "skipped" ""
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    echo "crosscheck --skip: cannot create state directory $STATE_DIR" >&2
+    return 1
+  fi
+  if ! write_plan_state "$hash" "skipped" ""; then
+    echo "crosscheck --skip: failed to persist skipped state for hash $hash" >&2
+    return 1
+  fi
   log "plan hash=$hash marked skipped"
   return 0
 }
@@ -337,7 +412,10 @@ cmd_skip() {
 # state root, so the skill doesn't have to re-derive state_root's precedence
 # rules itself just to know where to put a temp prompt file. ---
 cmd_tmp_dir() {
-  mkdir -p "$TMP_DIR" 2>/dev/null
+  if ! mkdir -p "$TMP_DIR" 2>/dev/null; then
+    echo "crosscheck --tmp-dir: cannot create $TMP_DIR" >&2
+    return 1
+  fi
   printf '%s\n' "$TMP_DIR"
 }
 
@@ -353,7 +431,10 @@ run_selftest() {
   # happens to be set, silently making every check below fail in a way that
   # looks like a logic bug, not an environment leak. Confirmed the hard way.
   unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR
-  tmp_home="$(mktemp -d -t crosscheck-selftest)"
+  tmp_home="$(mktemp -d -t crosscheck-selftest.XXXXXX)" || {
+    echo "selftest: mktemp -d failed" >&2
+    return 1
+  }
   echo "selftest: sandbox at $tmp_home"
 
   check() {
@@ -569,6 +650,161 @@ run_selftest() {
   check "CLAUDE_CONFIG_DIR path does NOT also create a ~/.claude default dir" \
     "$([ -d "$cfgdir_home/.claude" ] && echo yes || echo no)" "no"
 
+  # Helper for the setup-failure tests below: PATH with the directory holding
+  # $1 removed, so a stub or an absence can be forced for one specific command
+  # without disturbing the rest of the real PATH.
+  strip_cmd_dir() {
+    local cmd="$1" path_in="$2" cmd_path cmd_dir out="" d
+    cmd_path="$(PATH="$path_in" command -v "$cmd" 2>/dev/null)"
+    [ -n "$cmd_path" ] || { printf '%s' "$path_in"; return; }
+    cmd_dir="$(dirname "$cmd_path")"
+    local IFS=':'
+    for d in $path_in; do
+      [ "$d" = "$cmd_dir" ] && continue
+      out="${out:+$out:}$d"
+    done
+    printf '%s' "$out"
+  }
+
+  # 18. Neither `timeout` nor `gtimeout` on PATH -> setup failure before Codex
+  #     ever runs, not the misleading "codex exec failed" the original bug
+  #     produced for the same root cause (missing dependency, not Codex).
+  local path_no_timeouts
+  path_no_timeouts="$(strip_cmd_dir timeout "$PATH")"
+  path_no_timeouts="$(strip_cmd_dir gtimeout "$path_no_timeouts")"
+  : >"$capture_file"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$path_no_timeouts" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "hash-no-timeout" 2>&1 >/dev/null)"
+  rc=$?
+  check "no timeout/gtimeout: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "no timeout/gtimeout: codex never invoked" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+  check "no timeout/gtimeout: message does not blame codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "0"
+
+  # 19. `gtimeout`-only PATH (stock macOS with coreutils installed but no
+  #     `timeout` shim) falls back and actually runs Codex.
+  local gtimeout_dir="$tmp_home/gtimeoutbin"
+  mkdir -p "$gtimeout_dir"
+  { echo '#!/usr/bin/env bash'; echo 'shift'; echo 'exec "$@"'; } >"$gtimeout_dir/gtimeout"
+  chmod +x "$gtimeout_dir/gtimeout"
+  : >"$capture_file"
+  out="$(HOME="$tmp_home" PATH="$gtimeout_dir:$stub_bin:$path_no_timeouts" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "hash-gtimeout" 2>/dev/null)"
+  rc=$?
+  check "gtimeout fallback: --run exits 0" "$rc" "0"
+  check "gtimeout fallback: codex was invoked" "$([ -s "$capture_file" ] && echo yes || echo no)" "yes"
+
+  # 20. mktemp failure is a setup failure, isolated from Codex: Codex is never
+  #     invoked, the message never blames Codex, and the hash is never marked
+  #     reviewed. This is the original bug, now caught before it can disguise
+  #     itself.
+  local badmktemp_dir="$tmp_home/badmktemp"
+  mkdir -p "$badmktemp_dir"
+  { echo '#!/usr/bin/env bash'; echo 'echo "boom" >&2'; echo 'exit 1'; } >"$badmktemp_dir/mktemp"
+  chmod +x "$badmktemp_dir/mktemp"
+  : >"$capture_file"
+  local hash_mktempfail="mktempfailhash1"
+  out="$(HOME="$tmp_home" PATH="$badmktemp_dir:$stub_bin:$PATH" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "$hash_mktempfail" 2>&1 >/dev/null)"
+  rc=$?
+  check "mktemp failure: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "mktemp failure: codex never invoked" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+  check "mktemp failure: message does not blame codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "0"
+  check "mktemp failure: hash not marked reviewed" "$([ -s "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash_mktempfail}.state" ] && echo yes || echo no)" "no"
+
+  # 21. The mirror image of #20: a genuine Codex failure (here, exit 90, the
+  #     old sentinel value) must still be reported as a Codex failure. This is
+  #     only meaningful now that the sentinel is gone: proves rc=90 from Codex
+  #     is never confused with the internal setup-failure path above.
+  local codex90_dir="$tmp_home/codex90"
+  mkdir -p "$codex90_dir"
+  { echo '#!/usr/bin/env bash'; echo 'cat >/dev/null'; echo 'echo "boom" >&2'; echo 'exit 90'; } >"$codex90_dir/codex"
+  chmod +x "$codex90_dir/codex"
+  local hash90="codexninetyhash1"
+  out="$(HOME="$tmp_home" PATH="$codex90_dir:$PATH" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "$hash90" 2>&1 >/dev/null)"
+  rc=$?
+  check "codex exit 90: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "codex exit 90: message reports rc=90" "$(printf '%s' "$out" | grep -c 'rc=90')" "1"
+  check "codex exit 90: message blames codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "1"
+  check "codex exit 90: hash not marked reviewed" "$([ -s "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash90}.state" ] && echo yes || echo no)" "no"
+
+  # 22. A prompt file that exists (passes -s) but can't actually be read is a
+  #     setup failure: Codex is never invoked over an empty/partial task that
+  #     could otherwise still end up marked reviewed.
+  if [ "$(id -u)" != "0" ]; then
+    local unreadable_prompt="$tmp_home/unreadable_prompt.md"
+    printf 'ORIGINAL REQUEST:\nsomething\n' >"$unreadable_prompt"
+    chmod 000 "$unreadable_prompt"
+    : >"$capture_file"
+    out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode plan-review --prompt-file "$unreadable_prompt" --hash "unreadablehash1" 2>&1 >/dev/null)"
+    rc=$?
+    check "unreadable prompt: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    check "unreadable prompt: codex never invoked" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+    chmod 644 "$unreadable_prompt"
+  else
+    echo "  skip  unreadable-prompt checks (running as root, permissions are not enforced)"
+  fi
+
+  # 23. An unwritable log directory must fail before Codex runs, with no
+  #     auth= in the message (that phrase is reserved for real Codex failures).
+  if [ "$(id -u)" != "0" ]; then
+    local badstate_root="$tmp_home/badstate"
+    mkdir -p "$badstate_root/logs"
+    chmod 000 "$badstate_root/logs"
+    : >"$capture_file"
+    out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" CROSSCHECK_STATE_DIR="$badstate_root" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash "logdirfailhash1" 2>&1 >/dev/null)"
+    rc=$?
+    check "unwritable log dir: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    check "unwritable log dir: codex never invoked" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+    check "unwritable log dir: message has no auth=" "$(printf '%s' "$out" | grep -c 'auth=')" "0"
+    chmod 755 "$badstate_root/logs" 2>/dev/null
+  else
+    echo "  skip  unwritable-log-dir checks (running as root, permissions are not enforced)"
+  fi
+
+  # 24. An unwritable state root must make `--skip` and `--tmp-dir` fail
+  #     honestly instead of claiming success (or, for --tmp-dir, printing a
+  #     path that doesn't exist).
+  if [ "$(id -u)" != "0" ]; then
+    local badstate_root2="$tmp_home/badstate2"
+    mkdir -p "$badstate_root2"
+    chmod 000 "$badstate_root2"
+    out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root2/state" "$run" --skip --hash "unwritablestate1" 2>&1 >/dev/null)"
+    rc=$?
+    check "--skip with unwritable state root exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root2/state" "$run" --tmp-dir 2>&1 >/dev/null)"
+    rc=$?
+    check "--tmp-dir with unwritable state root exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    chmod 755 "$badstate_root2" 2>/dev/null
+  else
+    echo "  skip  unwritable-state-root checks (running as root, permissions are not enforced)"
+  fi
+
+  # 25. Fail-open: if the hook itself can't persist the `pending` state (state
+  #     root unwritable), ExitPlanMode must be ALLOWED, not stuck denying
+  #     forever with no way to ever record a decision.
+  if [ "$(id -u)" != "0" ]; then
+    local badstate_root3="$tmp_home/badstate3"
+    mkdir -p "$badstate_root3"
+    chmod 000 "$badstate_root3"
+    out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":"a brand new never-seen plan text"},"cwd":"%s"}' "$tmp_home" \
+      | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root3/state" "$run")"
+    check "unpersistable pending state fails open (no stdout = allowed)" "$out" ""
+    chmod 755 "$badstate_root3" 2>/dev/null
+  else
+    echo "  skip  fail-open-on-unpersistable-pending check (running as root, permissions are not enforced)"
+  fi
+
+  # 26. TMP_DIR pruning: a stale prompt file (older than STATE_MAX_AGE_DAYS)
+  #     actually gets deleted now. Requests, plans, and anything sensitive in
+  #     them used to accumulate here forever, contrary to what the README
+  #     promises about state/ retention.
+  local prune_tmp_dir="$tmp_home/.claude/plan-mode-crosscheck/state/tmp" stale_prompt eight_days_ago touch_stamp
+  mkdir -p "$prune_tmp_dir"
+  stale_prompt="$prune_tmp_dir/stale-prompt.md"
+  echo "old prompt" >"$stale_prompt"
+  eight_days_ago=$(( $(date +%s) - 8 * 86400 ))
+  touch_stamp="$(date -r "$eight_days_ago" '+%Y%m%d%H%M.%S' 2>/dev/null || date -d "@$eight_days_ago" '+%Y%m%d%H%M.%S' 2>/dev/null)"
+  [ -n "$touch_stamp" ] && touch -t "$touch_stamp" "$stale_prompt" 2>/dev/null
+  out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":""},"cwd":"%s"}' "$tmp_home" | HOME="$tmp_home" "$run")"
+  check "stale TMP_DIR prompt file gets pruned" "$([ -f "$stale_prompt" ] && echo yes || echo no)" "no"
+
   rm -rf "$tmp_home"
   echo
   if [ "$failures" -eq 0 ]; then
@@ -587,6 +823,10 @@ hook_main() {
   trim_log "$STDERR_LOG_FILE"
   find "$STATE_DIR" -maxdepth 1 -type f -name 'plan-*.state' -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
   find "$REPORTS_DIR" -maxdepth 1 -type f -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
+  # Prompt files (requests, plan text, possibly secrets/PII) live here too:
+  # the README promises everything under state/ is pruned after
+  # STATE_MAX_AGE_DAYS, but until now this loop never actually walked TMP_DIR.
+  find "$TMP_DIR" -maxdepth 1 -type f -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
 
   [ -f "$DISABLED_SENTINEL" ] && exit 0
 
@@ -624,7 +864,15 @@ hook_main() {
   # Missing or already-pending: (re)assert pending and deny again. A repeat
   # call on a still-pending hash means nothing was decided yet: that is
   # exactly the case v2's "deny once, then trust" contract could not detect.
-  write_plan_state "$hash" "pending" ""
+  #
+  # Fail-open if the write itself fails (state dir unwritable, disk full):
+  # denying without being able to persist that decision would leave the user
+  # in a deny loop with no way to ever record "skipped" or "reviewed", which
+  # is worse than letting Plan Mode through ungated this one time.
+  if ! write_plan_state "$hash" "pending" ""; then
+    log "exitplanmode: hash=$hash could not persist pending state, failing open (allow)"
+    exit 0
+  fi
   log "exitplanmode: hash=$hash status=pending, denying"
 
   local reason
@@ -665,7 +913,7 @@ case "${1:-}" in
     ;;
   --tmp-dir)
     cmd_tmp_dir
-    exit 0
+    exit $?
     ;;
 esac
 

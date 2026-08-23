@@ -36,15 +36,22 @@ will keep denying forever.
 
 3. **If the user says Yes:**
 
-   a. Get a scratch directory:
+   a. Get a scratch directory, write the prompt file, and launch the run, all
+      inside **one single `Bash` tool call** (see Notes: one `Bash` call per
+      invocation, not three). Do not write the prompt file with the `Write`
+      tool: in Plan Mode, `Write` is restricted to the plan file itself and
+      will surface a permission prompt for anything else, which breaks the
+      hands-off flow this skill exists to provide. Only `AskUserQuestion`
+      (step 1, above) should ever prompt the user.
+
+   b. Inside that one `Bash` call, write the prompt file at
+      `"$tmp/plan-<hash>.md"` with a heredoc, content in your own words where
+      noted:
+
       ```
       tmp="$(crosscheck --tmp-dir)"
-      ```
-
-   b. Write a prompt file at `"$tmp/plan-<hash>.md"` containing, in your own
-      words where noted:
-
-      ```
+      pf="$tmp/plan-<hash>.md"
+      cat > "$pf" <<'CROSSCHECK_PROMPT_<hash>'
       ORIGINAL REQUEST:
       <the task the user actually asked for, in your own words, not the
       literal text of whatever they typed most recently if that was just an
@@ -58,22 +65,41 @@ will keep denying forever.
       <anything the user specified that the plan must follow: tradeoffs they
       picked, things they explicitly ruled out. Omit this section if there
       weren't any.>
+      CROSSCHECK_PROMPT_<hash>
+      crosscheck --run --mode plan-review --prompt-file "$pf" --hash <hash>
       ```
 
-      This is the one step you cannot get wrong. The whole reason this skill
-      exists instead of the old always-on background research is that a
-      one-line raw prompt is not a research target. Take the extra sentence
-      to write a real request.
+      Two non-negotiable details in that heredoc, both there to stop the
+      plan's own text from being interpreted as shell input instead of being
+      copied byte-for-byte:
 
-   c. Run, via the `Bash` tool with `run_in_background: true` and a
-      `description` that says what's actually happening, not "running
-      command", something like `"Codex auditando el plan (gpt-5.6-sol,
-      medium)"`, since that description is what the user sees as the task's
-      status label:
-      ```
-      crosscheck --run --mode plan-review \
-        --prompt-file "$tmp/plan-<hash>.md" --hash <hash>
-      ```
+      - **The delimiter must be quoted**: `<<'CROSSCHECK_PROMPT_<hash>'`, not
+        `<<CROSSCHECK_PROMPT_<hash>`. An unquoted heredoc lets the shell
+        expand anything inside it, so a plan containing `$(...)`, a bare
+        `` ` ``, or a `$VAR` would execute or substitute instead of being
+        copied literally. Quoting the delimiter turns the whole body into
+        inert text, no exceptions.
+      - **The delimiter must be unique to this plan**, e.g. built from the
+        hash as shown above, never a generic token like `EOF`. A heredoc ends
+        the instant a line matches its delimiter exactly, regardless of
+        quoting, so a plan that happens to contain a line reading `EOF` would
+        silently truncate the prompt and turn the rest of the plan text into
+        shell commands. A hash-derived delimiter makes that collision
+        practically impossible.
+
+      This prompt file is also the one step you cannot get wrong for a
+      different reason: the whole reason this skill exists instead of the
+      old always-on background research is that a one-line raw prompt is not
+      a research target. Take the extra sentence to write a real request.
+
+   c. Because that script ends in `crosscheck --run`, make the whole `Bash`
+      call `run_in_background: true`, with a `description` that says what's
+      actually happening, not "running command", something like `"Codex
+      auditando el plan (gpt-5.6-sol, medium)"`, since that description is
+      what the user sees as the task's status label. The tmp-dir lookup and
+      the heredoc write are near-instant; backgrounding the whole script just
+      means the slow part (`--run`) doesn't block, not that the fast parts
+      run separately.
 
    d. Wait for the task notification. Do not poll.
 
@@ -102,21 +128,26 @@ will keep denying forever.
 No hash, no gating, nothing blocked. This is a standalone request for a
 second opinion on whatever's live in the conversation right now.
 
-1. Write a self-contained description of what to investigate to a prompt
-   file (same scratch-dir pattern as above: `tmp="$(crosscheck --tmp-dir)"`).
-   In your own words, not a copy-paste of the user's last message: if the
-   last message alone isn't enough to hand to someone with no other
-   context, it isn't enough for Codex either.
-
-2. Run, via `Bash` with `run_in_background: true` and a descriptive
-   `description`:
+1. In one single `Bash` call (same reasoning as A.a-c above: no `Write` tool,
+   no splitting into separate calls, the same quoted-and-unique heredoc
+   delimiter so the request text can't be interpreted as shell input), get
+   the scratch dir, write a self-contained description of what to
+   investigate, and launch the run:
    ```
-   crosscheck --run --mode research \
-     --prompt-file "$tmp/request-$$.md"
+   tmp="$(crosscheck --tmp-dir)"
+   pf="$tmp/request-$$.md"
+   cat > "$pf" <<'CROSSCHECK_REQUEST_<random-token>'
+   <a self-contained description of what to investigate, in your own words,
+   not a copy-paste of the user's last message: if the last message alone
+   isn't enough to hand to someone with no other context, it isn't enough
+   for Codex either.>
+   CROSSCHECK_REQUEST_<random-token>
+   crosscheck --run --mode research --prompt-file "$pf"
    ```
-   No `--hash`: this mode never touches plan state.
+   No `--hash`: this mode never touches plan state. Run the whole call with
+   `run_in_background: true` and a descriptive `description`, same as A.c.
 
-3. Wait for the notification, then relay findings the same way as A.e above.
+2. Wait for the notification, then relay findings the same way as A.e above.
 
 ## Notes
 
