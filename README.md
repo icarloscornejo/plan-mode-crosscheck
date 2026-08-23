@@ -36,9 +36,12 @@ actually worth researching turned out to be a better deal.
 - Logged in with a ChatGPT account: `codex login status` should print
   `Logged in using ChatGPT`.
 - `jq` installed (used for all JSON parsing).
+- A `timeout` command on your `PATH`, GNU coreutils' `timeout` or its
+  `gtimeout` alias. Stock macOS ships neither; `brew install coreutils` gets
+  you `gtimeout`, which `hooks/crosscheck.sh` falls back to automatically.
 
-If either of the first two isn't true, `/crosscheck` and the plan-review flow
-will tell you so directly, a failed tool result, not a silent no-op. See
+If any of these isn't true, `/crosscheck` and the plan-review flow will tell
+you so directly, a failed tool result, not a silent no-op. See
 [Failure handling](#failure-handling) below.
 
 ## Install

@@ -2,6 +2,96 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.1.0
+
+A real session hit `crosscheck --run: codex exec failed (rc=1, auth=ok)`
+while Codex never actually ran. Root cause: `hooks/crosscheck.sh` called
+`mktemp -t crosscheck-json` with no `XXXXXX` in the template. That's valid
+under BSD `mktemp` (stock macOS, which appends a random suffix on its own)
+but GNU `mktemp` rejects it outright with `too few X's in template`, and this
+plugin runs under GNU coreutils whenever it's ahead of `/usr/bin` on `PATH`
+(common after `brew install coreutils`). Because line 57 is `set -uo
+pipefail` without `-e`, the failure didn't stop the script: `mktemp` failed,
+the output path variable was left as an empty (set, not unset) string,
+execution continued into `codex exec ... >"$out_file"`, redirecting to `""`
+failed with "No such file or directory", and *that* exit code got reported as
+"codex exec failed" even though Codex was never invoked. `auth=ok` was the
+tell that the real failure was upstream of Codex entirely.
+
+Fixing the two `mktemp` templates (the second one lived in `--selftest`)
+turned up the same failure shape in three more places, so this release closes
+the whole class instead of just the one instance:
+
+- **`timeout` was unvalidated.** `run_codex` called GNU `timeout`, which
+  doesn't exist on stock macOS, but only `codex` and `jq` were checked before
+  running it. Without coreutils, Codex never ran and the resulting exit 127
+  got the same "codex exec failed" mislabeling. `hooks/crosscheck.sh` now
+  resolves `timeout`, falls back to `gtimeout`, and fails with a
+  dependency-specific message (no mention of Codex) if neither exists.
+- **The stderr log directory was unvalidated.** `codex exec`'s own stderr
+  redirects into `logs/crosscheck.stderr.log`; if that directory couldn't be
+  created or written to, the redirection failure looked identical to a Codex
+  failure. Now checked, and reported as a setup failure, before Codex runs.
+- **An unreadable prompt file could still reach Codex.** The prompt was
+  checked for non-empty size, then read a second time inside `run_codex` with
+  its own errors suppressed. A file that became unreadable in between (or
+  simply couldn't be read for permissions reasons) silently handed Codex an
+  empty task, which could still end up marked `reviewed`. The prompt is now
+  read exactly once, up front, and a failed read aborts before Codex runs.
+
+Also fixed, found by two rounds of an independent Codex plan-review audit
+against this fix's own plan:
+
+- **The initial fix introduced a new ambiguity.** An early version of this
+  fix used a reserved exit code (90) to signal "setup failed, not Codex" back
+  through a `$(...)` command substitution. But Codex itself can exit 90 on
+  its own, which would have made a genuine Codex failure indistinguishable
+  from a setup failure, the opposite of this release's goal. Reworked so the
+  temp file for Codex's `--json` stream is created directly in `cmd_run` (no
+  subshell), its cleanup trap is installed *before* Codex is ever launched
+  (previously installed after, so cancelling mid-run could leak the temp
+  file), and `run_codex` returns Codex's real exit code with no sentinel
+  needed: a setup failure now always aborts with its own distinct message
+  before Codex is invoked at all, so `rc` and `auth=` in a "codex exec
+  failed" message are only ever printed for an actual Codex-side failure.
+- **`--skip`, `--tmp-dir`, and the hook's own `pending`-state write ignored
+  failures.** An unwritable state directory made `--skip` report success
+  without persisting anything, made `--tmp-dir` print a path that didn't
+  exist, and made the hook deny `ExitPlanMode` without being able to record
+  that denial, an unrecoverable loop. All three now check their writes; the
+  hook specifically fails *open* (allows `ExitPlanMode`) rather than denying
+  into a state it can't ever resolve. The `--run` artifact write and the
+  `reviewed` state write got the same treatment: a failed write is now a
+  reported failure, never a silent success pointing at a report that doesn't
+  exist.
+- **Prompt files never actually got pruned.** They're written under
+  `state/tmp`, which the retention logic never walked, contradicting the
+  README's claim that everything under `state/` is pruned after 7 days.
+  Requests and plan text (potentially including secrets or PII) could
+  accumulate indefinitely. The prune pass now covers `state/tmp` too.
+- **`skills/crosscheck/SKILL.md`'s own instructions were unsafe and
+  self-contradictory.** Step 3b told Claude to "write a prompt file", which
+  reads as "use the `Write` tool", but the plugin's Notes section already
+  said everything should go through one `Bash` call. Read literally, the
+  ambiguity led to `Write` being used in Plan Mode, which surfaces a
+  permission prompt for a file that has nothing to do with the plan and
+  breaks the intended hands-off flow. Separately, the heredoc the skill uses
+  to get the plan's own text into that `Bash` call had no requirement that
+  its delimiter be quoted or unique: an unquoted heredoc lets a plan
+  containing `$(...)` or a bare backtick execute as shell input instead of
+  being copied literally, and a generic delimiter like `EOF` can collide with
+  an ordinary line in the plan and truncate the prompt into the following
+  text being run as commands. `SKILL.md` now prescribes a single `Bash` call,
+  a heredoc with a quoted delimiter derived from the plan's own hash, and is
+  explicit that `AskUserQuestion` is the only step allowed to prompt the
+  user.
+
+`hooks/crosscheck.sh --selftest` gained coverage for all of the above:
+isolating a setup failure (mktemp, missing `timeout`, unwritable log/state
+dirs, an unreadable prompt) from a genuine Codex failure, the `gtimeout`
+fallback actually invoking Codex, the fail-open behavior on an unpersistable
+`pending` write, and `state/tmp` pruning actually removing a stale file.
+
 ## 3.0.1
 
 Live end-to-end testing of 3.0.0 (real `EnterPlanMode`/`ExitPlanMode` cycle,
