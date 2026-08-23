@@ -49,6 +49,7 @@ will keep denying forever.
       noted:
 
       ```
+      umask 077
       tmp="$(crosscheck --tmp-dir)"
       pf="$tmp/plan-<hash>.md"
       cat > "$pf" <<'CROSSCHECK_PROMPT_<hash>'
@@ -113,6 +114,10 @@ will keep denying forever.
       full thing if they want. Then call `ExitPlanMode` again: the hash is
       now `reviewed`, so it will be allowed.
 
+      **If this is not the first round on this plan (see "Running multiple
+      rounds" below), do not summarize here: follow that section's reporting
+      requirement instead before deciding anything.**
+
    f. **On failure (nonzero exit):** Codex is broken (not installed, not
       logged in, timed out, etc; the stderr in the tool result says which).
       Do not leave the user stuck: tell them the audit failed and why, then
@@ -122,6 +127,41 @@ will keep denying forever.
       ```
       so the hash is marked `skipped` (an attempted-and-failed audit is not
       a silent bypass, the user was told), and call `ExitPlanMode` again.
+
+## Running multiple rounds on the same plan
+
+Nothing about the state machine stops this from happening, and it isn't a bug
+when it does: if a round's findings change the plan text, the hash changes,
+the hook denies `ExitPlanMode` again, and step 1 fires again asking whether to
+audit. Round 2, round 3, and so on are all the same flow above, run again on
+the new hash. There is no state that numbers rounds against each other or
+remembers what earlier rounds found; each run is an independent Codex thread
+with no memory of the previous one (see the header comment in
+`hooks/crosscheck.sh` for why).
+
+That independence is exactly why round 2 onward needs a different reporting
+step than a first round does. On a first round, summarizing findings and
+moving on is enough, because there's no decision to make about whether to
+keep going. From round 2 onward there is: continue auditing, or stop here and
+show the plan. That decision needs the actual findings in front of the user,
+not a proxy for them.
+
+**Before asking whether to run another round or stop, post every finding from
+the round that just finished as plain chat text, one at a time**: severity,
+title, the evidence, the required correction, and whether the plan
+incorporated it or it was deliberately rejected (and why). Do this even if
+there are many findings and even if severity is low. **Do not substitute this
+with a count or a trend** ("findings went from 12 down to 5") — a shrinking or
+growing number tells you a trend existed, it gives the user nothing to weigh a
+"one more round" decision against. Post the findings first, as their own
+message; only after that, as a separate step, ask whether to continue or stop
+(`AskUserQuestion` or plain text, whichever fits the moment).
+
+**When to stop:** a round that surfaces nothing materially new is a reason to
+stop, not a shrinking count on its own — a low count with a new CRITICAL is
+not a signal to stop, and a high count of findings already seen and
+deliberately rejected before is not a signal to keep going. Judge by content,
+because content is what got posted.
 
 ## Entry point B: the user typed `/crosscheck`
 
@@ -134,6 +174,7 @@ second opinion on whatever's live in the conversation right now.
    the scratch dir, write a self-contained description of what to
    investigate, and launch the run:
    ```
+   umask 077
    tmp="$(crosscheck --tmp-dir)"
    pf="$tmp/request-$$.md"
    cat > "$pf" <<'CROSSCHECK_REQUEST_<random-token>'

@@ -2,6 +2,45 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.1.1
+
+A real multi-round session (incorporate a finding, hash changes, hook denies
+`ExitPlanMode` again, repeat) ran four rounds of Codex audits on one plan.
+At the end of round 4, Claude asked "round 5 or stop?" backed by nothing but a
+finding count and a trend ("12, 12, 7, 5 findings"), never showing what those
+findings actually said. Nothing in `skills/crosscheck/SKILL.md` covers that
+case: its reporting step (A.e) was written for a single round that ends in
+`ExitPlanMode`, not for "this round just finished, and I'm about to ask
+whether to run another." Multiple rounds on the same plan aren't a bug (the
+README already describes the hash-changes-so-it-denies-again mechanism), the
+gap was that nothing told Claude what to do with that mechanism once it fires
+more than once. `SKILL.md` now has a "Running multiple rounds" section: post
+every finding from the round that just finished as plain chat text, one at a
+time, before asking whether to continue, never a bare count. The README now
+names "rounds" explicitly instead of only describing the mechanism that
+produces them.
+
+Two more bugs surfaced while chasing that one down, unrelated to the reporting
+gap but real and worth fixing in the same pass:
+
+- **The plan text traveled as a `codex exec` process argument.** `run_codex`
+  built the whole prompt (original request, proposed plan, any prior
+  findings) and passed it positionally, even though the script has always
+  known this material can carry secrets or PII (see the comment on `tmp/`
+  pruning). A process argument is visible to any same-user `ps`/`/proc`
+  inspection regardless of file permissions. The prompt now goes over
+  `codex exec`'s stdin instead.
+- **Nothing confined `--out`, and nothing set restrictive permissions.**
+  `--out` was accepted verbatim and handed to `atomic_write`'s `mv`, so a
+  malformed or injected value could overwrite any file the invoking user
+  could write. It's now canonicalized and required to resolve strictly under
+  the plugin's own state root, checked once before Codex runs and again
+  before publishing (`run_codex` can take minutes; an ancestor directory
+  could change in between). Separately, the script never set a restrictive
+  `umask`, so newly created state lived at whatever mode the caller's shell
+  happened to default to. It now sets `umask 077` for itself at startup, and
+  the skill's own heredoc shells do the same before writing a prompt file.
+
 ## 3.1.0
 
 A real session hit `crosscheck --run: codex exec failed (rc=1, auth=ok)`
