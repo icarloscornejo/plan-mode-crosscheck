@@ -94,13 +94,23 @@ above runs again on it: the hook denies `ExitPlanMode` again, and Claude asks
 again whether to audit. That's not a bug, it's the same one-hash-one-decision
 gate applying to the plan's new text. Round 2, round 3, and so on are all
 independent Codex threads with no memory of earlier rounds; there's no state
-that numbers them against each other or remembers what an earlier round found.
+that numbers them against each other or remembers what an earlier round found
+(each round's prompt carries a `PRIOR ROUNDS` summary instead, assembled by
+the skill).
 
 Because each round is independent, the `crosscheck` skill is instructed that
 from round 2 onward it must post every finding from the round that just
 finished as plain chat text, one at a time, **before** asking whether to run
 another round or stop, never as a bare count or trend. A shrinking finding
 count doesn't tell you whether it's safe to stop; the actual findings do.
+
+**Rounds are capped at a fixed maximum of 3** on any single plan. This is not
+an environment variable and can't be raised by setting one: it's a constant in
+`hooks/crosscheck.sh`, and `crosscheck --run` itself rejects a `--round`
+above that maximum before Codex ever runs. The skill keeps the actual count
+(there's no per-plan-lineage state in the hook to track it), and after round 3
+it stops offering another round outright: any further edit to the plan goes
+out with `crosscheck --skip`, marked explicitly to you as unaudited.
 
 ## Failure handling
 
@@ -116,15 +126,20 @@ All optional, all environment variables, read by `hooks/crosscheck.sh --run`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CROSSCHECK_MODEL` | `gpt-5.6-sol` | Model passed to `codex exec -m`. |
+| `CROSSCHECK_MODEL` | `gpt-6-astra` | Model passed to `codex exec -m`. |
 | `CROSSCHECK_EFFORT` | `medium` | `model_reasoning_effort` passed to Codex. See below for why this isn't `high` by default. |
 | `CROSSCHECK_TIMEOUT` | `600` | Budget, in seconds, for the Codex call. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
 
-**About the default model:** `gpt-5.6-sol` is what the author uses day to day;
-it may not be available on every Codex CLI account or region. If Codex fails
-with that default and you don't know why, set `CROSSCHECK_MODEL` to whatever
-model your own `codex exec` normally uses.
+The 3-round cap described in [Multiple rounds](#multiple-rounds) is
+deliberately not in this table: it's a fixed constant, not something you set
+through the environment.
+
+**About the default model:** `gpt-6-astra` is what the author uses day to day;
+it may not be available on every Codex CLI account or region. The previous
+default, `gpt-5.6-sol`, is a known-good fallback if ASTRA isn't available on
+yours. If Codex fails with the default and you don't know why, set
+`CROSSCHECK_MODEL` to whatever model your own `codex exec` normally uses.
 
 **About the default effort:** `medium`, not `high`. Measured in practice,
 `high` reasoning effort took Codex up to roughly 11 minutes on some plan

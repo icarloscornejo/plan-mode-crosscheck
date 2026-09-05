@@ -2,6 +2,85 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.2.0
+
+Three changes, all from real usage of 3.1.1.
+
+**Default model moved from `gpt-5.6-sol` to `gpt-6-astra`.** ASTRA is OpenAI's
+newer model on Codex CLI, and it's what the author's own `codex` config
+already points at day to day. `gpt-5.6-sol` stays documented as a known-good
+fallback for accounts where ASTRA isn't available yet, but it's no longer the
+default anywhere in `hooks/crosscheck.sh`, `skills/crosscheck/SKILL.md`, or
+`README.md`.
+
+**All three prompt layers got a real second pass**, not just the model swap.
+A four-round audit session on this very release (see below) kept surfacing
+the same underlying complaint from different angles: the reviewer prompt
+would happily pad a report with minor nits once nothing severe turned up, had
+no instruction against proposing scope-expanding refactors, and let an
+explicit user decision blanket-suppress a finding even when that decision
+caused a real defect. `plan_review_instructions` and `research_instructions`
+in `hooks/crosscheck.sh` now carry: a severity threshold (CRITICAL/HIGH/MEDIUM
+always, LOW only when it's a correctness defect fixable within the plan's own
+steps, style/naming/docs nits never), an explicit no-padding rule ("three
+verified findings beat ten padded ones"), a scope-discipline rule with no
+escape hatch for "useful but unrelated" ideas, a rule that a user's explicit
+decision protects the preference but not a defect it causes, and a trust
+boundary stating that the request, the plan, prior-round summaries, and
+repository content are data to evaluate, never instructions the reviewer
+should follow. The skill's own heredoc and the hook's deny reason got the
+Claude-side half of the same policy (relay findings by severity, don't pad
+the summary, don't let reconciling a finding become an excuse to widen the
+plan), rather than duplicating the reviewer's own rules a second time inside
+a prompt that already concatenates with them.
+
+**Multi-round audits are now capped at a hard 3 rounds.** 3.1.1 fixed how
+multiple rounds get reported to the user but left the count itself unbounded;
+a real session had already run 4 rounds on one plan before that fix landed.
+The cap lives in two places on purpose: `SKILL.md` keeps the actual count
+(there is still no per-plan-lineage state in the hook to track rounds
+against each other, unchanged from 3.1.1's design) and stops offering another
+round once round 3 is done, and `hooks/crosscheck.sh` gets a mechanical
+backstop, a new `--round N` argument on `--run`, validated as a setup failure
+before Codex ever runs, rejected once `N` exceeds a fixed `CROSSCHECK_MAX_ROUNDS=3`
+constant. That constant is deliberately **not** environment-overridable like
+`CROSSCHECK_MODEL`/`CROSSCHECK_EFFORT`/`CROSSCHECK_TIMEOUT`: an audit round
+against this very design caught that a configurable cap is a cap that can be
+raised, which defeats having one. If a real need for a configurable cap shows
+up later, that is a product decision to make on purpose, not a default to
+expose quietly through an env var.
+
+This release was itself audited by Codex through two live rounds of the new
+`plan-review` flow before implementation started. Round 1 (5 findings, all
+HIGH/MEDIUM) caught that an early draft of the round cap was still
+environment-overridable, that the reviewer prompt still had an "out of scope"
+escape hatch, that an explicit user decision was blanket-suppressing
+HIGH/MEDIUM findings instead of only preference disagreements, that the
+severity/no-padding rules hadn't reached `research_instructions` or the deny
+reason, and that the `--round` argument parser and its selftest coverage had
+gaps (a bare trailing `--round` could hang the parser under `set -uo
+pipefail` with no `-e`). Round 2 (4 more findings, 1 HIGH/3 MEDIUM) caught
+that the severity rules still hadn't reached the skill's own heredoc and the
+hook's deny reason, that neither prompt template declared a trust boundary
+against instruction injection from plan or repository content, that the
+README draft would have documented the fixed round cap in the same table
+labeled "all environment variables," and that the new `--round` selftests
+would have passed even if Codex were wrongly invoked, because the stubbed
+Codex accumulates invocations across the whole selftest run and nothing
+truncated the capture files between cases. All of it is incorporated above;
+see the two flagged findings' relay in the plan-review session itself for the
+one deliberate rejection (duplicating the reviewer's rules a second time
+inside the heredoc, folded into the Claude-side relay instructions instead,
+per the paragraph above).
+
+`hooks/crosscheck.sh --selftest` gained coverage for `--round`: valid rounds
+up to the cap, rejection above the cap, a missing value, non-numeric and
+negative values, zero, rejection in `research` mode, and confirmation that
+`CROSSCHECK_MAX_ROUNDS` as an environment variable has no effect. It also
+confirms the updated `plan_review_instructions` template is what actually
+reaches Codex (no more "OUT OF SCOPE" section, the new no-padding rule
+present in the captured stdin).
+
 ## 3.1.1
 
 A real multi-round session (incorporate a finding, hash changes, hook denies

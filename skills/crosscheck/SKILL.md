@@ -53,6 +53,8 @@ will keep denying forever.
       tmp="$(crosscheck --tmp-dir)"
       pf="$tmp/plan-<hash>.md"
       cat > "$pf" <<'CROSSCHECK_PROMPT_<hash>'
+      ROUND: N of 3
+
       ORIGINAL REQUEST:
       <the task the user actually asked for, in your own words, not the
       literal text of whatever they typed most recently if that was just an
@@ -66,9 +68,23 @@ will keep denying forever.
       <anything the user specified that the plan must follow: tradeoffs they
       picked, things they explicitly ruled out. Omit this section if there
       weren't any.>
+
+      PRIOR ROUNDS:
+      <only from round 2 onward, omit entirely on round 1. One line per
+      finding from every previous round on this same request: severity,
+      one-line title, and "incorporated" or "rejected: <why>". This is what
+      stops the next round from repeating a finding it already settled.>
       CROSSCHECK_PROMPT_<hash>
-      crosscheck --run --mode plan-review --prompt-file "$pf" --hash <hash>
+      crosscheck --run --mode plan-review --prompt-file "$pf" --hash <hash> --round N
       ```
+
+      `N` is a count you keep yourself: how many `--run --mode plan-review`
+      calls you've made for this same plan-mode task so far, starting at 1.
+      There's no state file for this, nothing to look up: you already know it
+      because you just made the previous calls. `--round` is validated by the
+      script before Codex ever runs (missing, non-numeric, or above the fixed
+      cap of 3 all fail as a setup error, never a Codex error), so passing the
+      wrong number surfaces immediately rather than silently.
 
       Two non-negotiable details in that heredoc, both there to stop the
       plan's own text from being interpreted as shell input instead of being
@@ -96,23 +112,27 @@ will keep denying forever.
    c. Because that script ends in `crosscheck --run`, make the whole `Bash`
       call `run_in_background: true`, with a `description` that says what's
       actually happening, not "running command", something like `"Codex
-      auditando el plan (gpt-5.6-sol, medium)"`, since that description is
-      what the user sees as the task's status label. The tmp-dir lookup and
-      the heredoc write are near-instant; backgrounding the whole script just
-      means the slow part (`--run`) doesn't block, not that the fast parts
-      run separately.
+      auditando el plan, ronda N/3 (gpt-6-astra, medium)"`, since that
+      description is what the user sees as the task's status label. The
+      tmp-dir lookup and the heredoc write are near-instant; backgrounding the
+      whole script just means the slow part (`--run`) doesn't block, not that
+      the fast parts run separately.
 
    d. Wait for the task notification. Do not poll.
 
    e. **On success (exit 0):** the tool result is either the full report
       (small reports inline directly) or a note pointing at an artifact
       file (large reports do not inline, `Read` that file instead). Either
-      way, summarize the findings for the user in your own words: lead with
-      the most severe or actionable ones, don't dump the raw report
-      verbatim. If a finding changes the plan, revise the plan file and say
-      so explicitly. Mention the artifact path so the user can read the
-      full thing if they want. Then call `ExitPlanMode` again: the hash is
-      now `reviewed`, so it will be allowed.
+      way, summarize the findings for the user in your own words, ordered by
+      severity (most severe first), and don't pad the summary with anything
+      Codex didn't itself flag as material: don't dump the raw report
+      verbatim, but don't add to it either. If a finding changes the plan,
+      revise the plan file to fix exactly what that finding points at, not
+      more: a Codex finding is not license to widen the plan beyond what the
+      finding itself corrects. Say explicitly what you changed. Mention the
+      artifact path so the user can read the full thing if they want. Then
+      call `ExitPlanMode` again: the hash is now `reviewed`, so it will be
+      allowed.
 
       **If this is not the first round on this plan (see "Running multiple
       rounds" below), do not summarize here: follow that section's reporting
@@ -158,10 +178,26 @@ message; only after that, as a separate step, ask whether to continue or stop
 (`AskUserQuestion` or plain text, whichever fits the moment).
 
 **When to stop:** a round that surfaces nothing materially new is a reason to
-stop, not a shrinking count on its own — a low count with a new CRITICAL is
+stop, not a shrinking count on its own: a low count with a new CRITICAL is
 not a signal to stop, and a high count of findings already seen and
 deliberately rejected before is not a signal to keep going. Judge by content,
 because content is what got posted.
+
+**Hard cap: 3 rounds, no exceptions.** This is not a suggestion you weigh
+against "when to stop" above; it is a fixed limit enforced by `crosscheck
+--run` itself (`--round` above 3 is rejected before Codex ever runs). Keep
+count of how many rounds you've run on this plan-mode task (see step 3.b: it's
+the same `N` you're already passing as `--round N`). After round 3's findings
+are posted and reconciled, do not offer a fourth round and do not ask the
+"continue or stop" question at all: go straight to showing the plan. If the
+plan text changed after round 3 (from incorporating round 3's own findings)
+and the hook denies `ExitPlanMode` again on the new hash, do not invoke
+`AskUserQuestion` for that denial: run `crosscheck --skip --hash <new-hash>`
+directly and tell the user plainly, in chat, that the round cap was reached
+and this last edit is going out unaudited. If `crosscheck --run` itself
+returns the round-cap rejection (a nonzero exit whose message names the
+maximum), treat that exactly the same way, as the cap being reached, not as a
+Codex failure: `--skip` and `ExitPlanMode`, no retry.
 
 ## Entry point B: the user typed `/crosscheck`
 
@@ -182,6 +218,12 @@ second opinion on whatever's live in the conversation right now.
    not a copy-paste of the user's last message: if the last message alone
    isn't enough to hand to someone with no other context, it isn't enough
    for Codex either.>
+
+   SCOPE:
+   <one line on what's actually in scope for this question, and, if it
+   matters, one line on what's explicitly not: research mode has the same
+   scope-discipline rule as plan-review, it should investigate what was
+   asked, not wander into unrelated refactors it notices along the way.>
    CROSSCHECK_REQUEST_<random-token>
    crosscheck --run --mode research --prompt-file "$pf"
    ```
@@ -192,11 +234,16 @@ second opinion on whatever's live in the conversation right now.
 
 ## Notes
 
-- `CROSSCHECK_MODEL` (default `gpt-5.6-sol`), `CROSSCHECK_EFFORT` (default
+- `CROSSCHECK_MODEL` (default `gpt-6-astra`), `CROSSCHECK_EFFORT` (default
   `medium`, deliberately: see the plugin's `CHANGELOG.md` for why `high`
   is not the default), and `CROSSCHECK_TIMEOUT` (default `600` seconds) are
   environment variables the user may already have set; don't override them
   unless asked to.
+- The 3-round cap is **not** one of those environment variables. It's a fixed
+  constant in `hooks/crosscheck.sh` on purpose (a configurable cap is a cap
+  that can be raised), so there's no `CROSSCHECK_MAX_ROUNDS` to set. Round
+  tracking is entirely on this skill's side: pass the right `--round N` (see
+  step 3.b) and respect the hard-cap rule in "Running multiple rounds".
 - One `Bash` call per invocation of this skill. Don't split the tmp-dir
   lookup, the write, and the run into separate backgrounded calls: only the
   `--run` itself needs `run_in_background`.
