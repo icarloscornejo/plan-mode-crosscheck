@@ -98,11 +98,15 @@ that numbers them against each other or remembers what an earlier round found
 (each round's prompt carries a `PRIOR ROUNDS` summary instead, assembled by
 the skill).
 
-Because each round is independent, the `crosscheck` skill is instructed that
-from round 2 onward it must post every finding from the round that just
-finished as plain chat text, one at a time, **before** asking whether to run
-another round or stop, never as a bare count or trend. A shrinking finding
-count doesn't tell you whether it's safe to stop; the actual findings do.
+Because each round is independent, the `crosscheck` skill is instructed to
+post every finding from the round that just finished as plain chat text, one
+at a time, ordered by severity, **before** asking whether to run another
+round or stop, never as a bare count or trend. A shrinking finding count
+doesn't tell you whether it's safe to stop; the actual findings do. Right
+after the findings, the skill states an explicit recommendation, one more
+round or show the plan, with reasons that weigh this round's findings against
+what earlier rounds already found, incorporated, or rejected, and only then
+asks you to decide, with the recommended option listed first.
 
 **Rounds are capped at a fixed maximum of 3** on any single plan. This is not
 an environment variable and can't be raised by setting one: it's a constant in

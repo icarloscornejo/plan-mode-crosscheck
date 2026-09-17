@@ -1164,6 +1164,8 @@ Si este plan ya acumulo ${CROSSCHECK_MAX_ROUNDS} rondas de auditoria en esta con
 
 Al incorporar hallazgos de Codex al plan, la correccion se limita a lo que cada hallazgo senala: un hallazgo no es licencia para ampliar el plan mas alla de eso. Al relayar hallazgos al usuario, ordenalos por severidad (CRITICAL primero) y no rellenes el resumen con nada que Codex no haya marcado como material.
 
+Si esta denegacion viene de un plan editado tras incorporar hallazgos de una ronda anterior, antes de preguntar de nuevo tenes que haber posteado esos hallazgos ordenados por severidad y una recomendacion explicita (otra ronda, o mostrar el plan) con razones que crucen lo encontrado en esta ronda contra lo de rondas anteriores; la pregunta al usuario lleva la opcion recomendada primero.
+
 Hash de este plan: ${hash}. ExitPlanMode no se va a permitir para este texto exacto de plan hasta que una de las dos rutas quede registrada. Si el plan se edita, el hash cambia y hay que decidir de nuevo."
 
   jq -n --arg reason "$reason" '{

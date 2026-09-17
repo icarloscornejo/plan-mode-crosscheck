@@ -27,6 +27,12 @@ will keep denying forever.
    audit of this plan before it's shown? Yes/No, one question, no need to
    over-explain: the deny reason already told you why you're asking.
 
+   **Exception: if this denial is on a hash produced by editing the plan to
+   incorporate an earlier round's findings** (i.e. this is round 2 or later
+   on the same plan-mode task), do not ask a bare Yes/No. Follow "Recommending:
+   one more round, or show the plan" below instead, which folds this same
+   question into a recommendation with the suggested option listed first.
+
 2. **If the user says No:**
    ```
    crosscheck --skip --hash <hash>
@@ -122,21 +128,13 @@ will keep denying forever.
 
    e. **On success (exit 0):** the tool result is either the full report
       (small reports inline directly) or a note pointing at an artifact
-      file (large reports do not inline, `Read` that file instead). Either
-      way, summarize the findings for the user in your own words, ordered by
-      severity (most severe first), and don't pad the summary with anything
-      Codex didn't itself flag as material: don't dump the raw report
-      verbatim, but don't add to it either. If a finding changes the plan,
-      revise the plan file to fix exactly what that finding points at, not
-      more: a Codex finding is not license to widen the plan beyond what the
-      finding itself corrects. Say explicitly what you changed. Mention the
-      artifact path so the user can read the full thing if they want. Then
-      call `ExitPlanMode` again: the hash is now `reviewed`, so it will be
-      allowed.
-
-      **If this is not the first round on this plan (see "Running multiple
-      rounds" below), do not summarize here: follow that section's reporting
-      requirement instead before deciding anything.**
+      file (large reports do not inline, `Read` that file instead). Follow
+      "Relaying a round's findings" below to report it, then "Recommending:
+      one more round, or show the plan" to decide what happens next. If a
+      finding changes the plan, revise the plan file to fix exactly what
+      that finding points at, not more: a Codex finding is not license to
+      widen the plan beyond what the finding itself corrects. Say explicitly
+      what you changed.
 
    f. **On failure (nonzero exit):** Codex is broken (not installed, not
       logged in, timed out, etc; the stderr in the tool result says which).
@@ -148,56 +146,83 @@ will keep denying forever.
       so the hash is marked `skipped` (an attempted-and-failed audit is not
       a silent bypass, the user was told), and call `ExitPlanMode` again.
 
-## Running multiple rounds on the same plan
+## Relaying a round's findings
 
-Nothing about the state machine stops this from happening, and it isn't a bug
-when it does: if a round's findings change the plan text, the hash changes,
-the hook denies `ExitPlanMode` again, and step 1 fires again asking whether to
-audit. Round 2, round 3, and so on are all the same flow above, run again on
-the new hash. There is no state that numbers rounds against each other or
-remembers what earlier rounds found; each run is an independent Codex thread
-with no memory of the previous one (see the header comment in
-`hooks/crosscheck.sh` for why).
+Applies to every `plan-review` run, round 1 and every round after it. (Entry
+point B, `/crosscheck`'s `research` mode, does not use this format; see its
+own section below.)
 
-That independence is exactly why round 2 onward needs a different reporting
-step than a first round does. On a first round, summarizing findings and
-moving on is enough, because there's no decision to make about whether to
-keep going. From round 2 onward there is: continue auditing, or stop here and
-show the plan. That decision needs the actual findings in front of the user,
-not a proxy for them.
+Post the findings as plain chat text, one numbered block per finding,
+**strictly in descending severity order: CRITICAL, HIGH, MEDIUM, LOW.** Within
+the same severity, keep the order Codex returned them in. Never reorder by
+file, by incorporation order, or by whichever one seems most interesting to
+mention first.
 
-**Before asking whether to run another round or stop, post every finding from
-the round that just finished as plain chat text, one at a time**: severity,
-title, the evidence, the required correction, and whether the plan
-incorporated it or it was deliberately rejected (and why). Do this even if
-there are many findings and even if severity is low. **Do not substitute this
-with a count or a trend** ("findings went from 12 down to 5") — a shrinking or
-growing number tells you a trend existed, it gives the user nothing to weigh a
-"one more round" decision against. Post the findings first, as their own
-message; only after that, as a separate step, ask whether to continue or stop
-(`AskUserQuestion` or plain text, whichever fits the moment).
+For each finding:
 
-**When to stop:** a round that surfaces nothing materially new is a reason to
-stop, not a shrinking count on its own: a low count with a new CRITICAL is
-not a signal to stop, and a high count of findings already seen and
-deliberately rejected before is not a signal to keep going. Judge by content,
-because content is what got posted.
+```
+N. [SEVERITY] one-line title
+Evidence: <file/line Codex cited>
+Required correction: <what Codex said to fix>
+Status: incorporated (<exactly what you changed in the plan>) | rejected: <why> | not applicable: <why>
+```
 
-**Hard cap: 3 rounds, no exceptions.** This is not a suggestion you weigh
-against "when to stop" above; it is a fixed limit enforced by `crosscheck
---run` itself (`--round` above 3 is rejected before Codex ever runs). Keep
-count of how many rounds you've run on this plan-mode task (see step 3.b: it's
-the same `N` you're already passing as `--round N`). After round 3's findings
-are posted and reconciled, do not offer a fourth round and do not ask the
-"continue or stop" question at all: go straight to showing the plan. If the
-plan text changed after round 3 (from incorporating round 3's own findings)
-and the hook denies `ExitPlanMode` again on the new hash, do not invoke
-`AskUserQuestion` for that denial: run `crosscheck --skip --hash <new-hash>`
-directly and tell the user plainly, in chat, that the round cap was reached
-and this last edit is going out unaudited. If `crosscheck --run` itself
-returns the round-cap rejection (a nonzero exit whose message names the
-maximum), treat that exactly the same way, as the cap being reached, not as a
-Codex failure: `--skip` and `ExitPlanMode`, no retry.
+Do this even if there are many findings and even if severity is low. Never
+substitute this with a count or a trend ("findings went from 12 down to 5"):
+a shrinking or growing number tells you a trend existed, it gives the user
+nothing to weigh a "one more round" decision against. Don't pad the list with
+anything Codex didn't itself flag as material, and don't dump the raw report
+verbatim either, this is a structured relay, not a copy-paste. Mention the
+artifact path so the user can read the full report if they want. A finding is
+not license to widen the plan beyond what it specifically points at.
+
+## Recommending: one more round, or show the plan
+
+Runs once per round, immediately after "Relaying a round's findings" above,
+and before calling `ExitPlanMode` again. Skip it only when the plan text did
+not change (nothing was incorporated), since then there's no new hash and no
+pending decision to make.
+
+Before saying anything, reread this round's findings against every prior
+round on this same plan-mode task (the same `PRIOR ROUNDS` summary you
+already assemble for the prompt in step 3.b: severity, title, and whether
+each was incorporated or rejected). This is your own judgment call, not
+something Codex does for you.
+
+State an explicit recommendation, in the same message as the findings, right
+after the list: either **"I recommend one more round"** or **"I recommend
+showing the plan now"**, followed by reasons that cite findings by number or
+title, never by count. Decision rules:
+
+- This round incorporated a new CRITICAL or HIGH: recommend one more round.
+  Nobody has reviewed that change yet.
+- Only MEDIUM/LOW came up, all incorporated as small, scoped edits, or
+  nothing material came up at all: recommend showing the plan.
+- This round mostly repeated findings already rejected in an earlier round
+  with no new evidence behind them: that weighs toward showing the plan, not
+  continuing.
+- Always state how many rounds remain under the cap of 3.
+
+Only after stating the recommendation, as a separate step, ask the user with
+`AskUserQuestion`, listing the recommended option first and labeled
+"(Recommended)" (do not repeat the reasons in the question itself, they're
+already in the chat message above).
+
+**Hard cap: 3 rounds, no exceptions.** This is not a factor you weigh against
+the rules above; it is a fixed limit enforced by `crosscheck --run` itself
+(`--round` above 3 is rejected before Codex ever runs). Keep count of how many
+rounds you've run on this plan-mode task (see step 3.b: it's the same `N`
+you're already passing as `--round N`). After round 3's findings are posted
+and reconciled, skip this section entirely: no recommendation, no question,
+go straight to showing the plan. If the plan text changed after round 3 (from
+incorporating round 3's own findings) and the hook denies `ExitPlanMode` again
+on the new hash, do not invoke `AskUserQuestion` for that denial: run
+`crosscheck --skip --hash <new-hash>` directly and tell the user plainly, in
+chat, that the round cap was reached and this last edit is going out
+unaudited. If `crosscheck --run` itself returns the round-cap rejection (a
+nonzero exit whose message names the maximum), treat that exactly the same
+way, as the cap being reached, not as a Codex failure: `--skip` and
+`ExitPlanMode`, no retry.
 
 ## Entry point B: the user typed `/crosscheck`
 
@@ -230,7 +255,15 @@ second opinion on whatever's live in the conversation right now.
    No `--hash`: this mode never touches plan state. Run the whole call with
    `run_in_background: true` and a descriptive `description`, same as A.c.
 
-2. Wait for the notification, then relay findings the same way as A.e above.
+2. Wait for the notification. `research_instructions` (see
+   `hooks/crosscheck.sh`) returns structured evidence, current behavior, data
+   flow, a minimal implementation, tests, edge cases/risks, open questions,
+   not severity-ranked findings against a plan. Do not force it into the
+   "Relaying a round's findings" format above: there's no plan to incorporate
+   into, no accept/reject decision, and no round to recommend continuing or
+   stopping. Preserve Codex's own structure instead, and only present items in
+   severity order where Codex itself classified them that way (typically
+   within "Edge cases and risks").
 
 ## Notes
 
@@ -243,7 +276,8 @@ second opinion on whatever's live in the conversation right now.
   constant in `hooks/crosscheck.sh` on purpose (a configurable cap is a cap
   that can be raised), so there's no `CROSSCHECK_MAX_ROUNDS` to set. Round
   tracking is entirely on this skill's side: pass the right `--round N` (see
-  step 3.b) and respect the hard-cap rule in "Running multiple rounds".
+  step 3.b) and respect the hard-cap rule in "Recommending: one more round,
+  or show the plan".
 - One `Bash` call per invocation of this skill. Don't split the tmp-dir
   lookup, the write, and the run into separate backgrounded calls: only the
   `--run` itself needs `run_in_background`.

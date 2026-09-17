@@ -2,6 +2,52 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.2.1
+
+Real multi-round sessions surfaced two relay defects that 3.2.0 didn't touch,
+both in how Claude reports a round's results, not in Codex's own output
+(`plan_review_instructions` already ranks findings by severity).
+
+**Findings didn't come out ordered by severity.** The only place `SKILL.md`
+said "ordered by severity" was buried in step A.e's prose for a first round.
+The separate "Running multiple rounds" section, which is what actually
+governs round 2 onward, said "post every finding ... one at a time" with no
+ordering requirement at all, so round 2+ reports (the common case in any
+multi-round session) had no severity-ordering rule to follow.
+
+**The continue-or-stop question came with no reasoning behind it.** The old
+"When to stop" block was written as criteria for Claude to judge by
+internally; nothing required that judgment to actually reach the user. In
+practice Claude posted the findings, then asked a bare "one more round or
+show the plan?" with no recommendation and no comparison against what earlier
+rounds already found, incorporated, or rejected.
+
+`SKILL.md` now has two sections instead of one ambiguous one: "Relaying a
+round's findings" (a fixed per-finding format, strict descending severity
+order, applies to every `plan-review` round including the first) and
+"Recommending: one more round, or show the plan" (reread this round against
+every prior round's summary, state an explicit "I recommend one more round"
+or "I recommend showing the plan now" with reasons that cite findings by
+name, then ask, with the recommended option listed first and labeled
+"Recommended"). The hard 3-round cap is unchanged, now stated once inside the
+recommendation section instead of duplicated. The hook's own deny reason
+(`hooks/crosscheck.sh`) gained one sentence making the same requirement
+explicit for round 2 onward.
+
+Entry point B (`/crosscheck`'s `research` mode) was pulled out of this
+format entirely, on Codex's own advice during this release's plan-review
+audit: `research_instructions` returns structured evidence (behavior, data
+flow, tests, open questions), not severity-ranked findings against a plan,
+and forcing that shape onto it would have made Claude invent severities and
+incorporation decisions for a request that was never a plan in the first
+place.
+
+This release was itself audited by Codex through the new plan-review flow
+before implementation, one round, two findings (the research-mode scope leak
+above, and that `grep -P` for the em-dash check in this plan's own
+verification section fails on BSD `grep`, macOS's default), both
+incorporated.
+
 ## 3.2.0
 
 Three changes, all from real usage of 3.1.1.
