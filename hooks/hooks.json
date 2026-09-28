@@ -1,5 +1,5 @@
 {
-  "description": "Plan Mode Crosscheck: on ExitPlanMode, gates showing the plan on an explicit decision (recorded per plan-hash) about an independent Codex CLI audit, offered to the user via the crosscheck skill.",
+  "description": "Plan Mode Crosscheck: on ExitPlanMode, gates showing the plan on an explicit decision (recorded per plan-hash) about an independent audit (Codex and/or Claude, per /crosscheck-setup), offered to the user via the crosscheck skill.",
   "hooks": {
     "PreToolUse": [
       {

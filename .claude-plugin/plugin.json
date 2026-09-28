@@ -1,8 +1,8 @@
 {
   "name": "plan-mode-crosscheck",
   "displayName": "Plan Mode Crosscheck",
-  "version": "3.2.1",
-  "description": "Get an independent second opinion from Codex CLI (a separate model, read-only sandbox) on a finished Plan Mode plan before you see it, or on demand via /crosscheck at any point in a conversation. Requires Codex CLI installed and logged in with ChatGPT.",
+  "version": "3.3.0",
+  "description": "Get an independent second opinion on a finished Plan Mode plan before you see it, or on demand via /crosscheck: from Codex CLI (default), a Claude model (Fable, Opus), or both in parallel. Pick with /crosscheck-setup. Codex CLI is only required if the engine uses it.",
   "author": {
     "name": "Carlos Cornejo"
   },
@@ -12,6 +12,7 @@
   "keywords": [
     "plan-mode",
     "codex",
+    "fable",
     "second-opinion",
     "claude-code",
     "research"

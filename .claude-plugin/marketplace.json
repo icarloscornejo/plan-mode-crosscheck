@@ -7,7 +7,7 @@
     {
       "name": "plan-mode-crosscheck",
       "source": "./",
-      "description": "Independent Codex CLI audit of the finished Plan Mode plan, or on demand via /crosscheck."
+      "description": "Independent audit (Codex CLI, a Claude model, or both) of the finished Plan Mode plan, or on demand via /crosscheck. Configure with /crosscheck-setup."
     }
   ]
 }

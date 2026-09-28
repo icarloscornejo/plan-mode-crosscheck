@@ -2,6 +2,91 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.3.0
+
+Multiple audit engines, an interactive setup, and no more round cap.
+
+**Engines.** Besides Codex (still the default, `gpt-6-astra`, `gpt-5.6-sol` as
+the alternative), the audit can now run on a Claude model (`fable` by default,
+or `opus`, `sonnet`, `haiku`) or on both in parallel. In `both`, the main
+session reads the two reports and relays a single deduplicated list in the
+usual severity order, each finding labeled `codex`, `claude:<model>` or
+`ambos`; contradictions are checked against the repo before relaying.
+
+A shell script cannot call the `Agent` tool, so the Claude engine lives in the
+`crosscheck` skill. The script only adds the mechanical halves:
+`crosscheck --prepare` assembles the task (the same text, byte for byte, that
+`--run` gives Codex) and `crosscheck --record` publishes a report through the
+same path as `--run`, so the `ExitPlanMode` gate is engine-agnostic. `--run`
+and `--record` now share `publish_report`; the prompt comes from a shared
+`assemble_task`. Log lines carry `engine=`. In `both`, the state file's
+`.artifact` points at whichever report was recorded last; both paths are shown
+to the user.
+
+Known deviation: the Claude engine is not a separate sandboxed process like
+Codex. It is a fresh-context `Plan` subagent (no Edit/Write) with a different
+model than the session. The README says so.
+
+**Setup.** New `/crosscheck-setup` skill asks for engine and models and saves
+them with `crosscheck --config set` to `config.json` in the state root (outside
+the pruned `state/`). `--config get` prints the resolved config, including
+`codex_model_source`. Precedence for the Codex model: `CROSSCHECK_MODEL`, then
+`config.json`, then the default. `--config set` requires all three values and
+replaces the file whole, so it also repairs a corrupt file. A corrupt config
+fails `--config get` and `--run` as a setup error (never as "codex exec
+failed"), and `--skip` never reads the config, so a plan can always be let
+through. The Claude model is an `Agent` alias; the concrete version behind it
+is decided by Claude Code.
+
+**Round cap removed, and every round now aims to be the only one.** 3.2.0
+capped rounds at 3 so each would be as valuable as possible. A cap only cuts
+rounds off; it never made any of them find more, so it is removed by explicit
+decision of the author (`CROSSCHECK_MAX_ROUNDS`, the `--round` flag and the
+"3 rounds" text in the deny reason are gone; a stray `--round N` is ignored).
+Nothing loops on its own: every extra round still needs the user's explicit
+"Otra ronda", with the recommendation from 3.2.1 shown first.
+
+The root cause was measured on this very feature's own audit (three rounds,
+effort `medium`, about 1.5 minutes each). Round 2's findings (the round counter
+ignoring the claude engine, a lost `umask` in the second `Bash` call) were
+already present in round 1's plan; round 3's finding was introduced by round
+1's own correction. Nearly all findings were the same shape: a path the plan
+adds (another engine, shell, mode) meeting a mechanism that already existed
+(the gate, permissions, counters). Two causes:
+
+1. *The auditor settled.* The prompt had no systematic sweep, capped output at
+   8 findings, ran at `medium`, and `ROUND: N` told it another round would
+   follow. Now `plan_review_instructions` says this is the only review the plan
+   will get, and asks for a sweep of every path the plan adds or changes
+   against every existing mechanism it touches, checking sibling paths for the
+   same defect and reporting the family as one finding. The 8-finding cap is
+   removed (the severity threshold decides what is reported); "Do not pad"
+   stays. The inspection boundary is what the request and conversation require
+   (including behaviors the plan omitted) plus what the plan changes and what
+   depends on it: not a survey of the project. Reports end with one
+   `Coverage:` line listing everything examined, so "nothing found" can be
+   told apart from "not reviewed".
+2. *Fixes were made one finding at a time.* The skill said to fix "exactly what
+   that finding points at", so a sibling instance of the same defect waited for
+   the next round, and the new text a fix introduced was never reviewed with
+   care. The skill (and the `ExitPlanMode` deny reason, which repeated the old
+   rule on every new hash) now say to fix the same cause in every instance
+   inside the request's scope, to reread the edits against the same
+   path-by-mechanism pairings, and from round 2 on the prompt carries
+   `CHANGES SINCE LAST ROUND`, which the auditor treats as unreviewed. A changed
+   part missing from `Coverage:` weighs toward one more round.
+
+**Codex effort is now configurable.** `config.json` gains `codex_effort`
+(`low`, `medium`, `high`, `xhigh`; a config saved without it resolves to
+`medium`, so the default is unchanged), chosen in `/crosscheck-setup`
+(`high` recommended). `--config set` now requires `--codex-effort` and
+`--config get` reports `codex_effort` and `codex_effort_source`.
+`CROSSCHECK_EFFORT` still wins over the saved value. Because `high` was
+measured at up to ~11 minutes, the default `CROSSCHECK_TIMEOUT` now follows the
+resolved effort (`low`/`medium` 600 s, `high` 1200 s, `xhigh` 1800 s) so a
+review inside its normal range is not killed and discarded; an explicit
+`CROSSCHECK_TIMEOUT` is respected as is.
+
 ## 3.2.1
 
 Real multi-round sessions surfaced two relay defects that 3.2.0 didn't touch,

@@ -1,22 +1,43 @@
 # Plan Mode Crosscheck
 
-**Get an independent second opinion from [Codex CLI](https://github.com/openai/codex)
-(OpenAI's coding CLI, a separate model, a separate process, a read-only view of
-your repo) on a finished Plan Mode plan, or on whatever's being discussed right
-now.**
+**Get an independent second opinion on a finished Plan Mode plan, or on
+whatever's being discussed right now, from [Codex CLI](https://github.com/openai/codex)
+(the default), from a Claude model such as Fable, or from both in parallel.**
 
 Two ways to trigger it:
 
 - **Automatic, on `ExitPlanMode`.** When Claude finishes a plan and tries to
   show it to you, this plugin denies that call once and asks Claude to check
-  with you first: do you want Codex to independently audit this plan before
+  with you first: do you want an independent audit of this plan before
   you see it? Say yes and Claude runs the audit, reconciles anything it finds,
   and shows you the plan. Say no and it shows you the plan as-is.
 - **Manual, `/crosscheck`, any time.** Ask for a second opinion mid-conversation
   on whatever's currently being discussed, no plan required.
 
-Both routes run the same Codex CLI call, in the background, so you keep
-working (or reading) while it runs.
+Both routes run the audit in the background, so you keep working (or
+reading) while it runs.
+
+## Engines and setup
+
+Type `/crosscheck-setup` once to pick who audits, and again whenever a new
+model version ships:
+
+| Engine | What runs | Notes |
+|---|---|---|
+| `codex` (default) | `codex exec`, read-only sandbox, separate process | Default model `gpt-6-astra`; `gpt-5.6-sol` is the alternative. |
+| `claude` | A Claude model as a fresh-context `Plan` subagent (`fable` by default, or `opus`, `sonnet`, `haiku`) | Launched by the skill through the `Agent` tool. |
+| `both` | The two above in parallel | Claude reads both reports and keeps one deduplicated list, each finding labeled `codex`, `claude:<model>` or `ambos`. |
+
+Out of the box nothing changes: Codex `gpt-6-astra` only.
+
+**The Claude engine is not isolated like Codex.** Codex runs as a separate
+process under a read-only sandbox. The Claude engine runs inside your Claude
+Code session as a subagent: it has no Edit/Write tools (the `Plan` agent type
+excludes them), starts from a fresh context (no fork) and uses a different
+model than your session, but it is not a separate sandboxed process. The
+Claude model is one of the `Agent` tool's aliases; which concrete version sits
+behind each alias (for example `ANTHROPIC_DEFAULT_OPUS_MODEL`) is decided by
+Claude Code, not by this plugin.
 
 ## Why this shape, not "research the whole time in the background"
 
@@ -32,9 +53,10 @@ actually worth researching turned out to be a better deal.
 
 ## Prerequisites
 
-- [Codex CLI](https://github.com/openai/codex) installed and on your `PATH`.
-- Logged in with a ChatGPT account: `codex login status` should print
-  `Logged in using ChatGPT`.
+- [Codex CLI](https://github.com/openai/codex) installed and on your `PATH`,
+  logged in with a ChatGPT account (`codex login status` should print
+  `Logged in using ChatGPT`). Only required if your engine is `codex` or
+  `both`.
 - `jq` installed (used for all JSON parsing).
 - A `timeout` command on your `PATH`, GNU coreutils' `timeout` or its
   `gtimeout` alias. Stock macOS ships neither; `brew install coreutils` gets
@@ -56,10 +78,10 @@ plugin is enabled, no manual edits to `settings.json`.
 
 ## How it actually works
 
-One hook, one skill.
+One hook, two skills.
 
 **Hook** (`hooks/crosscheck.sh`, `PreToolUse` on `ExitPlanMode`): pure bash and
-`jq`, no Codex call. It hashes the plan text (`tool_input.plan`) and checks a
+`jq`, no audit call. It hashes the plan text (`tool_input.plan`) and checks a
 small state file for that hash:
 
 - No decision on record yet: mark it `pending`, **deny** the `ExitPlanMode`
@@ -67,7 +89,7 @@ small state file for that hash:
   skill.
 - Already `reviewed` or `skipped` for this exact plan text: **allow**.
 
-Because the hook never calls Codex itself, it returns in a fraction of a
+Because the hook never runs an audit itself, it returns in a fraction of a
 second every time. There's nothing to wait on.
 
 **Skill** (`skills/crosscheck/SKILL.md`, invoked by Claude after the deny, or
@@ -77,11 +99,18 @@ original task, or whatever's live in the conversation for a manual
 for the result, and relays the findings to you in its own words rather than
 dumping the raw report. On the plan-review path, a successful run marks that
 plan's hash `reviewed`, which is what lets the next `ExitPlanMode` call
-through. It invokes the engine as a bare `crosscheck` command rather than a
+through. With the Claude engine, the skill itself makes the `Agent` call
+(a shell script cannot) and the script only does the mechanical halves:
+`crosscheck --prepare` assembles the task and `crosscheck --record` publishes
+the report, so the `ExitPlanMode` gate sees the same `reviewed` state whatever
+the engine. It invokes the CLI as a bare `crosscheck` command rather than a
 full path: this plugin ships a thin wrapper at `bin/crosscheck`, and Claude
 Code adds an enabled plugin's own `bin/` directory to `PATH`, so the skill
 never has to know (or guess wrong, across installs and updates) where the
 plugin actually lives on disk.
+
+**Setup skill** (`skills/crosscheck-setup/SKILL.md`, `/crosscheck-setup`):
+asks for engine and models and saves them with `crosscheck --config set`.
 
 If the plan changes after being reviewed or skipped, its hash changes too, and
 the whole cycle starts over for the new text. You can't silently carry a stale
@@ -89,11 +118,11 @@ approval forward onto a plan that's since been edited.
 
 ## Multiple rounds
 
-If a Codex finding changes the plan text, that's a new hash, and the cycle
+If a finding changes the plan text, that's a new hash, and the cycle
 above runs again on it: the hook denies `ExitPlanMode` again, and Claude asks
 again whether to audit. That's not a bug, it's the same one-hash-one-decision
 gate applying to the plan's new text. Round 2, round 3, and so on are all
-independent Codex threads with no memory of earlier rounds; there's no state
+independent audits with no memory of earlier rounds; there's no state
 that numbers them against each other or remembers what an earlier round found
 (each round's prompt carries a `PRIOR ROUNDS` summary instead, assembled by
 the skill).
@@ -108,36 +137,56 @@ round or show the plan, with reasons that weigh this round's findings against
 what earlier rounds already found, incorporated, or rejected, and only then
 asks you to decide, with the recommended option listed first.
 
-**Rounds are capped at a fixed maximum of 3** on any single plan. This is not
-an environment variable and can't be raised by setting one: it's a constant in
-`hooks/crosscheck.sh`, and `crosscheck --run` itself rejects a `--round`
-above that maximum before Codex ever runs. The skill keeps the actual count
-(there's no per-plan-lineage state in the hook to track it), and after round 3
-it stops offering another round outright: any further edit to the plan goes
-out with `crosscheck --skip`, marked explicitly to you as unaudited.
+**There is no round cap.** Version 3.2.0 capped rounds at 3 so each one would
+be as valuable as possible, but a cap only cuts rounds off; it does not make
+any of them find more. 3.3.0 removes it and goes after the cause instead, so
+that every round is written as if it were the only one:
+
+- The auditor is told this is the only review the plan will get, and sweeps
+  every path the plan adds or changes against every existing mechanism those
+  paths touch (state, permissions, counters, error handling, cleanup, gates),
+  checking sibling paths for the same defect. The old "at most 8 findings"
+  limit is gone; "do not pad" stays, so nothing is reported just to have a
+  finding.
+- The sweep stays tied to what the request and the conversation require, plus
+  what the plan changes and what depends on it. It is not a survey of the
+  project.
+- Fixes cover every instance of a defect, not only the one cited, and from
+  round 2 on the prompt carries `CHANGES SINCE LAST ROUND`, which the auditor
+  reviews as unreviewed text.
+- Each report ends with a `Coverage:` line listing what was examined, so "found
+  nothing" can be told apart from "did not look".
+
+Nothing loops on its own: every extra round still needs your explicit "Otra
+ronda", with the skill's recommendation in front of you.
 
 ## Failure handling
 
-If Codex isn't installed, isn't logged in, or times out, `hooks/crosscheck.sh
---run` exits nonzero and says why on stderr. This is not silent: the skill is
-instructed to tell you the audit failed and why, mark that plan's hash
-`skipped` so you aren't stuck waiting on a broken external tool, and continue.
-You always find out; you're never blocked indefinitely.
+If an engine isn't available (Codex not installed, not logged in, timed out,
+or the subagent returns nothing), the skill tells you which one failed and why.
+With `both`, it carries on with the engine that worked. If every configured
+engine fails, it marks that plan's hash `skipped` so you aren't stuck waiting
+on a broken tool, and continues. A corrupt `config.json` is handled the same
+way (`--skip` never reads the config) and is repaired by re-running
+`/crosscheck-setup`. You always find out; you're never blocked indefinitely.
 
 ## Configuration
 
-All optional, all environment variables, read by `hooks/crosscheck.sh --run`:
+Engine and models are saved by `/crosscheck-setup` in `config.json`, in the
+state root next to `logs/` and `state/` (it is never pruned). Precedence for
+the Codex model: `CROSSCHECK_MODEL` env var, then `config.json`, then the
+default. You can also manage it directly: `crosscheck --config get` and
+`crosscheck --config set --engine E --codex-model M --claude-model C
+--codex-effort F` (all four required; it replaces the file whole, which also repairs a corrupt one).
+
+The rest are optional environment variables, read by `hooks/crosscheck.sh --run`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CROSSCHECK_MODEL` | `gpt-6-astra` | Model passed to `codex exec -m`. |
-| `CROSSCHECK_EFFORT` | `medium` | `model_reasoning_effort` passed to Codex. See below for why this isn't `high` by default. |
-| `CROSSCHECK_TIMEOUT` | `600` | Budget, in seconds, for the Codex call. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
+| `CROSSCHECK_MODEL` | from `config.json`, else `gpt-6-astra` | Model passed to `codex exec -m`. Overrides the saved choice. |
+| `CROSSCHECK_EFFORT` | from `config.json`, else `medium` | `model_reasoning_effort` passed to Codex (`low`, `medium`, `high`, `xhigh`). Overrides the saved choice. See below for why `medium` is the default. |
+| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh` 1800 | Budget, in seconds, for the Codex call. Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
-
-The 3-round cap described in [Multiple rounds](#multiple-rounds) is
-deliberately not in this table: it's a fixed constant, not something you set
-through the environment.
 
 **About the default model:** `gpt-6-astra` is what the author uses day to day;
 it may not be available on every Codex CLI account or region. The previous
@@ -145,7 +194,8 @@ default, `gpt-5.6-sol`, is a known-good fallback if ASTRA isn't available on
 yours. If Codex fails with the default and you don't know why, set
 `CROSSCHECK_MODEL` to whatever model your own `codex exec` normally uses.
 
-**About the default effort:** `medium`, not `high`. Measured in practice,
+**About the default effort:** `medium`, not `high`, unless you pick otherwise in
+`/crosscheck-setup`. Measured in practice,
 `high` reasoning effort took Codex up to roughly 11 minutes on some plan
 reviews. That's a real cost even with nothing else waiting on it, and one good
 result at `high` isn't evidence it's worth paying by default: set
@@ -179,7 +229,7 @@ Resolved in this order:
    other than `~/.claude`).
 3. `~/.claude/plan-mode-crosscheck`, otherwise.
 
-Inside that directory: `logs/crosscheck.log` (structured, one line per run),
+Inside that directory: `config.json`, `logs/crosscheck.log` (structured, one line per run),
 `logs/crosscheck.stderr.log` (Codex's own stderr, timestamped and delimited
 per call), and `state/`, one small JSON file per plan hash (`pending`,
 `reviewed`, or `skipped`), a `reports/` subdirectory holding the full text of
@@ -207,14 +257,15 @@ Or, from inside a live Claude Code session with the plugin enabled, the bare
 works](#how-it-actually-works)): `crosscheck --selftest`.
 
 Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
-`--run` in both modes against a stubbed Codex binary, `--skip`, argument
+`--run` in both modes against a stubbed Codex binary, `--config`, `--prepare`,
+`--record`, `--skip`, argument
 validation, state-root resolution) with no real API calls and no ChatGPT auth
 needed, finishes in a few seconds. This is the fastest way to confirm the
 plugin's own logic works after any change. It does not confirm Codex CLI
 itself is installed and authenticated, or that the skill behaves correctly
 inside an actual Claude Code session. For that, try both routes for real
 (`/crosscheck`, and a real Plan Mode session through to `ExitPlanMode`) and
-check `logs/crosscheck.log`.
+check `logs/crosscheck.log` (lines carry `engine=codex` or `engine=claude`).
 
 ## Troubleshooting
 
@@ -240,7 +291,7 @@ descriptive label) rather than skipped.
 
 ## How it's different from just asking Claude twice
 
-Codex runs as a genuinely separate process, separate model, separate context
+With the Codex engine, Codex runs as a genuinely separate process, separate model, separate context
 window, with its own read-only view of the repo. It doesn't see Claude's
 reasoning, and Claude doesn't see Codex's reasoning until the skill relays it.
 The plan-review prompt specifically instructs Codex to derive the task's real
