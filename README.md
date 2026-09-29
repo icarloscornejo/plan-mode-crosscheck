@@ -25,19 +25,24 @@ model version ships:
 | Engine | What runs | Notes |
 |---|---|---|
 | `codex` (default) | `codex exec`, read-only sandbox, separate process | Default model `gpt-6-astra`; `gpt-5.6-sol` is the alternative. |
-| `claude` | A Claude model as a fresh-context `Plan` subagent (`fable` by default, or `opus`, `sonnet`, `haiku`) | Launched by the skill through the `Agent` tool. |
+| `claude` | A nested, read-only `claude -p --safe-mode` (`fable` by default; any alias or full model ID such as `claude-fable-5-1`) at the effort you pick | Launched by `crosscheck --run --engine claude`. |
 | `both` | The two above in parallel | Claude reads both reports and keeps one deduplicated list, each finding labeled `codex`, `claude:<model>` or `ambos`. |
 
 Out of the box nothing changes: Codex `gpt-6-astra` only.
 
-**The Claude engine is not isolated like Codex.** Codex runs as a separate
-process under a read-only sandbox. The Claude engine runs inside your Claude
-Code session as a subagent: it has no Edit/Write tools (the `Plan` agent type
-excludes them), starts from a fresh context (no fork) and uses a different
-model than your session, but it is not a separate sandboxed process. The
-Claude model is one of the `Agent` tool's aliases; which concrete version sits
-behind each alias (for example `ANTHROPIC_DEFAULT_OPUS_MODEL`) is decided by
-Claude Code, not by this plugin.
+**Models are typed, not listed.** `/crosscheck-setup` offers a few shortcuts
+(full IDs such as `claude-fable-5-1`, so each one pins a version) but "Other"
+takes any exact model ID, for Codex and for Claude, so a new model needs no
+plugin update. A Claude alias (`fable`, `opus`) typed there means whatever
+version Claude Code maps it to today (for example
+`ANTHROPIC_DEFAULT_OPUS_MODEL`); a full ID pins the version.
+
+**The Claude engine is not isolated like Codex.** Codex runs under a
+read-only sandbox. The Claude engine is a separate `claude -p` process with
+`--safe-mode` (no CLAUDE.md, skills, plugins, hooks or MCP servers, so no
+recursion into this plugin) and `--tools Read,Grep,Glob` (no Bash, Edit or
+Write), a fresh context and your normal Claude login. It is read-only by tool
+restriction, not by an OS sandbox. It needs the `claude` CLI on `PATH`.
 
 ## Why this shape, not "research the whole time in the background"
 
@@ -177,7 +182,12 @@ state root next to `logs/` and `state/` (it is never pruned). Precedence for
 the Codex model: `CROSSCHECK_MODEL` env var, then `config.json`, then the
 default. You can also manage it directly: `crosscheck --config get` and
 `crosscheck --config set --engine E --codex-model M --claude-model C
---codex-effort F` (all four required; it replaces the file whole, which also repairs a corrupt one).
+--codex-effort F --claude-effort G` (all five required; it replaces the file
+whole, which also repairs a corrupt one). Effort for Claude is `low`,
+`medium`, `high`, `xhigh` or `max` and is saved as `claude_effort`. Model IDs
+are opaque strings: they may not be empty, start with `-`, or contain
+whitespace or shell metacharacters. If you compose that command by hand,
+single-quote every value.
 
 The rest are optional environment variables, read by `hooks/crosscheck.sh --run`:
 
@@ -185,7 +195,7 @@ The rest are optional environment variables, read by `hooks/crosscheck.sh --run`
 |---|---|---|
 | `CROSSCHECK_MODEL` | from `config.json`, else `gpt-6-astra` | Model passed to `codex exec -m`. Overrides the saved choice. |
 | `CROSSCHECK_EFFORT` | from `config.json`, else `medium` | `model_reasoning_effort` passed to Codex (`low`, `medium`, `high`, `xhigh`). Overrides the saved choice. See below for why `medium` is the default. |
-| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh` 1800 | Budget, in seconds, for the Codex call. Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
+| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh`/`max` 1800 | Budget, in seconds, for the engine call (Codex or Claude, by that engine's effort). Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
 
 **About the default model:** `gpt-6-astra` is what the author uses day to day;

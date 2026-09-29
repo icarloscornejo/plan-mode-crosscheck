@@ -27,24 +27,23 @@
 #      instructions if there's no decision on record yet, allows otherwise.
 #      Pure bash + jq; does not itself call `codex` or wait on anything, so
 #      it returns in well under its 15s hook timeout every time.
-#   2. `--run --mode research|plan-review --prompt-file PATH [--hash HASH]`:
-#      the actual Codex CLI call, i.e. the codex engine. Invoked by the
+#   2. `--run --mode research|plan-review --prompt-file PATH [--hash HASH]
+#      [--engine codex|claude]`: the actual engine call, Codex CLI (default)
+#      or a nested read-only `claude -p`. Invoked by the
 #      `crosscheck` skill via the Bash tool with run_in_background, NOT by a
 #      hook, so it can take as long as it needs without racing any hook
 #      timeout. On success in plan-review mode, marks the given hash
 #      `reviewed`.
 #   3. `--prepare --mode M --prompt-file PATH` / `--record --engine claude
-#      --mode M --report-file PATH [--hash HASH]`: the claude engine's two
-#      mechanical halves. This script cannot invoke the Agent tool itself
-#      (only the skill can, since Agent is a Claude Code tool, not a shell
-#      command), so `--prepare` only assembles the task text for the skill to
-#      hand to Agent, and `--record` only publishes whatever report the skill
-#      got back, through the exact same path `--run` uses internally
-#      (`publish_report`). Neither one talks to Codex.
+#      --mode M --report-file PATH [--hash HASH]`: legacy mechanical halves
+#      from when the claude engine ran through the Agent tool (whose `model`
+#      parameter only accepts aliases and has no effort). The skill no longer
+#      uses them, `--run --engine claude` replaced that path; they still work
+#      and neither one talks to Codex.
 #   4. `--config get|set`: reads or persists the engine/model choice set via
-#      `/crosscheck-setup`, at `$CONFIG_FILE`. `--run` reads it (for
-#      `codex_model`) but does not act on `engine`: which engine(s) actually
-#      run for a given audit is a decision the skill makes, not this script.
+#      `/crosscheck-setup`, at `$CONFIG_FILE`. `--run` reads it (models and
+#      efforts) but does not act on `engine`: which engine(s) actually run for
+#      a given audit is a decision the skill makes, passed as `--engine`.
 #   5. `--skip --hash HASH`: marks a hash `skipped` without calling any
 #      engine, for when the user declines, or when a run attempt failed and
 #      the skill falls back to not blocking the user on a broken external
@@ -125,7 +124,7 @@ STDOUT_INLINE_MAX_BYTES=6000
 timeout_default_for_effort() {
   case "$1" in
     high) printf '1200' ;;
-    xhigh) printf '1800' ;;
+    xhigh|max) printf '1800' ;;
     *) printf '600' ;;
   esac
 }
@@ -320,6 +319,31 @@ run_codex() {
   return $rc
 }
 
+# Claude twin of run_codex. Args: $1 instructions, $2 request body, $3 budget
+# seconds, $4 file to write claude's stdout to, $5 timeout binary, $6 model id,
+# $7 effort. Prompt over stdin, never argv, for the same reason as run_codex.
+# `--safe-mode` is what makes this reviewer actually read-only and hook-free:
+# it disables CLAUDE.md, skills, installed plugins (this one included, so no
+# recursion), hooks and MCP servers while keeping OAuth auth, model selection
+# and permissions. `--tools` alone would NOT drop MCP tools. Returns claude's
+# exit code (124 on timeout).
+run_claude() {
+  local instructions="$1" body="$2" budget="$3" out_file="$4" timeout_bin="$5" model="$6" effort="$7" task rc
+  task="$(assemble_task "$instructions" "$body")"
+  printf -- '--- %s run (claude) ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$STDERR_LOG_FILE" 2>/dev/null
+  printf '%s' "$task" | "$timeout_bin" "$budget" claude -p \
+    --safe-mode \
+    --model "$model" \
+    --effort "$effort" \
+    --output-format text \
+    --no-session-persistence \
+    --tools "Read,Grep,Glob" \
+    --permission-mode dontAsk \
+    >"$out_file" 2>>"$STDERR_LOG_FILE"
+  rc=$?
+  return $rc
+}
+
 # Confines $1 (a target file path, may not exist yet) to resolve strictly
 # under $STATE_ROOT, and rejects it if the final path component is itself a
 # symlink. `--out` is accepted verbatim by cmd_run and was, before this
@@ -381,29 +405,21 @@ write_plan_state() {
 # skill (`/crosscheck-setup`). ---
 #
 # Lives at $CONFIG_FILE, a sibling of logs/ and state/. Schema:
-# {"engine": "codex"|"claude"|"both", "codex_model": "<str>",
-# "claude_model": "fable"|"opus"|"sonnet"|"haiku",
-# "codex_effort": "low"|"medium"|"high"|"xhigh"} (codex_effort is optional on
-# read: a config saved before it existed resolves to "medium"). claude_model is
-# restricted to the exact enum the Agent tool's own `model` parameter
-# accepts: this plugin cannot pass a concrete model id (e.g.
-# "claude-fable-5-1") to Agent, only one of these aliases, so there is
-# nothing finer to validate. Resolving an alias to an actual model version
-# is entirely Claude Code's job (e.g. ANTHROPIC_DEFAULT_OPUS_MODEL), not this
-# plugin's.
+# {"engine": "codex"|"claude"|"both", "codex_model": "<id>",
+# "claude_model": "<id>", "codex_effort": "low"|"medium"|"high"|"xhigh",
+# "claude_effort": "low"|"medium"|"high"|"xhigh"|"max"} (both efforts are
+# optional on read: a config saved before they existed resolves to "medium").
+# Models are opaque IDs, never an enum: new ones ship all the time and
+# `claude --model` / `codex -m` are the ones that know which exist. The claude
+# engine runs as a nested `claude -p` (see run_claude), not through the Agent
+# tool, precisely because Agent's `model` parameter only takes aliases.
 CONFIG_ENGINES="codex claude both"
-CONFIG_CLAUDE_MODELS="fable opus sonnet haiku"
 CONFIG_EFFORTS="low medium high xhigh"
+CONFIG_CLAUDE_EFFORTS="low medium high xhigh max"
 
 valid_engine() {
   local e="$1" x
   for x in $CONFIG_ENGINES; do [ "$x" = "$e" ] && return 0; done
-  return 1
-}
-
-valid_claude_model() {
-  local m="$1" x
-  for x in $CONFIG_CLAUDE_MODELS; do [ "$x" = "$m" ] && return 0; done
   return 1
 }
 
@@ -413,14 +429,24 @@ valid_effort() {
   return 1
 }
 
-# codex_model travels as `-m "$CROSSCHECK_MODEL"` to `codex exec` (see
-# run_codex): a value starting with `-` would be parsed as a flag instead of
-# a model name, and anything outside this charset has no business being a
-# model identifier.
-valid_codex_model() {
+valid_claude_effort() {
+  local f="$1" x
+  for x in $CONFIG_CLAUDE_EFFORTS; do [ "$x" = "$f" ] && return 0; done
+  return 1
+}
+
+# A model ID (codex or claude) travels as a single quoted argv entry to
+# `codex -m` / `claude --model`, so a leading `-` would be parsed as a flag.
+# Beyond that it is an opaque string: `/` and `:` and `@` are legitimate
+# (Bedrock ARNs, provider prefixes). Whitespace, control characters and shell
+# metacharacters are rejected as defense in depth; they are never part of a
+# real ID, and the escaping that actually matters happens where the setup
+# skill composes the `--config set` line, before this script ever runs.
+valid_model_id() {
   case "$1" in
     ''|-*) return 1 ;;
-    *[!A-Za-z0-9._:-]*) return 1 ;;
+    *[[:space:][:cntrl:]]*) return 1 ;;
+    *\'*|*\"*|*\`*|*\$*|*\;*|*\|*|*\&*|*\<*|*\>*|*\(*|*\)*|*\\*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -435,7 +461,7 @@ valid_codex_model() {
 # default the user never chose.
 resolve_config() {
   local engine="codex" codex_model="gpt-6-astra" claude_model="fable" codex_effort="medium"
-  local codex_effort_source="default"
+  local codex_effort_source="default" claude_effort="medium" claude_effort_source="default"
   if [ -s "$CONFIG_FILE" ]; then
     local cfg
     cfg="$(cat "$CONFIG_FILE" 2>/dev/null)" || return 1
@@ -444,14 +470,21 @@ resolve_config() {
     codex_model="$(printf '%s' "$cfg" | jq -r '.codex_model // empty' 2>/dev/null)"
     claude_model="$(printf '%s' "$cfg" | jq -r '.claude_model // empty' 2>/dev/null)"
     valid_engine "$engine" || return 1
-    valid_codex_model "$codex_model" || return 1
-    valid_claude_model "$claude_model" || return 1
+    valid_model_id "$codex_model" || return 1
+    valid_model_id "$claude_model" || return 1
     local saved_effort
     saved_effort="$(printf '%s' "$cfg" | jq -r '.codex_effort // empty' 2>/dev/null)"
     if [ -n "$saved_effort" ]; then
       valid_effort "$saved_effort" || return 1
       codex_effort="$saved_effort"
       codex_effort_source="config"
+    fi
+    local saved_claude_effort
+    saved_claude_effort="$(printf '%s' "$cfg" | jq -r '.claude_effort // empty' 2>/dev/null)"
+    if [ -n "$saved_claude_effort" ]; then
+      valid_claude_effort "$saved_claude_effort" || return 1
+      claude_effort="$saved_claude_effort"
+      claude_effort_source="config"
     fi
   fi
   if [ -n "${CROSSCHECK_EFFORT:-}" ]; then
@@ -469,7 +502,8 @@ resolve_config() {
   jq -n --arg engine "$engine" --arg codex_model "$codex_model" \
     --arg claude_model "$claude_model" --arg codex_model_source "$codex_model_source" \
     --arg codex_effort "$codex_effort" --arg codex_effort_source "$codex_effort_source" \
-    '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort, codex_model_source:$codex_model_source, codex_effort_source:$codex_effort_source}'
+    --arg claude_effort "$claude_effort" --arg claude_effort_source "$claude_effort_source" \
+    '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort, claude_effort:$claude_effort, codex_model_source:$codex_model_source, codex_effort_source:$codex_effort_source, claude_effort_source:$claude_effort_source}'
 }
 
 # --- `--config get|set`: read or persist the engine/model choice ---
@@ -484,24 +518,26 @@ cmd_config() {
       }
       ;;
     set)
-      local engine="" codex_model="" claude_model="" codex_effort=""
+      local engine="" codex_model="" claude_model="" codex_effort="" claude_effort=""
       while [ $# -gt 0 ]; do
         case "$1" in
           --engine) engine="${2:-}"; shift 2 ;;
           --codex-model) codex_model="${2:-}"; shift 2 ;;
           --claude-model) claude_model="${2:-}"; shift 2 ;;
           --codex-effort) codex_effort="${2:-}"; shift 2 ;;
+          --claude-effort) claude_effort="${2:-}"; shift 2 ;;
           *) shift ;;
         esac
       done
-      if [ -z "$engine" ] || [ -z "$codex_model" ] || [ -z "$claude_model" ] || [ -z "$codex_effort" ]; then
-        echo "crosscheck --config set: --engine, --codex-model, --claude-model, and --codex-effort are all required" >&2
+      if [ -z "$engine" ] || [ -z "$codex_model" ] || [ -z "$claude_model" ] || [ -z "$codex_effort" ] || [ -z "$claude_effort" ]; then
+        echo "crosscheck --config set: --engine, --codex-model, --claude-model, --codex-effort, and --claude-effort are all required" >&2
         return 2
       fi
       valid_engine "$engine" || { echo "crosscheck --config set: --engine must be one of: $CONFIG_ENGINES" >&2; return 2; }
-      valid_claude_model "$claude_model" || { echo "crosscheck --config set: --claude-model must be one of: $CONFIG_CLAUDE_MODELS" >&2; return 2; }
+      valid_model_id "$claude_model" || { echo "crosscheck --config set: --claude-model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
       valid_effort "$codex_effort" || { echo "crosscheck --config set: --codex-effort must be one of: $CONFIG_EFFORTS" >&2; return 2; }
-      valid_codex_model "$codex_model" || { echo "crosscheck --config set: --codex-model is invalid (must not start with '-', charset [A-Za-z0-9._:-])" >&2; return 2; }
+      valid_claude_effort "$claude_effort" || { echo "crosscheck --config set: --claude-effort must be one of: $CONFIG_CLAUDE_EFFORTS" >&2; return 2; }
+      valid_model_id "$codex_model" || { echo "crosscheck --config set: --codex-model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
       if ! mkdir -p "$STATE_ROOT" 2>/dev/null; then
         echo "crosscheck --config set: cannot create $STATE_ROOT" >&2
         return 1
@@ -511,13 +547,13 @@ cmd_config() {
       # for a corrupt config.json, with no separate "reset" command needed.
       local json
       json="$(jq -n --arg engine "$engine" --arg codex_model "$codex_model" --arg claude_model "$claude_model" \
-        --arg codex_effort "$codex_effort" \
-        '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort}')"
+        --arg codex_effort "$codex_effort" --arg claude_effort "$claude_effort" \
+        '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort, claude_effort:$claude_effort}')"
       atomic_write "$CONFIG_FILE" "$json" || {
         echo "crosscheck --config set: failed to write $CONFIG_FILE" >&2
         return 1
       }
-      log "config set engine=$engine codex_model=$codex_model claude_model=$claude_model codex_effort=$codex_effort"
+      log "config set engine=$engine codex_model=$codex_model claude_model=$claude_model codex_effort=$codex_effort claude_effort=$claude_effort"
       resolve_config
       ;;
     *)
@@ -591,16 +627,24 @@ publish_report() {
 # it's actually true, so a real Codex problem is never mistaken for a setup
 # problem or vice versa.
 cmd_run() {
-  local mode="" prompt_file="" hash="" artifact_file=""
+  local mode="" prompt_file="" hash="" artifact_file="" engine="codex"
   while [ $# -gt 0 ]; do
     case "$1" in
       --mode) mode="${2:-}"; shift 2 ;;
       --prompt-file) prompt_file="${2:-}"; shift 2 ;;
       --hash) hash="${2:-}"; shift 2 ;;
       --out) artifact_file="${2:-}"; shift 2 ;;
+      --engine) engine="${2:-}"; shift 2 ;;
       *) shift ;;
     esac
   done
+
+  # Fails closed like --mode: a typo must not silently run Codex and mark the
+  # hash reviewed under the wrong engine label.
+  case "$engine" in
+    codex|claude) : ;;
+    *) echo "crosscheck --run: unknown --engine '$engine' (want codex|claude)" >&2; return 2 ;;
+  esac
 
   if [ -z "$mode" ] || [ -z "$prompt_file" ] || [ ! -s "$prompt_file" ]; then
     echo "crosscheck --run: --mode and a non-empty --prompt-file are required" >&2
@@ -615,7 +659,7 @@ cmd_run() {
   esac
 
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --run: jq not found on PATH" >&2; return 1; }
-  command -v codex >/dev/null 2>&1 || { echo "crosscheck --run: codex not found on PATH" >&2; return 1; }
+  command -v "$engine" >/dev/null 2>&1 || { echo "crosscheck --run: $engine not found on PATH" >&2; return 1; }
 
   local timeout_bin
   timeout_bin="$(resolve_timeout_bin)" || {
@@ -668,9 +712,12 @@ cmd_run() {
     echo "crosscheck --run: $CONFIG_FILE is corrupt or invalid. Run /crosscheck-setup to fix it." >&2
     return 1
   }
-  CROSSCHECK_MODEL="$(printf '%s' "$resolved_config" | jq -r '.codex_model')"
-  CROSSCHECK_EFFORT="$(printf '%s' "$resolved_config" | jq -r '.codex_effort')"
-  local budget="${CROSSCHECK_TIMEOUT:-$(timeout_default_for_effort "$CROSSCHECK_EFFORT")}"
+  local engine_model engine_effort
+  engine_model="$(printf '%s' "$resolved_config" | jq -r ".${engine}_model")"
+  engine_effort="$(printf '%s' "$resolved_config" | jq -r ".${engine}_effort")"
+  CROSSCHECK_MODEL="$engine_model"
+  CROSSCHECK_EFFORT="$engine_effort"
+  local budget="${CROSSCHECK_TIMEOUT:-$(timeout_default_for_effort "$engine_effort")}"
 
   # Setup: the temp file for codex's raw --json stream. Created directly in
   # this process (no `$(...)` subshell), so the cleanup trap below is
@@ -682,6 +729,27 @@ cmd_run() {
   }
   # shellcheck disable=SC2064
   trap "rm -f $(printf '%q' "$json_file")" EXIT
+
+  if [ "$engine" = "claude" ]; then
+    # `json_file` holds claude's plain-text stdout here (no JSON stream to
+    # decode). Its failures never mention Codex or call auth_status.
+    run_claude "$instructions" "$prompt_body" "$budget" "$json_file" "$timeout_bin" "$engine_model" "$engine_effort"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      log "run ($mode) engine=claude failed rc=$rc"
+      echo "crosscheck --run: claude -p failed (rc=$rc). See $STDERR_LOG_FILE." >&2
+      return 1
+    fi
+    local claude_output
+    claude_output="$(cat "$json_file" 2>/dev/null)"
+    if [ -z "$claude_output" ]; then
+      log "run ($mode) engine=claude produced empty output"
+      echo "crosscheck --run: claude produced no output. See $STDERR_LOG_FILE." >&2
+      return 1
+    fi
+    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude"
+    return $?
+  fi
 
   run_codex "$instructions" "$prompt_body" "$budget" "$json_file" "$timeout_bin"
   rc=$?
@@ -1322,7 +1390,7 @@ run_selftest() {
 
   # 30. Config: a valid `--config set` writes config.json 0600 under
   #     STATE_ROOT, and `--config get` reflects it back.
-  out="$(HOME="$tmp_home" "$run" --config set --engine both --codex-model gpt-5.6-sol --claude-model opus --codex-effort high)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine both --codex-model gpt-5.6-sol --claude-model opus --codex-effort high --claude-effort medium)"
   rc=$?
   check "config set exits 0" "$rc" "0"
   check "config set writes engine=both" "$(jq -r '.engine' "$cfg_file" 2>/dev/null)" "both"
@@ -1339,17 +1407,17 @@ run_selftest() {
   #     before anything is written, and `set` missing any of the 3 required
   #     args is rejected too. config.json stays untouched from check 30
   #     throughout.
-  out="$(HOME="$tmp_home" "$run" --config set --engine nope --codex-model gpt-6-astra --claude-model fable --codex-effort medium 2>&1)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine nope --codex-model gpt-6-astra --claude-model fable --codex-effort medium --claude-effort medium 2>&1)"
   rc=$?
   check "config set with invalid engine exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
   check "config set with invalid engine leaves config untouched" "$(jq -r '.engine' "$cfg_file" 2>/dev/null)" "both"
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model nope --codex-effort medium 2>&1)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model 'a;b' --codex-effort medium --claude-effort medium 2>&1)"
   rc=$?
   check "config set with invalid claude-model exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model -evil --claude-model fable --codex-effort medium 2>&1)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model -evil --claude-model fable --codex-effort medium --claude-effort medium 2>&1)"
   rc=$?
   check "config set with codex-model starting with - exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model "with space" --claude-model fable --codex-effort medium 2>&1)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model "with space" --claude-model fable --codex-effort medium --claude-effort medium 2>&1)"
   rc=$?
   check "config set with codex-model containing a space exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
   out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra 2>&1)"
@@ -1358,7 +1426,7 @@ run_selftest() {
   out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable 2>&1)"
   rc=$?
   check "config set missing --codex-effort exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort nope 2>&1)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort nope --claude-effort medium 2>&1)"
   rc=$?
   check "config set with invalid codex-effort exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
   check "config set with invalid codex-effort leaves config untouched" "$(jq -r '.codex_effort' "$cfg_file" 2>/dev/null)" "high"
@@ -1384,7 +1452,7 @@ run_selftest() {
   rc=$?
   check "--skip works even with corrupt config" "$rc" "0"
   check "--skip with corrupt config marks the hash skipped" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${skip_hash}.state" 2>/dev/null)" "skipped"
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort medium)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort medium --claude-effort medium)"
   rc=$?
   check "config set repairs a corrupt config.json" "$rc" "0"
   out="$(HOME="$tmp_home" "$run" --config get)"
@@ -1393,7 +1461,7 @@ run_selftest() {
   # 33. codex_model from config.json reaches codex as `-m`, and
   #     CROSSCHECK_MODEL (env) still wins over it, matching the precedence
   #     that env var already had before config.json existed.
-  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-9-configtest --claude-model fable --codex-effort medium)"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-9-configtest --claude-model fable --codex-effort medium --claude-effort medium)"
   : >"$capture_file"; : >"$capture_stdin"
   out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$prompt_file" 2>&1 >/dev/null)"
   check "codex_model from config.json reaches -m" "$(grep -c 'gpt-9-configtest' "$capture_file" 2>/dev/null)" "1"
@@ -1413,7 +1481,7 @@ run_selftest() {
   chmod +x "$timeout_shim/timeout"
   local effort_case effort_expected_budget
   for effort_case in "medium:600" "high:1200" "xhigh:1800"; do
-    out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-9-configtest --claude-model fable --codex-effort "${effort_case%%:*}")"
+    out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-9-configtest --claude-model fable --codex-effort "${effort_case%%:*}" --claude-effort medium)"
     : >"$capture_file"; : >"$budget_log"
     out="$(HOME="$tmp_home" PATH="$timeout_shim:$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$prompt_file" 2>&1 >/dev/null)"
     check "codex_effort=${effort_case%%:*} from config reaches model_reasoning_effort" "$(grep -c "model_reasoning_effort=\"${effort_case%%:*}\"" "$capture_file" 2>/dev/null)" "1"
@@ -1481,6 +1549,125 @@ run_selftest() {
   check "--record research exits 0" "$rc" "0"
   check "--record research inlines the report" "$(printf '%s' "$out" | grep -c 'some research findings')" "1"
   check "--record research touches no state file" "$state_files_after" "$state_files_before"
+
+  # 37. Claude engine: `--run --engine claude` runs a nested `claude -p`
+  #     (stubbed here), never touches codex, and opaque model IDs and the
+  #     claude effort round-trip untouched.
+  local claude_stub="$tmp_home/claudestub" claude_args="$tmp_home/claude_args.log" claude_stdin="$tmp_home/claude_stdin.log"
+  mkdir -p "$claude_stub"
+  : >"$claude_args"; : >"$claude_stdin"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'printf %%s\\\\n "$*" >>%q\n' "$claude_args"
+    printf 'cat >>%q\n' "$claude_stdin"
+    echo 'printf "%s\n" "stub claude finding"'
+  } >"$claude_stub/claude"
+  chmod +x "$claude_stub/claude"
+  local arn_model="arn:aws:bedrock:us-east-1:123456789012:custom-model/abc"
+  out="$(HOME="$tmp_home" "$run" --config set --engine both --codex-model gpt-9-configtest --claude-model "$arn_model" --codex-effort medium --claude-effort max)"
+  rc=$?
+  check "config set accepts an opaque claude model id with / and :" "$rc" "0"
+  out="$(HOME="$tmp_home" "$run" --config get)"
+  check "config get round-trips the opaque claude model id" "$(printf '%s' "$out" | jq -r '.claude_model')" "$arn_model"
+  check "config get reports claude_effort=max/config" "$(printf '%s' "$out" | jq -r '"\(.claude_effort)/\(.claude_effort_source)"')" "max/config"
+  : >"$capture_file"; : >"$budget_log"
+  local claude_hash="claudeenginerun1"
+  out="$(HOME="$tmp_home" PATH="$timeout_shim:$claude_stub:$stub_bin:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$prompt_file" --hash "$claude_hash" 2>/dev/null)"
+  rc=$?
+  check "--run --engine claude exits 0" "$rc" "0"
+  check "--run --engine claude inlines the report" "$(printf '%s' "$out" | grep -c 'stub claude finding')" "1"
+  check "--run --engine claude marks the hash reviewed" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${claude_hash}.state" 2>/dev/null)" "reviewed"
+  check "claude argv carries --safe-mode" "$(grep -c -- '--safe-mode' "$claude_args" 2>/dev/null)" "1"
+  check "claude argv restricts tools to Read,Grep,Glob" "$(grep -c -- '--tools Read,Grep,Glob' "$claude_args" 2>/dev/null)" "1"
+  check "claude argv carries the opaque model id as given" "$(grep -c -- "--model $arn_model" "$claude_args" 2>/dev/null)" "1"
+  check "claude argv carries --effort max" "$(grep -c -- '--effort max' "$claude_args" 2>/dev/null)" "1"
+  check "claude engine got the max budget of 1800s" "$(head -1 "$budget_log" 2>/dev/null)" "1800"
+  check "claude got the prompt via stdin" "$(grep -c 'PROPOSED PLAN:' "$claude_stdin" 2>/dev/null)" "1"
+  check "claude did NOT receive the prompt via argv" "$(grep -c 'PROPOSED PLAN:' "$claude_args" 2>/dev/null)" "0"
+  check "--engine claude never invoked codex" "$([ -s "$capture_file" ] && echo yes || echo no)" "no"
+
+  # 37b. Claude alone must not need codex on PATH. Only meaningful when
+  #      stripping codex's directory leaves jq and timeout resolvable.
+  local path_no_codex
+  path_no_codex="$(strip_cmd_dir codex "$PATH")"
+  if PATH="$path_no_codex" command -v jq >/dev/null 2>&1 && { PATH="$path_no_codex" command -v timeout >/dev/null 2>&1 || PATH="$path_no_codex" command -v gtimeout >/dev/null 2>&1; }; then
+    out="$(HOME="$tmp_home" PATH="$claude_stub:$path_no_codex" "$run" --run --engine claude --mode research --prompt-file "$prompt_file" 2>&1 >/dev/null)"
+    rc=$?
+    check "--run --engine claude works with no codex on PATH" "$rc" "0"
+  else
+    echo "  skip  claude-without-codex check (codex shares a PATH directory with jq/timeout)"
+  fi
+
+  # 37c. The inverse: codex alone must not invoke claude.
+  : >"$claude_args"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --engine codex --mode research --prompt-file "$prompt_file" 2>&1 >/dev/null)"
+  rc=$?
+  check "--run --engine codex exits 0" "$rc" "0"
+  check "--engine codex never invoked claude" "$([ -s "$claude_args" ] && echo yes || echo no)" "no"
+
+  # 37d. A failing claude: clean message with no codex wording, no reviewed
+  #      state. Empty output fails too.
+  local claude_fail="$tmp_home/claudefail" claude_empty="$tmp_home/claudeempty"
+  mkdir -p "$claude_fail" "$claude_empty"
+  { echo '#!/usr/bin/env bash'; echo 'cat >/dev/null'; echo 'echo "boom" >&2'; echo 'exit 1'; } >"$claude_fail/claude"
+  { echo '#!/usr/bin/env bash'; echo 'cat >/dev/null'; echo 'exit 0'; } >"$claude_empty/claude"
+  chmod +x "$claude_fail/claude" "$claude_empty/claude"
+  local claude_fail_hash="claudefailhash001"
+  out="$(HOME="$tmp_home" PATH="$claude_fail:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$prompt_file" --hash "$claude_fail_hash" 2>&1 >/dev/null)"
+  rc=$?
+  check "failing claude: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "failing claude: message says claude -p failed" "$(printf '%s' "$out" | grep -c 'claude -p failed')" "1"
+  check "failing claude: message never blames codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "0"
+  check "failing claude: message has no auth=" "$(printf '%s' "$out" | grep -c 'auth=')" "0"
+  check "failing claude: hash not marked reviewed" "$([ -s "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${claude_fail_hash}.state" ] && echo yes || echo no)" "no"
+  out="$(HOME="$tmp_home" PATH="$claude_empty:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$prompt_file" --hash "claudeemptyrun001" 2>&1 >/dev/null)"
+  rc=$?
+  check "empty claude output: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "empty claude output: message says no output" "$(printf '%s' "$out" | grep -c 'claude produced no output')" "1"
+
+  # 37e. Unknown --engine fails closed and invokes nothing.
+  : >"$capture_file"; : >"$claude_args"
+  out="$(HOME="$tmp_home" PATH="$claude_stub:$stub_bin:$PATH" "$run" --run --engine bogus --mode research --prompt-file "$prompt_file" 2>&1 >/dev/null)"
+  rc=$?
+  check "--run --engine bogus exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "--engine bogus invoked neither codex nor claude" "$([ -s "$capture_file" ] || [ -s "$claude_args" ] && echo yes || echo no)" "no"
+
+  # 37f. Opaque model validation: shell metacharacters and a leading - are
+  #      rejected for BOTH models and leave config.json untouched; claude_effort
+  #      is required and enum-checked; a config saved without claude_effort
+  #      resolves to medium/default.
+  local before_model bad_value
+  before_model="$(jq -r '.claude_model' "$cfg_file" 2>/dev/null)"
+  for bad_value in 'a;b' '$(x)' '-evil' 'with space'; do
+    out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model "$bad_value" --codex-effort medium --claude-effort medium 2>&1)"
+    rc=$?
+    check "config set rejects claude-model '$bad_value'" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model "$bad_value" --claude-model fable --codex-effort medium --claude-effort medium 2>&1)"
+    rc=$?
+    check "config set rejects codex-model '$bad_value'" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  done
+  check "rejections left config.json untouched" "$(jq -r '.claude_model' "$cfg_file" 2>/dev/null)" "$before_model"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort medium 2>&1)"
+  rc=$?
+  check "config set missing --claude-effort exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  out="$(HOME="$tmp_home" "$run" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort medium --claude-effort nope 2>&1)"
+  rc=$?
+  check "config set with invalid claude-effort exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  printf '{"engine":"codex","codex_model":"gpt-9-configtest","claude_model":"fable"}' >"$cfg_file"
+  out="$(HOME="$tmp_home" "$run" --config get)"
+  check "config saved without claude_effort resolves to medium/default" "$(printf '%s' "$out" | jq -r '"\(.claude_effort)/\(.claude_effort_source)"')" "medium/default"
+
+  # 37g. The quoting rule the setup skill mandates: a free-text answer wrapped
+  #      in single quotes (inner ' escaped as '\'') reaches the script as ONE
+  #      literal argument and never runs a substitution. `eval` here stands in
+  #      for the shell line the assistant composes.
+  quote_single() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+  local injection_marker="$tmp_home/injection-marker" payload
+  for payload in "model\$(touch $injection_marker)" "x'\$(touch $injection_marker)'y" "high\$(touch $injection_marker)" "a;touch $injection_marker"; do
+    eval "HOME=\"$tmp_home\" \"$run\" --config set --engine codex --codex-model $(quote_single "$payload") --claude-model fable --codex-effort medium --claude-effort medium" >/dev/null 2>&1
+    eval "HOME=\"$tmp_home\" \"$run\" --config set --engine codex --codex-model gpt-6-astra --claude-model fable --codex-effort $(quote_single "$payload") --claude-effort $(quote_single "$payload")" >/dev/null 2>&1
+  done
+  check "single-quoted free text never executed a substitution" "$([ -e "$injection_marker" ] && echo yes || echo no)" "no"
 
   rm -rf "$tmp_home"
   echo

@@ -1,8 +1,8 @@
 {
   "name": "plan-mode-crosscheck",
   "displayName": "Plan Mode Crosscheck",
-  "version": "3.3.0",
-  "description": "Get an independent second opinion on a finished Plan Mode plan before you see it, or on demand via /crosscheck: from Codex CLI (default), a Claude model (Fable, Opus), or both in parallel. Pick with /crosscheck-setup. Codex CLI is only required if the engine uses it.",
+  "version": "3.4.0",
+  "description": "Get an independent second opinion on a finished Plan Mode plan before you see it, or on demand via /crosscheck: from Codex CLI (default), a Claude model (any alias or model ID), or both in parallel. Pick with /crosscheck-setup. Codex CLI is only required if the engine uses it.",
   "author": {
     "name": "Carlos Cornejo"
   },

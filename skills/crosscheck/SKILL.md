@@ -1,6 +1,6 @@
 ---
 name: crosscheck
-description: Get an independent second opinion on a finished Plan Mode plan, or on whatever's being discussed right now, from Codex CLI (a separate model, separate process, read-only view of the repo), from a Claude model run as a fresh-context Plan subagent, or from both in parallel, per the engine the user chose in /crosscheck-setup. Two triggers, (1) a PreToolUse/ExitPlanMode hook in this plugin denies the tool call and asks you to invoke this skill after checking with the user, (2) the user types /crosscheck at any point in a conversation. Never invoke this on your own initiative outside of trigger (1)'s deny reason; it costs the user real time and model usage.
+description: Get an independent second opinion on a finished Plan Mode plan, or on whatever's being discussed right now, from Codex CLI (a separate model, separate process, read-only view of the repo), from a Claude model run as a fresh-context read-only `claude -p`, or from both in parallel, per the engine the user chose in /crosscheck-setup. Two triggers, (1) a PreToolUse/ExitPlanMode hook in this plugin denies the tool call and asks you to invoke this skill after checking with the user, (2) the user types /crosscheck at any point in a conversation. Never invoke this on your own initiative outside of trigger (1)'s deny reason; it costs the user real time and model usage.
 ---
 
 # Crosscheck
@@ -12,11 +12,10 @@ configured with `/crosscheck-setup`:
 
 - **`codex`** (default): a single Codex CLI call (`codex exec`, read-only
   sandbox, a separate model from you), launched by `crosscheck --run`.
-- **`claude`**: a Claude model (`fable`, `opus`, ...) run through the `Agent`
-  tool as a fresh-context `Plan` subagent. The shell script cannot call
-  `Agent`, so this skill does that part and the script only does the
-  mechanical halves (`--prepare` assembles the task, `--record` publishes the
-  report).
+- **`claude`**: a Claude model (any alias or full model ID, at the saved
+  effort) run as a nested, read-only `claude -p --safe-mode`, launched by
+  `crosscheck --run --engine claude`. Fresh context, no MCP, no hooks. It is
+  not the `Agent` tool: that tool only accepts model aliases and has no effort.
 - **`both`**: the two above in parallel, then you merge them.
 
 This skill's job is everything the shell script can't do: deciding what the
@@ -35,9 +34,9 @@ crosscheck --config get
 ```
 
 It prints JSON: `engine` (`codex` | `claude` | `both`), `codex_model`,
-`claude_model` (`fable` | `opus` | `sonnet` | `haiku`), and
-`codex_model_source`. No config file just means defaults (`codex`,
-`gpt-6-astra`, `fable`).
+`claude_model` (any alias or model ID), `codex_effort`, `claude_effort`
+(`low` | `medium` | `high` | `xhigh` | `max`), and `codex_model_source`. No
+config file just means defaults (`codex`, `gpt-6-astra`, `fable`, `medium`).
 
 If it exits nonzero, the config file is corrupt or invalid. Do not try to fix
 it here and do not run any engine:
@@ -163,61 +162,37 @@ will keep denying forever.
       starts with its own `umask 077` (each call is a separate shell and does
       not inherit the previous one's umask).
 
-      **`engine=codex`:** append to the same `Bash` call from 3.b:
+      **`engine=codex`** or **`engine=claude`:** append to the same `Bash` call
+      from 3.b:
       ```
-      crosscheck --run --mode plan-review --prompt-file "$pf" --hash <hash>
+      crosscheck --run --engine <codex|claude> --mode plan-review --prompt-file "$pf" --hash <hash>
       ```
       and make the whole call `run_in_background: true`, with a `description`
       that says what's actually happening, something like `"Codex auditando
-      el plan, ronda N (gpt-6-astra, medium)"`. The tmp-dir lookup and the
+      el plan, ronda N (gpt-6-astra, medium)"` or `"Claude auditando el plan,
+      ronda N (<claude_model>, <claude_effort>)"`. The tmp-dir lookup and the
       heredoc write are near-instant; backgrounding the whole script just
       means the slow part (`--run`) doesn't block.
 
-      **`engine=claude`:**
-      1. Append to the 3.b call (foreground, no `run_in_background`):
-         ```
-         crosscheck --prepare --mode plan-review --prompt-file "$pf"
-         ```
-         It prints the path of the assembled task file (same text Codex
-         would receive). Remember that path and `$tmp`.
-      2. Call `Agent` with `subagent_type: "Plan"`, `model: <claude_model>`,
-         a `description` like `"Fable auditando el plan, ronda N"`, and a
-         short prompt: read the task file at that path in full with `Read`,
-         carry out exactly what it says, modify no files, and return only the
-         final report as its answer. No `fork`: it must start from a fresh
-         context. Do not add your own opinions about the plan to that
-         prompt; the task file already has everything.
-      3. Write what it returned, verbatim, and record it in a second
-         foreground `Bash` call:
-         ```
-         umask 077
-         tmp="<the $tmp path from step 1>"
-         rf="$tmp/report-<hash>-claude.md"
-         cat > "$rf" <<'CROSSCHECK_REPORT_<hash>'
-         <the subagent's report, verbatim>
-         CROSSCHECK_REPORT_<hash>
-         crosscheck --record --engine claude --mode plan-review --report-file "$rf" --hash <hash>
-         ```
-         Same two heredoc rules as above (quoted, unique delimiter).
+      **`engine=both`:** first ONE foreground `Bash` call that does the 3.b
+      work and ends with `printf '%s\n' "$pf"`, so the prompt file exists
+      (and its path is known) before either engine starts: `--run` exits 2 if
+      `--prompt-file` is missing or empty, so two backgrounded calls that
+      raced the write would fail intermittently. Then, **in the same
+      assistant message**, issue two `Bash` calls with `run_in_background:
+      true`: `crosscheck --run --engine codex --mode plan-review
+      --prompt-file <printed path> --hash <hash>` and the same with `--engine
+      claude`. Paste the printed path literally, it is a different shell.
+      `--run` writes the hash's state file for both engines and both leave it
+      `reviewed`; the state file's `.artifact` points at whichever finished
+      last, which is fine because both report paths are shown to the user.
 
-      **`engine=both`:** do step 1 of `claude` first (its `--prepare` output
-      is only needed by the Agent; Codex reads `$pf` itself). Then, **in the
-      same assistant message**, issue both of these so they run in parallel:
-      the Bash call `crosscheck --run --mode plan-review --prompt-file "$pf"
-      --hash <hash>` with `run_in_background: true` (the `$pf` path is
-      literal, since it's a different shell), and the `Agent` call from step
-      2. Wait for both. Then do step 3 for the Claude report. `--record` and
-      `--run` both write the hash's state file and both leave it `reviewed`;
-      the state file's `.artifact` points at whichever finished last, which
-      is fine because both report paths are shown to the user.
+   d. Wait for the task notification(s). Do not poll.
 
-   d. Wait for the task notification(s) and the `Agent` result. Do not poll.
-
-   e. **On success:** for `codex` the tool result is either the full report
-      (small reports inline directly) or a note pointing at an artifact
-      file (large reports do not inline, `Read` that file instead); for
-      `claude` the report is the `Agent` result and its published path is in
-      the `--record` output. Follow "Relaying a round's findings" below,
+   e. **On success:** for each engine the tool result is either the full
+      report (small reports inline directly) or a note pointing at an
+      artifact file (large reports do not inline, `Read` that file instead).
+      Follow "Relaying a round's findings" below,
       then "Recommending: one more round, or show the plan" to decide what
       happens next. If a finding changes the plan, fix the root: the same defect in
       every instance inside the plan (each engine, mode, entry point, shell),
@@ -234,7 +209,7 @@ will keep denying forever.
         worked and tell the user which one failed and why (the stderr in the
         tool result says which). That still counts as a completed audit.
       - If every configured engine failed (Codex not installed, not logged
-        in, timed out, the subagent returned nothing, etc.), do not leave the
+        in, timed out, `claude -p` failed or returned nothing, etc.), do not leave the
         user stuck: tell them the audit failed and why, then run
         ```
         crosscheck --skip --hash <hash>
@@ -339,7 +314,7 @@ first.
    ```
    umask 077
    tmp="$(crosscheck --tmp-dir)"
-   pf="$tmp/request-$$.md"
+   pf="$tmp/request-<random-token>.md"
    cat > "$pf" <<'CROSSCHECK_REQUEST_<random-token>'
    <a self-contained description of what to investigate, in your own words,
    not a copy-paste of the user's last message: if the last message alone
@@ -353,12 +328,11 @@ first.
    asked, not wander into unrelated refactors it notices along the way.>
    CROSSCHECK_REQUEST_<random-token>
    ```
+   `<random-token>` is one fixed string you pick (not `$$`, which differs per
+   shell). End the call with `printf '%s\n' "$pf"` when the engine is `both`.
    Then launch by engine exactly as in A.3.c, with `--mode research` and
-   **no `--hash` on any command** (`--run`, `--prepare`, `--record`): this
-   mode never touches plan state. For `codex` and `both`, `--run` goes in the
-   background; for `claude` and `both`, the Agent call and the `--record`
-   step work the same way (`--record --engine claude --mode research
-   --report-file "$rf"`, report at `$tmp/report-request-claude.md`).
+   **no `--hash` on any command**: this mode never touches plan state. Every
+   `--run --engine <codex|claude>` goes in the background.
 
 2. Wait for the results. `research_instructions` (see `hooks/crosscheck.sh`)
    returns structured evidence, current behavior, data flow, a minimal
@@ -388,16 +362,13 @@ first.
 - There is no round cap and no per-round flag on any command. Round counting
   (`N`) is entirely on this skill's side, only for the `ROUND: N` prompt line, task
   descriptions and `PRIOR ROUNDS`.
-- `Bash` calls per audit: `codex` is one call (write the prompt, then
-  `--run`, backgrounded). `claude` is two foreground calls around the
-  `Agent` call (`--prepare`, then write-report + `--record`). `both` is the
-  `--prepare` call, then `--run` (background) and `Agent` in the same message,
-  then the write-report + `--record` call. Don't split the tmp-dir lookup and
-  the heredoc write into separate calls.
-- `crosscheck --prepare` and `--record` are mechanical only: `--prepare`
-  assembles the exact task text `--run` would send to Codex and prints its
-  path, `--record` publishes a report the same way `--run` does (same
-  confinement to the state root, same state update).
+- `Bash` calls per audit: `codex` and `claude` are one call each (write the
+  prompt, then `--run --engine ...`, backgrounded). `both` is one foreground
+  call (write the prompt, print its path), then two backgrounded `--run`
+  calls in the same message. Don't split the tmp-dir lookup and the heredoc
+  write into separate calls.
+- `crosscheck --prepare` and `--record` are legacy: nothing in this skill uses
+  them any more (they served the old `Agent`-based claude engine).
 - `crosscheck` works as a bare command because this plugin ships it under
   `bin/`, which Claude Code adds to `PATH` while the plugin is enabled. If
   `command -v crosscheck` fails, the plugin likely isn't enabled correctly;

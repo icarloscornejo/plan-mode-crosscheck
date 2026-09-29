@@ -2,6 +2,38 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.4.0
+
+Any model ID, and a Claude effort.
+
+**Free-text models.** `claude_model` and `codex_model` are opaque IDs now,
+validated by one `valid_model_id`: not empty, no leading `-`, no whitespace,
+control characters or shell metacharacters. `/` and `:` are fine (Bedrock
+ARNs). `/crosscheck-setup` keeps a few shortcuts but "Other" takes any exact
+ID, so a new model needs no plugin update.
+
+**Claude effort.** New `claude_effort` (`low|medium|high|xhigh|max`, default
+`medium`, optional on read so a 3.3.0 config keeps working) and
+`--claude-effort` on `--config set` (now five required flags).
+
+**The Claude engine is a nested `claude -p` now.** The `Agent` tool's `model`
+parameter only takes aliases and has no effort, so neither a full ID nor an
+effort was possible through it. `crosscheck --run --engine claude` runs
+`claude -p --safe-mode --model M --effort E --tools Read,Grep,Glob
+--permission-mode dontAsk --no-session-persistence` with the prompt on stdin.
+`--safe-mode` drops MCP servers and every plugin's hooks (this one included),
+which `--tools` alone would not. `--engine` defaults to `codex` and rejects
+unknown values. Dependencies, timeout budget (`max` = 1800 s) and failure
+messages are per engine: Claude alone no longer needs Codex, and its failures
+never mention Codex or its auth. `engine=both` is now one foreground call that
+writes the prompt and prints its path, then two backgrounded `--run` calls.
+`--prepare` and `--record` still work but the skill no longer uses them.
+
+**Setup.** Two `AskUserQuestion` calls (five questions). Every user-typed value
+goes into the `--config set` line single-quoted, with `'\''` for inner quotes:
+the script-side validation runs after the shell has already parsed the line,
+so it cannot be the only defense.
+
 ## 3.3.0
 
 Multiple audit engines, an interactive setup, and no more round cap.
