@@ -48,6 +48,11 @@
 #      engine, for when the user declines, or when a run attempt failed and
 #      the skill falls back to not blocking the user on a broken external
 #      tool.
+#   6. `--metrics-findings --hash H --round N --engines E --finding SEV:SRC`:
+#      records one round's findings as counts in `$METRICS_FILE`, next to
+#      the automatic per-report `run` lines `publish_report` appends there.
+#      `--stats [FILE...]` summarizes that file (or several, across instances).
+#      Numbers and short labels only, never finding text.
 #
 # There is no thread reuse across calls. Every `--run` is a fresh Codex
 # thread. This is a deliberate downgrade from v2, not an oversight: v2's
@@ -104,6 +109,9 @@ DISABLED_SENTINEL="$STATE_DIR/DISABLED"
 # pruned by age (see STATE_MAX_AGE_DAYS below), and a saved engine/model
 # choice must never expire just because it hasn't been touched in a week.
 CONFIG_FILE="$STATE_ROOT/config.json"
+# Same reasoning as CONFIG_FILE: audit metrics are a long-lived history, so
+# they live next to config.json and never inside the pruned state/ tree.
+METRICS_FILE="$STATE_ROOT/metrics.jsonl"
 
 LOG_MAX_BYTES=1048576           # 1 MiB
 LOG_KEEP_BYTES=262144           # trim down to 256 KiB, keep the tail
@@ -317,6 +325,16 @@ run_codex() {
     >"$json_file" 2>>"$STDERR_LOG_FILE"
   rc=$?
   return $rc
+}
+
+# Codex reports API failures (unsupported model, no subscription, rate limit)
+# as `error` / `turn.failed` events on stdout, not on stderr, and the stream
+# file is deleted when `--run` returns. Pull the first such message out before
+# that happens, capped and on one line, so the real cause reaches the log and
+# the user instead of a bare rc=1. $1 = path to the raw `--json` stream.
+codex_stream_error() {
+  jq -r 'select(.type == "turn.failed" or .type == "error") | (.error.message // .message // empty)' "$1" 2>/dev/null \
+    | head -n 1 | tr '\n' ' ' | head -c 500
 }
 
 # Claude twin of run_codex. Args: $1 instructions, $2 request body, $3 budget
@@ -572,6 +590,18 @@ assemble_task() {
   printf '%s\n%s\n---' "$instructions" "$body"
 }
 
+# Appends one JSON line to METRICS_FILE. Never fails its caller: a metrics
+# problem must not block an audit or leave a plan hash undecided. Lines stay
+# well under PIPE_BUF, so the two parallel `--run` calls of `both` can append
+# without interleaving.
+append_metric() {
+  local line="$1"
+  if [ -z "$line" ] || ! printf '%s\n' "$line" >>"$METRICS_FILE" 2>/dev/null; then
+    log "metrics: could not append to $METRICS_FILE"
+  fi
+  return 0
+}
+
 # Publishes a finished report: (re-)confines the artifact path, writes it
 # atomically, logs it, and marks the plan hash reviewed when this is a
 # plan-review round with a hash. Shared by the codex engine (cmd_run, after
@@ -580,9 +610,13 @@ assemble_task() {
 # identically no matter which engine produced the report: it only ever reads
 # the hash's state file, never which engine wrote it.
 # $1 = mode, $2 = hash (may be empty), $3 = artifact file path, $4 = report
-# body, $5 = engine label for the log line.
+# body, $5 = engine label for the log line, $6 = round (optional, positive
+# integer), $7 = model and $8 = effort (optional, recorded in the metrics
+# line). Model and effort are passed in, never read from the environment:
+# a user's exported CROSSCHECK_MODEL would otherwise label a claude report.
 publish_report() {
   local mode="$1" hash="$2" artifact_file="$3" body="$4" engine="$5"
+  local round="${6:-}" model="${7:-}" effort="${8:-}"
 
   if ! artifact_file="$(confine_to_state_root "$artifact_file")"; then
     log "publish ($mode) engine=$engine refused to publish: --out no longer resolves under $STATE_ROOT"
@@ -606,6 +640,16 @@ publish_report() {
       return 1
     fi
   fi
+
+  # Only a fully published report counts as a run: this sits after
+  # write_plan_state so a failed publish leaves no metrics line.
+  local round_json="null"
+  [[ "$round" =~ ^[1-9][0-9]*$ ]] && round_json="$round"
+  append_metric "$(jq -cn --arg mode "$mode" --arg engine "$engine" --arg model "$model" \
+    --arg effort "$effort" --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
+    --argjson round "$round_json" --argjson ts "$(date +%s)" \
+    '{type:"run", ts:$ts, mode:$mode, engine:$engine, model:$model, effort:$effort,
+      round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo}' 2>/dev/null)"
 
   local body_bytes
   body_bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
@@ -677,6 +721,13 @@ cmd_run() {
     return 1
   fi
 
+  # The skill writes `ROUND: N` as the first prompt line (plan-review only).
+  # Anything else (research prompts, odd values) leaves the round unrecorded.
+  local round="" first_line
+  first_line="$(printf '%s' "$prompt_body" | head -n 1)"
+  local round_pattern='^ROUND: ([1-9][0-9]*)$'
+  [[ "$first_line" =~ $round_pattern ]] && round="${BASH_REMATCH[1]}"
+
   # Setup: the log directory backs STDERR_LOG_FILE, which run_codex redirects
   # Codex's own stderr into. If it can't be created or written to, Codex's
   # invocation itself would fail on that redirection and get misreported as a
@@ -747,7 +798,7 @@ cmd_run() {
       echo "crosscheck --run: claude produced no output. See $STDERR_LOG_FILE." >&2
       return 1
     fi
-    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude"
+    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort"
     return $?
   fi
 
@@ -757,8 +808,10 @@ cmd_run() {
   # Everything past this point is a genuine Codex-side outcome: setup already
   # succeeded, so rc and auth_status are meaningful and safe to report.
   if [ $rc -ne 0 ] || [ ! -s "$json_file" ]; then
-    log "run ($mode) failed rc=$rc auth=$(auth_status)"
-    echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)). See $STDERR_LOG_FILE." >&2
+    local codex_error
+    codex_error="$(codex_stream_error "$json_file")"
+    log "run ($mode) failed rc=$rc auth=$(auth_status) error=${codex_error:-none}"
+    echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)).${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
     return 1
   fi
 
@@ -766,8 +819,10 @@ cmd_run() {
   research_output="$(jq -c 'select(.type=="item.completed" and .item.type=="agent_message")' "$json_file" 2>/dev/null | tail -1 | jq -r '.item.text // ""' 2>/dev/null)"
 
   if [ -z "$research_output" ]; then
-    log "run ($mode) produced empty output"
-    echo "crosscheck --run: codex produced no output. See $STDERR_LOG_FILE." >&2
+    local codex_error
+    codex_error="$(codex_stream_error "$json_file")"
+    log "run ($mode) produced empty output error=${codex_error:-none}"
+    echo "crosscheck --run: codex produced no output.${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
     return 1
   fi
 
@@ -775,7 +830,7 @@ cmd_run() {
   # take several minutes, long enough for an ancestor directory to have been
   # replaced with a symlink since the first check. publish_report repeats the
   # check on its own, which is fine, it's cheap.
-  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex"
+  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort"
   return $?
 }
 
@@ -898,6 +953,155 @@ cmd_skip() {
   return 0
 }
 
+# --- `--metrics-findings`: record one plan-review round's findings as counts
+# (severity x source), never as text. Called by the crosscheck skill after it
+# relays a round, because only the skill knows the merged, deduplicated list
+# and which engines actually reported. Fails closed (exit 2, nothing written)
+# on any invalid argument. ---
+cmd_metrics_findings() {
+  local hash="" round="" engines="" finding severity source counts
+  local -a findings=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --round) round="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --engines) engines="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --finding) findings+=("${2:-}"); shift $(( $# >= 2 ? 2 : 1 )) ;;
+      *) shift ;;
+    esac
+  done
+
+  [[ "$hash" =~ ^[0-9a-f]+$ ]] || { echo "crosscheck --metrics-findings: --hash is required and must be hex" >&2; return 2; }
+  [[ "$round" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --metrics-findings: --round is required and must be a positive integer" >&2; return 2; }
+  case "$engines" in
+    codex|claude|both) : ;;
+    *) echo "crosscheck --metrics-findings: --engines must be one of: codex claude both" >&2; return 2 ;;
+  esac
+
+  # A single-engine round can only have findings from that engine: `ambos`
+  # or the other engine there would corrupt the codex-only / claude-only split.
+  if [ ${#findings[@]} -gt 0 ]; then
+    for finding in "${findings[@]}"; do
+      severity="${finding%%:*}"
+      source="${finding#*:}"
+      case "$severity" in
+        CRITICAL|HIGH|MEDIUM|LOW) : ;;
+        *) echo "crosscheck --metrics-findings: invalid severity in --finding '$finding'" >&2; return 2 ;;
+      esac
+      case "$source" in
+        codex|claude|ambos) : ;;
+        *) echo "crosscheck --metrics-findings: invalid source in --finding '$finding'" >&2; return 2 ;;
+      esac
+      if [ "$engines" != "both" ] && [ "$source" != "$engines" ]; then
+        echo "crosscheck --metrics-findings: source '$source' is not possible with --engines $engines" >&2
+        return 2
+      fi
+    done
+  fi
+
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --metrics-findings: jq not found on PATH" >&2; return 1; }
+
+  counts="{}"
+  if [ ${#findings[@]} -gt 0 ]; then
+    counts="$(printf '%s\n' "${findings[@]}" | jq -R -s -c '
+      split("\n") | map(select(length > 0) | split(":") | {severity: .[0], source: .[1]})
+      | group_by(.source)
+      | map({key: .[0].source, value: (group_by(.severity) | map({key: .[0].severity, value: length}) | from_entries)})
+      | from_entries')" || { echo "crosscheck --metrics-findings: could not build counts" >&2; return 1; }
+  fi
+
+  mkdir -p "$STATE_ROOT" 2>/dev/null
+  append_metric "$(jq -cn --arg hash "$hash" --arg engines "$engines" --arg repo "$(basename -- "$PWD")" \
+    --argjson round "$round" --argjson ts "$(date +%s)" --argjson counts "$counts" \
+    '{type:"findings", ts:$ts, hash:$hash, round:$round, engines:$engines, repo:$repo, counts:$counts}')"
+  log "metrics findings round=$round engines=$engines hash=$hash"
+  return 0
+}
+
+# jq program behind `--stats`. Input: every valid metrics line, slurped.
+# `findings` lines are deduplicated by hash (last wins); `run` lines are joined
+# to them by hash only to name the models behind the codex-vs-claude split.
+stats_program='
+def severities: ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+def severity_line($rows): severities | map(. as $level | "\($level) \([$rows[] | select(.severity == $level) | .n] | add // 0)") | join(", ");
+def critical_high($rows): [$rows[] | select(.severity == "CRITICAL" or .severity == "HIGH") | .n] | add // 0;
+def count_rows: [ .[] | .engines as $engines | (.counts // {}) | to_entries[] | .key as $source | .value | to_entries[]
+  | {engines: $engines, source: $source, severity: .key, n: .value} ];
+def model_of($runs; $hash; $engine): ([$runs[] | select(.hash == $hash and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
+
+(map(select(.type == "run"))) as $runs
+| (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
+| ($rounds | map(select(.engines != "both"))) as $single_rounds
+| ($rounds | map(select(.engines == "both"))) as $both_rounds
+| [
+    "Planes auditados: \($rounds | map(select(.round == 1)) | length)",
+    "Planes con mas de una ronda: \($rounds | map(select(.round == 2)) | length)",
+    "Auditorias por motor y modelo:",
+    ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(if .[0].model == "" then "(sin modelo)" else .[0].model end): \(length)"),
+    "Rondas de un solo motor, hallazgos por motor:",
+    ($single_rounds | count_rows as $rows | ["codex", "claude"][] as $engine
+      | [$rows[] | select(.engines == $engine)] as $mine
+      | "  \($engine): \(severity_line($mine)) (critical+high: \(critical_high($mine)))"),
+    "Rondas con ambos motores: \($both_rounds | length)",
+    ($both_rounds | group_by([model_of($runs; .hash; "codex"), model_of($runs; .hash; "claude")]) | .[]
+      | ([model_of($runs; .[0].hash; "codex"), model_of($runs; .[0].hash; "claude")]) as $pair
+      | count_rows as $rows
+      | "  codex \($pair[0]) + claude \($pair[1]) (\(length) rondas):",
+        (["codex", "claude", "ambos"][] as $source
+          | [$rows[] | select(.source == $source)] as $mine
+          | "    \(if $source == "ambos" then "ambos" else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))"))
+  ] | .[]
+'
+
+# --- `--stats [FILE...]`: plain-text summary of metrics.jsonl. With no
+# arguments it reads this instance's file; with arguments it reads only those
+# (so combining instances never counts the current one twice). Always exits 0
+# on missing or damaged input: a stats command must not fail on history. ---
+cmd_stats() {
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --stats: jq not found on PATH" >&2; return 1; }
+
+  local -a requested=("$@")
+  [ $# -eq 0 ] && requested=("$METRICS_FILE")
+
+  local requested_path directory canonical_path files="" notes="" read_count=0
+  for requested_path in "${requested[@]}"; do
+    canonical_path=""
+    if directory="$(cd "$(dirname -- "$requested_path")" 2>/dev/null && pwd -P)"; then
+      canonical_path="$directory/$(basename -- "$requested_path")"
+    fi
+    if [ -z "$canonical_path" ] || [ ! -f "$canonical_path" ] || [ ! -r "$canonical_path" ]; then
+      notes="$notes  saltado (no existe o no se puede leer): $requested_path"$'\n'
+      continue
+    fi
+    case $'\n'"$files" in
+      *$'\n'"$canonical_path"$'\n'*) continue ;;
+    esac
+    files="$files$canonical_path"$'\n'
+    read_count=$((read_count + 1))
+  done
+
+  # One file at a time, with an explicit newline between them: a file that
+  # lacks a trailing newline must not glue its last line to the next file.
+  local all_lines="" metrics_path valid_lines total_count valid_count
+  while IFS= read -r metrics_path; do
+    [ -n "$metrics_path" ] || continue
+    all_lines="$all_lines$(cat -- "$metrics_path")"$'\n'
+  done <<<"$files"
+
+  total_count="$(printf '%s\n' "$all_lines" | grep -c .)"
+  valid_lines="$(printf '%s\n' "$all_lines" | jq -R -c 'fromjson? | select(type == "object")' 2>/dev/null)"
+  valid_count="$(printf '%s\n' "$valid_lines" | grep -c .)"
+
+  printf 'Metricas de crosscheck (%s archivo(s), %s linea(s) saltada(s))\n' "$read_count" "$((total_count - valid_count))"
+  [ -n "$notes" ] && printf '%s' "$notes"
+  if [ "$valid_count" -eq 0 ]; then
+    echo "sin metricas todavia"
+    return 0
+  fi
+  printf '%s\n' "$valid_lines" | jq -r -s "$stats_program"
+  return 0
+}
+
 # --- `--tmp-dir`: print (and create) a scratch dir under this plugin's own
 # state root, so the skill doesn't have to re-derive state_root's precedence
 # rules itself just to know where to put a temp prompt file. ---
@@ -920,7 +1124,7 @@ run_selftest() {
   # directory instead of $tmp_home, including its DISABLED sentinel if one
   # happens to be set, silently making every check below fail in a way that
   # looks like a logic bug, not an environment leak. Confirmed the hard way.
-  unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR
+  unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR CROSSCHECK_MODEL CROSSCHECK_EFFORT
   tmp_home="$(mktemp -d -t crosscheck-selftest.XXXXXX)" || {
     echo "selftest: mktemp -d failed" >&2
     return 1
@@ -1236,6 +1440,24 @@ run_selftest() {
   check "codex exit 90: message reports rc=90" "$(printf '%s' "$out" | grep -c 'rc=90')" "1"
   check "codex exit 90: message blames codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "1"
   check "codex exit 90: hash not marked reviewed" "$([ -s "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash90}.state" ] && echo yes || echo no)" "no"
+
+  # 21b. Codex reports API failures as `error`/`turn.failed` events on stdout
+  #      (e.g. a model the account does not have). The message must reach the
+  #      user and the log, not just "rc=1".
+  local codex_api_error_dir="$tmp_home/codexapierror"
+  mkdir -p "$codex_api_error_dir"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"turn.failed", error:{message:"model_not_found: not supported with this account"}}')'"
+    echo 'exit 1'
+  } >"$codex_api_error_dir/codex"
+  chmod +x "$codex_api_error_dir/codex"
+  out="$(HOME="$tmp_home" PATH="$codex_api_error_dir:$PATH" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash codexapierrorhash1 2>&1 >/dev/null)"
+  rc=$?
+  check "codex api error: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "codex api error: message carries what Codex said" "$(printf '%s' "$out" | grep -c 'Codex said: model_not_found')" "1"
+  check "codex api error: the log records it too" "$(grep -c 'error=model_not_found' "$tmp_home/.claude/plan-mode-crosscheck/logs/crosscheck.log" 2>/dev/null)" "1"
 
   # 22. A prompt file that exists (passes -s) but can't actually be read is a
   #     setup failure: Codex is never invoked over an empty/partial task that
@@ -1669,6 +1891,127 @@ run_selftest() {
   done
   check "single-quoted free text never executed a substitution" "$([ -e "$injection_marker" ] && echo yes || echo no)" "no"
 
+  # 38. Metrics: every published report appends one `run` line to
+  #     metrics.jsonl, a sibling of config.json (not under the pruned state/).
+  #     Round comes from the prompt's first line, model/effort from the
+  #     resolved config, never from the caller's environment.
+  local state_root_dir="$tmp_home/.claude/plan-mode-crosscheck" metrics_file metrics_prompt
+  metrics_file="$state_root_dir/metrics.jsonl"
+  metrics_prompt="$tmp_home/metrics-prompt.md"
+  printf 'ROUND: 2\n\nPROPOSED PLAN:\nmetrics test\n' >"$metrics_prompt"
+  rm -f "$metrics_file"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode plan-review --prompt-file "$metrics_prompt" --hash metricscodexhash1 2>/dev/null)"
+  check "metrics: codex run line has engine/round/mode/hash" "$(jq -r '"\(.type) \(.engine) \(.round) \(.mode) \(.hash)"' "$metrics_file" 2>/dev/null | tail -1)" "run codex 2 plan-review metricscodexhash1"
+  check "metrics: codex run line carries the configured model" "$(jq -r '.model' "$metrics_file" 2>/dev/null | tail -1)" "gpt-9-configtest"
+  out="$(HOME="$tmp_home" PATH="$claude_stub:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$metrics_prompt" --hash metricsclaudehash1 2>/dev/null)"
+  check "metrics: claude run line has engine claude" "$(jq -r '.engine' "$metrics_file" 2>/dev/null | tail -1)" "claude"
+  check "metrics: claude run line carries the claude model, not codex's" "$(jq -r '.model' "$metrics_file" 2>/dev/null | tail -1)" "fable"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode research --prompt-file "$prompt_file" 2>/dev/null)"
+  check "metrics: research run has null round and null hash" "$(jq -r '"\(.round) \(.hash)"' "$metrics_file" 2>/dev/null | tail -1)" "null null"
+  check "metrics: file lives in the state root, not in state/" "$([ -f "$metrics_file" ] && [ ! -e "$state_root_dir/state/metrics.jsonl" ] && echo yes || echo no)" "yes"
+  touch -t 200001010000 "$metrics_file"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:""}, cwd:$cwd}' | HOME="$tmp_home" "$run" >/dev/null 2>&1
+  check "metrics: file survives the hook's age-based prune" "$([ -f "$metrics_file" ] && echo yes || echo no)" "yes"
+
+  # 38b. A metrics file that cannot be appended to (here: a directory stands
+  #      in for it) never blocks the audit: report published, hash reviewed.
+  rm -f "$metrics_file"; mkdir "$metrics_file"
+  out="$(HOME="$tmp_home" PATH="$stub_bin:$PATH" "$run" --run --mode plan-review --prompt-file "$metrics_prompt" --hash metricsblockedhash1 2>/dev/null)"
+  rc=$?
+  check "metrics: unwritable metrics file does not fail --run" "$rc" "0"
+  check "metrics: unwritable metrics file still marks the hash reviewed" "$(jq -r '.status' "$state_root_dir/state/plan-metricsblockedhash1.state" 2>/dev/null)" "reviewed"
+  rmdir "$metrics_file"
+
+  # 38c. `--record` takes model/effort from its caller (empty), so an exported
+  #      CROSSCHECK_MODEL cannot mislabel the line; a publish that fails to
+  #      persist the plan state leaves no `run` line.
+  rm -f "$metrics_file"
+  out="$(HOME="$tmp_home" CROSSCHECK_MODEL=gpt-x CROSSCHECK_EFFORT=low "$run" --record --engine claude --mode plan-review --report-file "$claude_report" --hash metricsrecordhash1 2>/dev/null)"
+  check "metrics: --record run line has an empty model despite CROSSCHECK_MODEL" "$(jq -r '"[\(.engine)][\(.model)][\(.effort)]"' "$metrics_file" 2>/dev/null | tail -1)" "[claude][][]"
+  if [ "$(id -u)" -ne 0 ]; then
+    rm -f "$metrics_file"
+    chmod 500 "$state_root_dir/state"
+    out="$(HOME="$tmp_home" "$run" --record --engine claude --mode plan-review --report-file "$claude_report" --hash metricsfailstate1 2>/dev/null)"
+    rc=$?
+    chmod 700 "$state_root_dir/state"
+    check "metrics: failed state write makes --record exit nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+    check "metrics: failed publish leaves no run line" "$([ -s "$metrics_file" ] && echo yes || echo no)" "no"
+  else
+    echo "  skip  failed-publish metrics check (running as root ignores directory permissions)"
+  fi
+
+  # 39. `--metrics-findings`: counts by source and severity, validated, and
+  #     fail closed (exit 2, nothing written) on any bad argument.
+  local metrics_root="$tmp_home/metrics-root"
+  mkdir -p "$metrics_root"
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc123 --round 1 --engines both \
+    --finding HIGH:codex --finding HIGH:ambos --finding LOW:claude >/dev/null 2>&1
+  rc=$?
+  check "metrics-findings: valid call exits 0" "$rc" "0"
+  check "metrics-findings: counts are grouped by source and severity" "$(jq -c '.counts' "$metrics_root/metrics.jsonl" 2>/dev/null)" '{"ambos":{"HIGH":1},"claude":{"LOW":1},"codex":{"HIGH":1}}'
+  check "metrics-findings: line records hash, round and engines" "$(jq -r '"\(.type) \(.hash) \(.round) \(.engines)"' "$metrics_root/metrics.jsonl" 2>/dev/null)" "findings abc123 1 both"
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc124 --round 2 --engines claude >/dev/null 2>&1
+  check "metrics-findings: no findings is valid and records empty counts" "$(jq -c '.counts' "$metrics_root/metrics.jsonl" 2>/dev/null | tail -1)" "{}"
+  metrics_findings_bad() {
+    local desc="$1"; shift
+    local before after
+    before="$(wc -l <"$metrics_root/metrics.jsonl" | tr -d ' ')"
+    CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings "$@" >/dev/null 2>&1
+    rc=$?
+    after="$(wc -l <"$metrics_root/metrics.jsonl" | tr -d ' ')"
+    check "metrics-findings rejects $desc (exit 2, nothing written)" "$rc/$([ "$before" = "$after" ] && echo same || echo changed)" "2/same"
+  }
+  metrics_findings_bad "an unknown severity" --hash abc123 --round 1 --engines both --finding BOGUS:codex
+  metrics_findings_bad "an unknown source" --hash abc123 --round 1 --engines both --finding HIGH:otro
+  metrics_findings_bad "a non-numeric round" --hash abc123 --round x --engines both
+  metrics_findings_bad "a missing engines" --hash abc123 --round 1
+  metrics_findings_bad "a missing hash" --round 1 --engines both
+  metrics_findings_bad "a non-hex hash" --hash 'not hex' --round 1 --engines both
+  metrics_findings_bad "ambos on a single-engine round" --hash abc123 --round 1 --engines codex --finding HIGH:ambos
+  metrics_findings_bad "the other engine on a single-engine round" --hash abc123 --round 1 --engines codex --finding HIGH:claude
+
+  # 40. `--stats`: totals over a hand-built fixture. h1 is a `both` round
+  #     (duplicated line, must count once); h2 is codex-only and must not leak
+  #     into the codex-vs-claude split; plans A and B (same repo) reach rounds
+  #     2 and 3; the last line is truncated and must be skipped, not fatal.
+  local fixture="$tmp_home/fixture.jsonl" empty_root="$tmp_home/empty-root"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"h1","repo":"r"}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"h1","repo":"r"}'
+    echo '{"type":"findings","ts":2,"hash":"h1","round":1,"engines":"both","repo":"r","counts":{"codex":{"HIGH":2},"ambos":{"HIGH":1},"claude":{"LOW":1}}}'
+    echo '{"type":"findings","ts":2,"hash":"h1","round":1,"engines":"both","repo":"r","counts":{"codex":{"HIGH":2},"ambos":{"HIGH":1},"claude":{"LOW":1}}}'
+    echo '{"type":"findings","ts":3,"hash":"h2","round":1,"engines":"codex","repo":"r","counts":{"codex":{"HIGH":5}}}'
+    echo '{"type":"findings","ts":4,"hash":"a1","round":1,"engines":"codex","repo":"r","counts":{}}'
+    echo '{"type":"findings","ts":5,"hash":"a2","round":2,"engines":"codex","repo":"r","counts":{}}'
+    echo '{"type":"findings","ts":6,"hash":"b1","round":1,"engines":"codex","repo":"r","counts":{}}'
+    echo '{"type":"findings","ts":7,"hash":"b2","round":2,"engines":"codex","repo":"r","counts":{}}'
+    echo '{"type":"findings","ts":8,"hash":"b3","round":3,"engines":"codex","repo":"r","counts":{}}'
+    printf '{"type":"findi'
+  } >"$fixture"
+  out="$("$run" --stats "$fixture")"
+  rc=$?
+  check "stats: exits 0 on a fixture with a truncated line" "$rc" "0"
+  check "stats: plans audited counts round-1 findings once per hash" "$(printf '%s' "$out" | grep -c '^Planes auditados: 4$')" "1"
+  check "stats: multi-round plans are the round-2 lines" "$(printf '%s' "$out" | grep -c '^Planes con mas de una ronda: 2$')" "1"
+  check "stats: the truncated line is skipped and reported" "$(printf '%s' "$out" | grep -c '1 linea(s) saltada(s)')" "1"
+  check "stats: codex-only in both rounds ignores single-engine rounds" "$(printf '%s' "$out" | grep -c 'solo codex: CRITICAL 0, HIGH 2, MEDIUM 0, LOW 0 (critical+high: 2)')" "1"
+  check "stats: the duplicated both round counts once (ambos HIGH 1)" "$(printf '%s' "$out" | grep -c 'ambos: CRITICAL 0, HIGH 1, MEDIUM 0, LOW 0')" "1"
+  check "stats: single-engine totals are reported separately" "$(printf '%s' "$out" | grep -c '^  codex: CRITICAL 0, HIGH 5')" "1"
+  check "stats: the both split names the model pair from the run lines" "$(printf '%s' "$out" | grep -c 'codex gpt-a + claude opus-x (1 rondas)')" "1"
+  ln -s "$tmp_home" "$tmp_home/fixture-link"
+  check "stats: the same file twice equals the file once" "$("$run" --stats "$fixture" "$fixture")" "$out"
+  check "stats: the same file via a symlinked directory equals once" "$("$run" --stats "$fixture" "$tmp_home/fixture-link/fixture.jsonl")" "$out"
+  local with_missing
+  with_missing="$("$run" --stats "$fixture" /nonexistent/metrics.jsonl)"
+  rc=$?
+  check "stats: a missing file exits 0" "$rc" "0"
+  check "stats: a missing file is noted" "$(printf '%s' "$with_missing" | grep -c 'saltado')" "1"
+  check "stats: a missing file leaves the totals alone" "$(printf '%s' "$with_missing" | grep -v 'saltado')" "$out"
+  out="$(CROSSCHECK_STATE_DIR="$empty_root" "$run" --stats)"
+  rc=$?
+  check "stats: no metrics file exits 0" "$rc" "0"
+  check "stats: no metrics file says there are none yet" "$(printf '%s' "$out" | grep -c 'sin metricas todavia')" "1"
+
   rm -rf "$tmp_home"
   echo
   if [ "$failures" -eq 0 ]; then
@@ -1799,6 +2142,17 @@ case "${1:-}" in
     ;;
   --tmp-dir)
     cmd_tmp_dir
+    exit $?
+    ;;
+  --metrics-findings)
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    shift
+    cmd_metrics_findings "$@"
+    exit $?
+    ;;
+  --stats)
+    shift
+    cmd_stats "$@"
     exit $?
     ;;
 esac

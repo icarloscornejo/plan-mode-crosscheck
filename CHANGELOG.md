@@ -2,6 +2,44 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.5.0
+
+Per-audit metrics, so the value of an audit can be quoted with numbers.
+
+**`metrics.jsonl`.** A sibling of `config.json` in the state root, never under
+the 7-day-pruned `state/`, so history is kept. Numbers and short labels only,
+never finding text. Two kinds of line:
+
+- `run`: written by `publish_report` for every published report (both engines,
+  `--run` and `--record`): engine, model, effort, round, plan hash, repo folder
+  name. A publish that fails leaves no line, and a metrics write failure never
+  fails an audit. Model and effort are passed in by the caller, so an exported
+  `CROSSCHECK_MODEL` cannot mislabel a Claude report.
+- `findings`: written by the skill after it relays a round, through the new
+  `--metrics-findings --hash H --round N --engines E --finding SEV:SRC`. Only
+  the skill sees the merged, deduplicated list, so reports are never parsed.
+  `--engines` is the engines that actually reported (a `both` round where one
+  engine failed is recorded as the survivor), which keeps "only Codex found
+  it" from being inflated by rounds where Claude never ran. Invalid arguments
+  exit 2 and write nothing.
+
+**`--stats [FILE...]`.** Plain-text summary: plans audited, plans that needed
+more than one round, audits per engine and model, single-engine findings, and
+for `both` rounds the solo-codex / solo-claude / both split by severity and
+model pair. Several files combine instances (with explicit paths it reads only
+those, deduplicated by canonical path). Truncated lines and missing files are
+skipped and reported, never fatal.
+
+**Codex's real error is no longer lost.** Codex reports API failures (a model
+the account does not have, no subscription, rate limits) as `error` /
+`turn.failed` events on stdout, and `--run` deletes that stream when it
+returns, so a failure showed up as a bare `rc=1`. `--run` now extracts the
+first such message (one line, capped at 500 chars) and puts it in the stderr
+message (`Codex said: ...`) and the log.
+
+SKILL.md: the relay step now records the round, and the two passages that said
+N is never passed to a command were rewritten.
+
 ## 3.4.0
 
 Any model ID, and a Claude effort.

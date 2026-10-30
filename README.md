@@ -239,13 +239,39 @@ Resolved in this order:
    other than `~/.claude`).
 3. `~/.claude/plan-mode-crosscheck`, otherwise.
 
-Inside that directory: `config.json`, `logs/crosscheck.log` (structured, one line per run),
+Inside that directory: `config.json`, `metrics.jsonl` (see Metrics below, never
+pruned), `logs/crosscheck.log` (structured, one line per run),
 `logs/crosscheck.stderr.log` (Codex's own stderr, timestamped and delimited
 per call), and `state/`, one small JSON file per plan hash (`pending`,
 `reviewed`, or `skipped`), a `reports/` subdirectory holding the full text of
 every Codex report (so a large one that doesn't fit inline in a tool result is
 never lost, just pointed at), and a `tmp/` subdirectory the skill uses to stage
 prompt files before a run. Everything under `state/` is pruned after 7 days.
+
+## Metrics
+
+Every audit leaves numbers behind in `metrics.jsonl`, next to `config.json`
+(never pruned, unlike `state/`): which engine and model ran, the round, and
+how many findings of each severity each engine found. In `both` mode it also
+records which findings only Codex found, only Claude found, or both. It stores
+counts and short labels only, never finding text, so it is safe to keep and
+share even when the plans were about private repos.
+
+```
+crosscheck --stats
+```
+
+prints the totals. To combine several instances, pass each one's file (with
+explicit paths it reads only those):
+
+```
+crosscheck --stats ~/.claude/plan-mode-crosscheck/metrics.jsonl \
+  ~/.claude-me/plan-mode-crosscheck/metrics.jsonl
+```
+
+Counting starts the day you install this version, old reports are not parsed.
+Accepted versus rejected findings are not tracked: findings are expected to be
+incorporated.
 
 ## Kill switch
 

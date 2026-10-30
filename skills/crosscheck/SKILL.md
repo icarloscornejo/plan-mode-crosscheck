@@ -82,10 +82,11 @@ will keep denying forever.
    this same plan-mode task so far, starting at 1. An attempt counts once no
    matter which engine(s) ran it (`codex`, `claude` or `both`). There is no
    cap and no state file for it, nothing to look up: you already know it
-   because you just made the previous attempts. `N` is never passed to any
-   `crosscheck` command; it only appears in the `ROUND: N` line of the
-   prompt, in task descriptions, and in `PRIOR ROUNDS`. Each new round still
-   needs the user's explicit "Otra ronda".
+   because you just made the previous attempts. `N` only appears in the
+   `ROUND: N` line of the prompt, in task descriptions, in `PRIOR ROUNDS`, and
+   in the `crosscheck --metrics-findings --round N` call that records the
+   round (see "Relaying a round's findings"). Each new round still needs the
+   user's explicit "Otra ronda".
 
    a. Get a scratch directory and write the prompt file inside a `Bash` tool
       call (see Notes for how many calls each engine takes). Do not write the
@@ -263,6 +264,24 @@ and produce a single deduplicated list in the same format and order.
   don't inflate the list with the same point worded twice.
 - `PRIOR ROUNDS` for the next round carries the source too.
 
+**Record the round's counts.** Right after the relay (`plan-review` only,
+never `research`), run one foreground `Bash` call:
+
+```
+crosscheck --metrics-findings --hash <hash> --round N --engines <codex|claude|both> \
+  --finding HIGH:codex --finding MEDIUM:ambos ...
+```
+
+One `--finding SEVERITY:SOURCE` per finding of the list you just relayed (the
+deduplicated one), with the severity you relayed. `--engines` is the engine(s)
+that actually reported this round, not the configured one: in `both`, if one
+engine failed, pass the one that survived. When a single engine reported, every
+source is that engine (`codex` or `claude`); only `--engines both` takes
+`codex`, `claude` or `ambos` (the same `Source:` line, `claude:<model>` reduced
+to `claude`). No findings is valid: pass none. It records numbers only, never
+text. If it exits nonzero, say so in one line and carry on: metrics never block
+the audit.
+
 ## Recommending: one more round, or show the plan
 
 Runs once per round, immediately after "Relaying a round's findings" above,
@@ -359,9 +378,13 @@ first.
   user may already have set; don't override them unless asked to. Engine and
   models live in `config.json`, managed with `crosscheck --config get|set` or,
   interactively, `/crosscheck-setup`.
-- There is no round cap and no per-round flag on any command. Round counting
-  (`N`) is entirely on this skill's side, only for the `ROUND: N` prompt line, task
-  descriptions and `PRIOR ROUNDS`.
+- There is no round cap. Round counting (`N`) is entirely on this skill's
+  side: it goes in the `ROUND: N` prompt line, task descriptions, `PRIOR
+  ROUNDS` and `--metrics-findings --round N`; no other command takes it.
+- `crosscheck --metrics-findings` records a plan-review round's findings as
+  counts (never text) in `metrics.jsonl`, and `crosscheck --stats [FILE...]`
+  prints the totals. `--run` already logs each report's engine, model and
+  round there by itself.
 - `Bash` calls per audit: `codex` and `claude` are one call each (write the
   prompt, then `--run --engine ...`, backgrounded). `both` is one foreground
   call (write the prompt, print its path), then two backgrounded `--run`
