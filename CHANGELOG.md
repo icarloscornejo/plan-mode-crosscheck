@@ -2,6 +2,36 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.8.0
+
+Complete audit metrics.
+
+- **Run lines** now carry `started_at`, `ended_at`, `duration_s`, `status`
+  (`success`, `failed`, `timeout`) and `error` (the engine's message, one line,
+  capped). Failed and timed-out runs get a line too; before, they left none.
+- **Tokens and cost.** Codex input, cached and output tokens come from the
+  `turn.completed` events of its `--json` stream (summed over turns). The
+  Claude engine now runs `--output-format json` and unwraps `.result`; it
+  records input, cached and output tokens and `cost_usd`. `input_tokens` is all
+  input with `cached_tokens` its cached part, for both engines, so they compare.
+  Failed runs keep the usage and the real error message too. A claude that
+  prints plain text still works, with no usage.
+- **Finding outcomes.** `--finding SEVERITY:SOURCE[:STATUS[:reason]]`, with
+  STATUS `incorporated`, `rejected` (reason required: a short label of at
+  most 60 characters, letters, digits, spaces and `. _ , -`) or
+  `not-applicable`; no status is recorded as `unknown`. A `--finding` with a
+  line break or control character is refused. `counts` is unchanged.
+- **Missing records.** On each `ExitPlanMode` hook call, a successful
+  plan-review run from the last week and older than two minutes, with no
+  `findings` line at or after it for its hash and round, gets a
+  `findings-missing` line (one batched write, linear scan). The CRITICAL gate
+  never reads it.
+- A run that engine-succeeded but failed to publish is recorded as failed.
+- **`--stats`** adds duration, tokens and cost to the audits table, lists failed
+  and timed-out runs, moves research and legacy `--record` runs to their own
+  section, and reports acceptance per engine and model (an `ambos` finding
+  counts for both) and the rounds without a record.
+
 ## 3.7.0
 
 **Skipping an audit needs the user's own answer.** `--skip --hash H` and

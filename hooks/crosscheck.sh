@@ -345,6 +345,73 @@ codex_stream_error() {
     | head -n 1 | tr '\n' ' ' | head -c 500
 }
 
+# Token usage out of codex's `--json` stream (summed over its `turn.completed`
+# events). Prints a compact JSON object, or `null` when the stream has none, so
+# a missing figure is never recorded as a zero. $1 = path to the stream.
+# Both engines record `input_tokens` as ALL input, cached included, with
+# `cached_tokens` the cached part of it, so the two are comparable (Codex
+# already reports it that way; Claude reports cache reads and writes apart).
+codex_usage_json() {
+  jq -R -c 'fromjson? | select(type == "object" and .type == "turn.completed") | .usage // empty' "$1" 2>/dev/null \
+    | jq -cs 'if length == 0 then null else {
+        input_tokens: (map(.input_tokens // 0) | add),
+        output_tokens: (map(.output_tokens // 0) | add),
+        cached_tokens: (map(.cached_input_tokens // 0) | add),
+        cost_usd: null } end' 2>/dev/null || printf 'null'
+}
+
+# Claude's `--output-format json` result: one object (or an array of events
+# whose last `result` one is the answer). Prints the final result object, or
+# nothing when the file is not that JSON (an older claude, or plain text), so
+# the caller falls back to treating the whole file as the report.
+claude_result_json() {
+  jq -c 'if type == "array" then (map(select(type == "object" and .type == "result")) | last // empty)
+         elif type == "object" and .type == "result" then . else empty end' "$1" 2>/dev/null | tail -n 1
+}
+
+claude_usage_json() {
+  printf '%s' "$1" | jq -c '(.usage // null) as $usage | if $usage == null then null else {
+      input_tokens: (($usage.input_tokens // 0) + ($usage.cache_creation_input_tokens // 0) + ($usage.cache_read_input_tokens // 0)),
+      output_tokens: ($usage.output_tokens // 0),
+      cached_tokens: ($usage.cache_read_input_tokens // 0),
+      cost_usd: (.total_cost_usd // null) } end' 2>/dev/null || printf 'null'
+}
+
+# Extra fields for a `run` metrics line: when it started and ended, how long it
+# took, how it ended and the engine's token usage. $1 = status
+# (success|failed|timeout), $2 = start epoch, $3 = end epoch, $4 = error text
+# (may be empty), $5 = usage JSON or null. The error is one line, capped: an
+# engine message, never the prompt or the report.
+run_extra_json() {
+  local status="$1" started="$2" ended="$3" error="${4:-}" usage="${5:-null}"
+  [ -n "$usage" ] || usage="null"
+  error="${error%"${error##*[![:space:]]}"}"
+  jq -cn --arg status "$status" --argjson started "$started" --argjson ended "$ended" \
+    --arg error "$(printf '%s' "$error" | tr '\n\r' '  ' | head -c 300)" --argjson usage "$usage" \
+    '{started_at:$started, ended_at:$ended, duration_s:($ended - $started), status:$status,
+      error:(if $error == "" then null else $error end)}
+     + (if $usage == null then {} else {input_tokens:$usage.input_tokens, output_tokens:$usage.output_tokens,
+         cached_tokens:$usage.cached_tokens, cost_usd:$usage.cost_usd} end)' 2>/dev/null || printf '{}'
+}
+
+# A run that failed or timed out never reaches publish_report, so it would
+# vanish from the metrics. This writes its `run` line. $1 = mode, $2 = engine,
+# $3 = model, $4 = effort, $5 = hash, $6 = round, $7 = start epoch, $8 = engine
+# exit code, $9 = error text, $10 = usage JSON (a failed run can still have
+# been billed).
+record_failed_run() {
+  local mode="$1" engine="$2" model="$3" effort="$4" hash="$5" round="$6" started="$7" rc="$8" error="${9:-}" usage="${10:-null}"
+  local status="failed" round_json="null" ended
+  [ "$rc" -eq 124 ] && status="timeout"
+  [[ "$round" =~ ^[1-9][0-9]*$ ]] && round_json="$round"
+  ended="$(date +%s)"
+  append_metric "$(jq -cn --arg mode "$mode" --arg engine "$engine" --arg model "$model" \
+    --arg effort "$effort" --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
+    --argjson round "$round_json" --argjson ts "$ended" --argjson extra "$(run_extra_json "$status" "$started" "$ended" "$error" "$usage")" \
+    '{type:"run", ts:$ts, mode:$mode, engine:$engine, model:$model, effort:$effort,
+      round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo} + $extra' 2>/dev/null)"
+}
+
 # Claude twin of run_codex. Args: $1 instructions, $2 request body, $3 budget
 # seconds, $4 file to write claude's stdout to, $5 timeout binary, $6 model id,
 # $7 effort. Prompt over stdin, never argv, for the same reason as run_codex.
@@ -361,7 +428,7 @@ run_claude() {
     --safe-mode \
     --model "$model" \
     --effort "$effort" \
-    --output-format text \
+    --output-format json \
     --no-session-persistence \
     --tools "Read,Grep,Glob" \
     --permission-mode dontAsk \
@@ -694,7 +761,8 @@ append_metric() {
 # a user's exported CROSSCHECK_MODEL would otherwise label a claude report.
 publish_report() {
   local mode="$1" hash="$2" artifact_file="$3" body="$4" engine="$5"
-  local round="${6:-}" model="${7:-}" effort="${8:-}"
+  local round="${6:-}" model="${7:-}" effort="${8:-}" extra="${9:-}"
+  [ -n "$extra" ] || extra="{}"
 
   if ! artifact_file="$(confine_to_state_root "$artifact_file")"; then
     log "publish ($mode) engine=$engine refused to publish: --out no longer resolves under $STATE_ROOT"
@@ -725,9 +793,9 @@ publish_report() {
   [[ "$round" =~ ^[1-9][0-9]*$ ]] && round_json="$round"
   append_metric "$(jq -cn --arg mode "$mode" --arg engine "$engine" --arg model "$model" \
     --arg effort "$effort" --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
-    --argjson round "$round_json" --argjson ts "$(date +%s)" \
+    --argjson round "$round_json" --argjson ts "$(date +%s)" --argjson extra "$extra" \
     '{type:"run", ts:$ts, mode:$mode, engine:$engine, model:$model, effort:$effort,
-      round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo}' 2>/dev/null)"
+      round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo} + $extra' 2>/dev/null)"
 
   local body_bytes
   body_bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
@@ -859,29 +927,60 @@ cmd_run() {
   # shellcheck disable=SC2064
   trap "rm -f $(printf '%q' "$json_file")" EXIT
 
+  local run_started run_ended
+  run_started="$(date +%s)"
   if [ "$engine" = "claude" ]; then
-    # `json_file` holds claude's plain-text stdout here (no JSON stream to
-    # decode). Its failures never mention Codex or call auth_status.
+    # `json_file` holds claude's `--output-format json` result (or plain text
+    # from a claude that ignores the flag). Its failures never mention Codex
+    # or call auth_status.
     run_claude "$instructions" "$prompt_body" "$budget" "$json_file" "$timeout_bin" "$engine_model" "$engine_effort"
     rc=$?
+    run_ended="$(date +%s)"
     if [ $rc -ne 0 ]; then
       log "run ($mode) engine=claude failed rc=$rc"
       echo "crosscheck --run: claude -p failed (rc=$rc). See $STDERR_LOG_FILE." >&2
+      # A failing claude can still print a JSON result with the real message
+      # and what the run cost.
+      local failed_result failed_message
+      failed_result="$(claude_result_json "$json_file")"
+      failed_message="$(printf '%s' "$failed_result" | jq -r '.result // empty' 2>/dev/null)"
+      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" \
+        "${failed_message:-claude -p exited $rc}" "$([ -n "$failed_result" ] && claude_usage_json "$failed_result" || printf null)"
       return 1
     fi
-    local claude_output
-    claude_output="$(cat "$json_file" 2>/dev/null)"
+    local claude_result claude_output claude_usage="null" claude_is_error
+    claude_result="$(claude_result_json "$json_file")"
+    if [ -n "$claude_result" ]; then
+      claude_output="$(printf '%s' "$claude_result" | jq -r '.result // ""' 2>/dev/null)"
+      claude_usage="$(claude_usage_json "$claude_result")"
+      claude_is_error="$(printf '%s' "$claude_result" | jq -r '.is_error // false' 2>/dev/null)"
+      if [ "$claude_is_error" = "true" ]; then
+        log "run ($mode) engine=claude reported an error result"
+        echo "crosscheck --run: claude reported an error: $(printf '%s' "$claude_output" | head -c 300). See $STDERR_LOG_FILE." >&2
+        record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage"
+        return 1
+      fi
+    else
+      claude_output="$(cat "$json_file" 2>/dev/null)"
+    fi
     if [ -z "$claude_output" ]; then
       log "run ($mode) engine=claude produced empty output"
       echo "crosscheck --run: claude produced no output. See $STDERR_LOG_FILE." >&2
+      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage"
       return 1
     fi
-    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort"
-    return $?
+    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" \
+      "$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage")"
+    rc=$?
+    # The engine ran (and was billed) but the report could not be published:
+    # still a failed run in the metrics.
+    [ $rc -eq 0 ] || record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$claude_usage"
+    return $rc
   fi
 
   run_codex "$instructions" "$prompt_body" "$budget" "$json_file" "$timeout_bin"
   rc=$?
+  run_ended="$(date +%s)"
 
   # Everything past this point is a genuine Codex-side outcome: setup already
   # succeeded, so rc and auth_status are meaningful and safe to report.
@@ -890,6 +989,7 @@ cmd_run() {
     codex_error="$(codex_stream_error "$json_file")"
     log "run ($mode) failed rc=$rc auth=$(auth_status) error=${codex_error:-none}"
     echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)).${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
+    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" "${codex_error:-codex exec exited $rc}" "$(codex_usage_json "$json_file")"
     return 1
   fi
 
@@ -901,6 +1001,7 @@ cmd_run() {
     codex_error="$(codex_stream_error "$json_file")"
     log "run ($mode) produced empty output error=${codex_error:-none}"
     echo "crosscheck --run: codex produced no output.${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
+    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "${codex_error:-empty output}" "$(codex_usage_json "$json_file")"
     return 1
   fi
 
@@ -908,8 +1009,11 @@ cmd_run() {
   # take several minutes, long enough for an ancestor directory to have been
   # replaced with a symlink since the first check. publish_report repeats the
   # check on its own, which is fine, it's cheap.
-  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort"
-  return $?
+  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort" \
+    "$(run_extra_json success "$run_started" "$run_ended" "" "$(codex_usage_json "$json_file")")"
+  rc=$?
+  [ $rc -eq 0 ] || record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$(codex_usage_json "$json_file")"
+  return $rc
 }
 
 # --- `--prepare`: assemble a task for an engine this script cannot invoke
@@ -1141,7 +1245,7 @@ critical_accepted() {
 # and which engines actually reported. Fails closed (exit 2, nothing written)
 # on any invalid argument. ---
 cmd_metrics_findings() {
-  local hash="" round="" engines="" finding severity source counts
+  local hash="" round="" engines="" finding severity source counts finding_status finding_reason
   local -a findings=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1164,8 +1268,20 @@ cmd_metrics_findings() {
   # or the other engine there would corrupt the codex-only / claude-only split.
   if [ ${#findings[@]} -gt 0 ]; then
     for finding in "${findings[@]}"; do
-      severity="${finding%%:*}"
-      source="${finding#*:}"
+      # A line break or control character would split this finding into rows
+      # that were never validated (and feed the CRITICAL gate's counts).
+      if [[ "$finding" == *[[:cntrl:]]* ]]; then
+        echo "crosscheck --metrics-findings: a --finding must be one line without control characters" >&2
+        return 2
+      fi
+      # SEVERITY:SOURCE[:STATUS[:reason]]; the reason is the rest of the string.
+      IFS=: read -r severity source finding_status finding_reason <<<"$finding"
+      # The reason is a short label, not finding text: metrics.jsonl is kept
+      # forever and shared between instances.
+      if [ -n "$finding_reason" ] && ! [[ "$finding_reason" =~ ^[A-Za-z0-9\ ._,-]{1,60}$ ]]; then
+        echo "crosscheck --metrics-findings: the reason must be 1-60 characters of letters, digits, spaces and . _ , -" >&2
+        return 2
+      fi
       case "$severity" in
         CRITICAL|HIGH|MEDIUM|LOW) : ;;
         *) echo "crosscheck --metrics-findings: invalid severity in --finding '$finding'" >&2; return 2 ;;
@@ -1173,6 +1289,13 @@ cmd_metrics_findings() {
       case "$source" in
         codex|claude|ambos) : ;;
         *) echo "crosscheck --metrics-findings: invalid source in --finding '$finding'" >&2; return 2 ;;
+      esac
+      case "$finding_status" in
+        ''|incorporated|not-applicable) : ;;
+        rejected)
+          [ -n "$finding_reason" ] || { echo "crosscheck --metrics-findings: a rejected finding needs a reason ('$finding')" >&2; return 2; }
+          ;;
+        *) echo "crosscheck --metrics-findings: invalid status in --finding '$finding' (want incorporated|rejected|not-applicable)" >&2; return 2 ;;
       esac
       if [ "$engines" != "both" ] && [ "$source" != "$engines" ]; then
         echo "crosscheck --metrics-findings: source '$source' is not possible with --engines $engines" >&2
@@ -1192,11 +1315,61 @@ cmd_metrics_findings() {
       | from_entries')" || { echo "crosscheck --metrics-findings: could not build counts" >&2; return 1; }
   fi
 
+  # What the model did with each finding. A finding reported without a status
+  # is "unknown" so a missing answer is visible in --stats, never counted as
+  # accepted or rejected. Reasons are short labels, capped.
+  local outcomes="[]"
+  if [ ${#findings[@]} -gt 0 ]; then
+    outcomes="$(printf '%s\n' "${findings[@]}" | tr '\r' ' ' | jq -R -s -c '
+      split("\n") | map(select(length > 0) | split(":")
+        | {severity: .[0], source: .[1], status: (if (.[2] // "") == "" then "unknown" else .[2] end),
+           reason: (if (.[3:] | length) == 0 then null else (.[3:] | join(":") | .[0:80]) end)})')" \
+      || { echo "crosscheck --metrics-findings: could not build outcomes" >&2; return 1; }
+  fi
+
   mkdir -p "$STATE_ROOT" 2>/dev/null
   append_metric "$(jq -cn --arg hash "$hash" --arg engines "$engines" --arg repo "$(basename -- "$PWD")" \
-    --argjson round "$round" --argjson ts "$(date +%s)" --argjson counts "$counts" \
-    '{type:"findings", ts:$ts, hash:$hash, round:$round, engines:$engines, repo:$repo, counts:$counts}')"
+    --argjson round "$round" --argjson ts "$(date +%s)" --argjson counts "$counts" --argjson outcomes "$outcomes" \
+    '{type:"findings", ts:$ts, hash:$hash, round:$round, engines:$engines, repo:$repo, counts:$counts, outcomes:$outcomes}')"
   log "metrics findings round=$round engines=$engines hash=$hash"
+  return 0
+}
+
+# The round's findings are recorded by the model (only it sees the merged
+# list), so it can forget, and a forgotten round would silently skew --stats.
+# On every ExitPlanMode hook call: any successful plan-review `run` line older
+# than two minutes (time to relay and record) whose hash and round have neither
+# a `findings` nor a `findings-missing` line gets a `findings-missing` line
+# (the "unknown" record). The gate reads only `findings` lines, so this never
+# changes what the CRITICAL gate sees. Never fails the hook.
+record_missing_findings() {
+  [ -r "$METRICS_FILE" ] && [ -f "$METRICS_FILE" ] || return 0
+  local pending now_epoch
+  now_epoch="$(date +%s)"
+  # Only the last week, the same horizon as the plan state: history from before
+  # this check existed is not backfilled with thousands of "unknown" lines.
+  pending="$(jq -R -c 'fromjson? // empty' "$METRICS_FILE" 2>/dev/null | jq -cs --argjson now "$now_epoch" '
+    # Latest record time per "hash round" (an object, so the lookup stays
+    # linear however long the history gets). A run counts as recorded only by
+    # a record made at or after it: a re-audit that reuses the round number
+    # of an older, recorded one still has to be recorded itself.
+    (reduce (.[] | select(type == "object" and (.type == "findings" or .type == "findings-missing")
+                          and (.ts | type) == "number")) as $record
+        ({}; ("\($record.hash) \($record.round)") as $key | .[$key] = ([.[$key] // 0, $record.ts] | max))) as $recorded_at
+    | [ .[] | select(type == "object" and .type == "run" and .mode == "plan-review"
+          and (.hash | type) == "string" and (.round | type) == "number"
+          and ((.status // "success") == "success") and (.ts | type) == "number" and (.ts <= $now - 120) and (.ts >= $now - 604800))
+        | {hash, round, repo, ts} ]
+    | group_by([.hash, .round]) | map(max_by(.ts)) | .[]
+    | select(($recorded_at["\(.hash) \(.round)"] // 0) < .ts and (.round >= 1) and (.round == (.round | floor)))
+    | {type: "findings-missing", ts: $now, hash, round, repo: (.repo // "")}' 2>/dev/null)" || return 0
+  [ -n "$pending" ] || return 0
+  # One write for the whole batch: this runs inside the hook's time budget.
+  if printf '%s\n' "$pending" >>"$METRICS_FILE" 2>/dev/null; then
+    log "metrics: $(printf '%s\n' "$pending" | wc -l | tr -d ' ') round(s) without recorded findings, recorded as unknown"
+  else
+    log "metrics: could not append to $METRICS_FILE"
+  fi
   return 0
 }
 
@@ -1211,7 +1384,20 @@ def count_rows: [ .[] | .engines as $engines | (.counts // {}) | to_entries[] | 
   | {engines: $engines, source: $source, severity: .key, n: .value} ];
 def model_of($runs; $hash; $engine): ([$runs[] | select(.hash == $hash and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
 
-(map(select(.type == "run"))) as $runs
+def averages: . as $group
+  | [ ([$group[].duration_s | numbers] as $d | if ($d | length) > 0 then "duracion media \(($d | add / ($d | length)) | round)s" else empty end),
+      ([$group[].input_tokens | numbers] as $i | [$group[].output_tokens | numbers] as $o
+        | if ($i | length) > 0 then "tokens totales \($i | add) entrada / \($o | add) salida" else empty end),
+      ([$group[].cost_usd | numbers] as $c | if ($c | length) > 0 then "costo total USD \(($c | add * 10000 | round) / 10000)" else empty end) ]
+  | if length == 0 then "" else " (" + join(", ") + ")" end;
+def engine_model_of($runs; $hash; $round; $engine): ([$runs[] | select(.hash == $hash and .round == $round and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
+
+(map(select(.type == "run"))) as $all_runs
+| ($all_runs | map(select(.mode == "plan-review" and (.model // "") != ""))) as $audit_runs
+| ($audit_runs | map(select((.status // "success") == "success"))) as $runs
+| ($audit_runs | map(select((.status // "success") != "success"))) as $failed_runs
+| ($all_runs | map(select(.mode != "plan-review" or (.model // "") == ""))) as $other_runs
+| (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
 | (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
 | ($rounds | map(select(.engines != "both"))) as $single_rounds
 | ($rounds | map(select(.engines == "both"))) as $both_rounds
@@ -1219,7 +1405,22 @@ def model_of($runs; $hash; $engine): ([$runs[] | select(.hash == $hash and .engi
     "Planes auditados: \($rounds | map(select(.round == 1)) | length)",
     "Planes con mas de una ronda: \($rounds | map(select(.round == 2)) | length)",
     "Auditorias por motor y modelo:",
-    ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(if .[0].model == "" then "(sin modelo)" else .[0].model end): \(length)"),
+    ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length)\(averages)"),
+    "Corridas fallidas o con timeout: \($failed_runs | length)",
+    ($failed_runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length) (timeout: \(map(select(.status == "timeout")) | length))"),
+    "Investigacion y corridas legacy (--record), fuera de la tabla de auditorias: \($other_runs | length)",
+    ($other_runs | group_by(.mode == "plan-review") | .[] | "  \(if .[0].mode == "plan-review" then "plan-review sin modelo (--record legacy)" else "research" end): \(length)"),
+    "Aceptacion de hallazgos por motor y modelo (incorporados / rechazados):",
+    ([ $round_records[] | . as $record | ($record.outcomes // [])[]
+       | (if .source == "ambos" then ["codex", "claude"] else [.source] end)[] as $engine
+       | {engine: $engine, model: engine_model_of($all_runs; $record.hash; $record.round; $engine), status: .status} ]
+      | if length == 0 then ["  sin hallazgos con estado todavia"][]
+        else (group_by([.engine, .model]) | .[]
+          | ([.[] | select(.status == "incorporated")] | length) as $accepted
+          | ([.[] | select(.status == "rejected")] | length) as $rejected
+          | ([.[] | select(.status == "unknown")] | length) as $unknown
+          | "  \(.[0].engine) \(.[0].model): \($accepted) incorporados, \($rejected) rechazados, \($unknown) sin estado\(if $accepted + $rejected > 0 then " (aceptacion \(($accepted * 100 / ($accepted + $rejected)) | round)%)" else "" end)") end),
+    "Rondas sin registro de hallazgos: \([ .[] | select(.type == "findings-missing") | "\(.hash) \(.round)" ] as $missing | ([ $round_records[] | "\(.hash) \(.round)" ]) as $have | [ $missing[] | select(IN($have[]) | not) ] | unique | length)",
     "Rondas de un solo motor, hallazgos por motor:",
     ($single_rounds | count_rows as $rows | ["codex", "claude"][] as $engine
       | [$rows[] | select(.engines == $engine)] as $mine
@@ -2389,6 +2590,175 @@ run_selftest() {
   check "stats: no metrics file exits 0" "$rc" "0"
   check "stats: no metrics file says there are none yet" "$(printf '%s' "$out" | grep -c 'sin metricas todavia')" "1"
 
+  # 41. Complete run metrics: duration, status, error and token usage on the
+  #     run line, for both engines, failures included.
+  local usage_root="$tmp_home/usage-root" usage_stub="$tmp_home/usagestub" usage_prompt="$tmp_home/usage-prompt.md" usage_metrics
+  usage_metrics="$usage_root/metrics.jsonl"
+  mkdir -p "$usage_root" "$usage_stub/codexok" "$usage_stub/codexfail" "$usage_stub/codextimeout" "$usage_stub/claudejson" "$usage_stub/claudeerror"
+  printf 'ROUND: 1\n\nPROPOSED PLAN:\nusage test\n' >"$usage_prompt"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"item.completed", item:{type:"agent_message", text:"codex usage finding"}}')'"
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"turn.completed", usage:{input_tokens:100, cached_input_tokens:20, output_tokens:40}}')'"
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"turn.completed", usage:{input_tokens:23, cached_input_tokens:0, output_tokens:5}}')'"
+  } >"$usage_stub/codexok/codex"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"error", message:"model not supported on this account"}')'"
+    echo 'exit 1'
+  } >"$usage_stub/codexfail/codex"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    echo 'exit 124'
+  } >"$usage_stub/codextimeout/codex"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"result", is_error:false, result:"claude json finding", total_cost_usd:0.0123, usage:{input_tokens:10, output_tokens:5, cache_read_input_tokens:3}}')'"
+  } >"$usage_stub/claudejson/claude"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"result", is_error:true, result:"credit balance too low"}')'"
+  } >"$usage_stub/claudeerror/claude"
+  chmod +x "$usage_stub"/*/codex "$usage_stub"/claudejson/claude "$usage_stub"/claudeerror/claude 2>/dev/null
+  chmod +x "$usage_stub"/*/claude 2>/dev/null
+  local usage_env=(env HOME="$tmp_home" CROSSCHECK_STATE_DIR="$usage_root")
+  out="$("${usage_env[@]}" PATH="$usage_stub/codexok:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash a11ce01 2>/dev/null)"
+  check "usage: codex run succeeds" "$(printf '%s' "$out" | grep -c 'codex usage finding')" "1"
+  check "usage: codex tokens are summed over turns" "$(jq -r '"\(.input_tokens)/\(.output_tokens)/\(.cached_tokens)"' "$usage_metrics" | tail -1)" "123/45/20"
+  check "usage: codex run line records success, duration and start/end" "$(jq -r '"\(.status) \(.duration_s >= 0) \(.ended_at >= .started_at) \(.error)"' "$usage_metrics" | tail -1)" "success true true null"
+  out="$("${usage_env[@]}" PATH="$usage_stub/claudejson:$usage_stub/codexok:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash a11ce02 2>/dev/null)"
+  check "usage: claude json result is unwrapped into the report" "$(printf '%s' "$out" | grep -c '^claude json finding$')" "1"
+  check "usage: claude tokens and cost are recorded" "$(jq -r '"\(.input_tokens)/\(.output_tokens)/\(.cached_tokens)/\(.cost_usd)"' "$usage_metrics" | tail -1)" "13/5/3/0.0123"
+  check "usage: the claude report artifact holds the text, not the json wrapper" "$(cat "$(jq -r '.artifact' "$usage_root/state/plan-a11ce02.state")" | grep -c '"type"')" "0"
+  out="$("${usage_env[@]}" PATH="$claude_stub:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash a11ce03 2>/dev/null)"
+  check "usage: a claude that prints plain text still works" "$(printf '%s' "$out" | grep -c 'stub claude finding')" "1"
+  check "usage: plain text claude records no token fields" "$(jq -r 'has("input_tokens")' "$usage_metrics" | tail -1)" "false"
+  "${usage_env[@]}" PATH="$usage_stub/codexfail:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash a11ce04 >/dev/null 2>&1
+  check "usage: a failed codex run still writes a run line with status failed" "$(jq -r '"\(.status) \(.hash)"' "$usage_metrics" | tail -1)" "failed a11ce04"
+  check "usage: a failed run records the engine error" "$(jq -r '.error' "$usage_metrics" | tail -1)" "model not supported on this account"
+  check "usage: a failed run does not mark the hash reviewed" "$([ -s "$usage_root/state/plan-a11ce04.state" ] && echo yes || echo no)" "no"
+  "${usage_env[@]}" PATH="$usage_stub/codextimeout:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash a11ce05 >/dev/null 2>&1
+  check "usage: a timeout is recorded as timeout" "$(jq -r '.status' "$usage_metrics" | tail -1)" "timeout"
+  "${usage_env[@]}" PATH="$usage_stub/claudeerror:$usage_stub/codexok:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash a11ce06 >/dev/null 2>&1
+  check "usage: a claude error result is a failed run with its message" "$(jq -r '"\(.status) \(.error)"' "$usage_metrics" | tail -1)" "failed credit balance too low"
+  #     A claude that exits nonzero AFTER printing a JSON error result: the
+  #     message and what the run cost are still recorded.
+  mkdir -p "$usage_stub/claudeexit"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"result", is_error:true, result:"rate limited", total_cost_usd:0.002, usage:{input_tokens:7, output_tokens:1}}')'"
+    echo 'exit 1'
+  } >"$usage_stub/claudeexit/claude"
+  chmod +x "$usage_stub/claudeexit/claude"
+  "${usage_env[@]}" PATH="$usage_stub/claudeexit:$usage_stub/codexok:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash a11ce07 >/dev/null 2>&1
+  check "usage: a nonzero claude exit keeps the JSON error message, tokens and cost" "$(jq -r '"\(.status) \(.error) \(.input_tokens) \(.cost_usd)"' "$usage_metrics" | tail -1)" "failed rate limited 7 0.002"
+  #     An engine that ran but whose report could not be published is a failed run too.
+  mkdir -p "$usage_root/state"
+  chmod 500 "$usage_root/state"
+  if [ "$(id -u)" != "0" ]; then
+    "${usage_env[@]}" PATH="$usage_stub/codexok:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash a11ce08 >/dev/null 2>&1
+    check "usage: a publish failure after the engine ran is recorded as failed, with its tokens" "$(jq -r '"\(.status) \(.error) \(.input_tokens)"' "$usage_metrics" | tail -1)" "failed publish failed 123"
+  else
+    echo "  skip  publish-failure run line (running as root ignores directory permissions)"
+  fi
+  chmod 700 "$usage_root/state"
+
+  # 41b. Finding outcomes: status per finding, a reason required for rejected.
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 1 --engines codex \
+    --finding HIGH:codex:incorporated --finding "MEDIUM:codex:rejected:out of scope" --finding LOW:codex >/dev/null 2>&1
+  check "outcomes: counts stay by severity and source" "$(jq -c 'select(.type == "findings") | .counts' "$usage_metrics" | tail -1)" '{"codex":{"HIGH":1,"LOW":1,"MEDIUM":1}}'
+  check "outcomes: statuses and reasons are recorded, a missing status is unknown" "$(jq -c 'select(.type == "findings") | [.outcomes[] | "\(.status):\(.reason)"]' "$usage_metrics" | tail -1)" '["incorporated:null","rejected:out of scope","unknown:null"]'
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 2 --engines codex --finding HIGH:codex:rejected >/dev/null 2>&1
+  check "outcomes: a rejected finding without a reason is refused" "$?" "2"
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 2 --engines codex --finding HIGH:codex:maybe >/dev/null 2>&1
+  check "outcomes: an unknown status word is refused" "$?" "2"
+  local lines_before_bad
+  lines_before_bad="$(wc -l <"$usage_metrics" | tr -d ' ')"
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 3 --engines codex --finding $'HIGH:codex:rejected:wrong\nCRITICAL:codex' >/dev/null 2>&1
+  check "outcomes: a finding with a line break is refused" "$?" "2"
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 3 --engines codex --finding 'HIGH:codex:rejected:it said password=hunter2 in `config`' >/dev/null 2>&1
+  check "outcomes: a reason with odd characters is refused" "$?" "2"
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce01 --round 3 --engines codex --finding "HIGH:codex:rejected:$(head -c 61 /dev/zero | tr '\0' x)" >/dev/null 2>&1
+  check "outcomes: a reason over 60 characters is refused" "$?" "2"
+  check "outcomes: refused findings write nothing" "$(wc -l <"$usage_metrics" | tr -d ' ')" "$lines_before_bad"
+
+  # 41c. A round the model never recorded: the next ExitPlanMode hook call
+  #      records it as unknown, once, and only after the grace period.
+  local missing_root="$tmp_home/missing-root" missing_metrics recent_ts
+  recent_ts=$(( $(date +%s) - 300 ))
+  missing_metrics="$missing_root/metrics.jsonl"
+  mkdir -p "$missing_root"
+  {
+    echo "{\"type\":\"run\",\"ts\":$recent_ts,\"mode\":\"plan-review\",\"engine\":\"codex\",\"model\":\"gpt-a\",\"effort\":\"medium\",\"round\":1,\"hash\":\"old1\",\"repo\":\"r\",\"status\":\"success\"}"
+    echo "{\"type\":\"run\",\"ts\":$recent_ts,\"mode\":\"plan-review\",\"engine\":\"codex\",\"model\":\"gpt-a\",\"effort\":\"medium\",\"round\":1,\"hash\":\"told1\",\"repo\":\"r\"}"
+    echo "{\"type\":\"findings\",\"ts\":$((recent_ts + 1)),\"hash\":\"told1\",\"round\":1,\"engines\":\"codex\",\"repo\":\"r\",\"counts\":{}}"
+    echo "{\"type\":\"run\",\"ts\":$recent_ts,\"mode\":\"plan-review\",\"engine\":\"codex\",\"model\":\"gpt-a\",\"effort\":\"medium\",\"round\":1,\"hash\":\"failed1\",\"repo\":\"r\",\"status\":\"failed\"}"
+    echo "{\"type\":\"run\",\"ts\":$(date +%s),\"mode\":\"plan-review\",\"engine\":\"codex\",\"model\":\"gpt-a\",\"effort\":\"medium\",\"round\":1,\"hash\":\"fresh1\",\"repo\":\"r\",\"status\":\"success\"}"
+  } >"$missing_metrics"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
+  check "missing findings: an old unrecorded round is recorded as unknown" "$(jq -r 'select(.type == "findings-missing") | "\(.hash) \(.round)"' "$missing_metrics")" "old1 1"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
+  check "missing findings: the second hook call does not duplicate it" "$(grep -c findings-missing "$missing_metrics")" "1"
+  check "missing findings: recorded, failed, and fresh rounds are left alone" "$(jq -r 'select(.type == "findings-missing") | .hash' "$missing_metrics" | grep -c -E 'told1|failed1|fresh1')" "0"
+  check "missing findings: the stats count them" "$("$run" --stats "$missing_metrics" | grep -c '^Rondas sin registro de hallazgos: 1$')" "1"
+  #      The new line types never reach the CRITICAL gate: a findings line that
+  #      carries outcomes still denies, and a later findings-missing line for
+  #      the same hash does not undo that.
+  local gate_plan="gate with new line types" gate_hash gate_root="$tmp_home/gate-root"
+  mkdir -p "$gate_root/state"
+  gate_hash="$(printf '%s' "$gate_plan" | shasum -a 256 | cut -c1-16)"
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$gate_root/state/plan-${gate_hash}.state"
+  CROSSCHECK_STATE_DIR="$gate_root" "$run" --metrics-findings --hash "$gate_hash" --round 1 --engines codex --finding CRITICAL:codex:incorporated >/dev/null 2>&1
+  printf '{"type":"findings-missing","ts":%s,"hash":"%s","round":1,"repo":"r"}\n' "$(( $(date +%s) + 5 ))" "$gate_hash" >>"$gate_root/metrics.jsonl"
+  out="$(jq -n --arg cwd "$tmp_home" --arg plan "$gate_plan" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$gate_root" "$run")"
+  check "missing findings: outcomes and findings-missing lines leave the CRITICAL gate denying" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  #      A re-audit reusing a recorded hash and round, itself unrecorded, is flagged.
+  {
+    echo "{\"type\":\"findings\",\"ts\":$((recent_ts - 100)),\"hash\":\"again1\",\"round\":1,\"engines\":\"codex\",\"repo\":\"r\",\"counts\":{}}"
+    echo "{\"type\":\"run\",\"ts\":$recent_ts,\"mode\":\"plan-review\",\"engine\":\"codex\",\"model\":\"gpt-a\",\"effort\":\"medium\",\"round\":1,\"hash\":\"again1\",\"repo\":\"r\",\"status\":\"success\"}"
+  } >>"$missing_metrics"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
+  check "missing findings: a later unrecorded re-audit of the same hash and round is flagged" "$(jq -r 'select(.type == "findings-missing" and .hash == "again1") | .round' "$missing_metrics")" "1"
+  #      The scan stays fast on a long history: the hook must not approach its 15s timeout.
+  jq -nc --argjson recent_ts "$recent_ts" 'range(0; 8000) | {type:"run", ts:$recent_ts, mode:"plan-review", engine:"codex", model:"gpt-a", effort:"medium", round:1, hash:("bulk\(.)"), repo:"r", status:"success"}' >"$missing_metrics.bulk"
+  cat "$missing_metrics.bulk" >>"$missing_metrics"; rm -f "$missing_metrics.bulk"
+  local scan_start scan_end
+  scan_start="$(date +%s)"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
+  scan_end="$(date +%s)"
+  check "missing findings: 8000 unrecorded rounds are scanned in under 10 seconds" "$([ $((scan_end - scan_start)) -lt 10 ] && echo fast || echo slow)" "fast"
+  check "missing findings: the bulk rounds were all recorded as unknown" "$(grep -c '"findings-missing"' "$missing_metrics")" "8002"
+
+  # 41d. Stats: research and legacy --record runs get their own section, and
+  #      acceptance is reported per engine and model.
+  local stats3="$tmp_home/stats3.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s1","repo":"r","status":"success","duration_s":40,"input_tokens":100,"output_tokens":10,"cost_usd":null}'
+    echo '{"type":"run","ts":2,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s2","repo":"r","status":"success","duration_s":20,"input_tokens":50,"output_tokens":5,"cost_usd":null}'
+    echo '{"type":"run","ts":3,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"s1","repo":"r","status":"success","duration_s":60,"input_tokens":10,"output_tokens":5,"cost_usd":0.5}'
+    echo '{"type":"run","ts":4,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s3","repo":"r","status":"timeout","duration_s":600,"error":"codex exec exited 124"}'
+    echo '{"type":"run","ts":5,"mode":"research","engine":"codex","model":"gpt-a","effort":"medium","round":null,"hash":null,"repo":"r"}'
+    echo '{"type":"run","ts":6,"mode":"plan-review","engine":"claude","model":"","effort":"","round":null,"hash":"legacy1","repo":"r"}'
+    echo '{"type":"findings","ts":10,"hash":"s1","round":1,"engines":"both","repo":"r","counts":{"codex":{"HIGH":2},"ambos":{"LOW":1}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null},{"severity":"HIGH","source":"codex","status":"rejected","reason":"wrong"},{"severity":"LOW","source":"ambos","status":"incorporated","reason":null}]}'
+    echo '{"type":"findings","ts":11,"hash":"s2","round":1,"engines":"codex","repo":"r","counts":{"codex":{"MEDIUM":1}},"outcomes":[{"severity":"MEDIUM","source":"codex","status":"incorporated","reason":null}]}'
+  } >"$stats3"
+  out="$("$run" --stats "$stats3")"
+  check "stats: the audits table counts only plan-review runs with a model" "$(printf '%s' "$out" | awk '/^Auditorias por motor y modelo:/{f=1;next} /^Corridas fallidas/{f=0} f' | grep -c 'gpt-a: 2')" "1"
+  check "stats: the audits table shows average duration and tokens" "$(printf '%s' "$out" | grep -c 'codex gpt-a: 2 (duracion media 30s, tokens totales 150 entrada / 15 salida)')" "1"
+  check "stats: cost is shown when present" "$(printf '%s' "$out" | grep -c 'claude opus-x: 1 (duracion media 60s, tokens totales 10 entrada / 5 salida, costo total USD 0.5)')" "1"
+  check "stats: timeouts are listed apart" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 1 (timeout: 1)$')" "1"
+  check "stats: research and legacy runs have their own section" "$(printf '%s' "$out" | grep -c 'fuera de la tabla de auditorias: 2')" "1"
+  check "stats: the legacy run is named in that section" "$(printf '%s' "$out" | grep -c 'plan-review sin modelo (--record legacy): 1')" "1"
+  check "stats: the legacy run is not in the audits table" "$(printf '%s' "$out" | awk '/^Auditorias por motor y modelo:/{f=1;next} /^Corridas fallidas/{f=0} f' | grep -c 'claude : \|(sin modelo)')" "0"
+  check "stats: acceptance per engine and model (codex gpt-a 3 of 4)" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 3 incorporados, 1 rechazados, 0 sin estado (aceptacion 75%)$')" "1"
+  check "stats: an ambos finding counts for both engines" "$(printf '%s' "$out" | grep -c '^  claude opus-x: 1 incorporados, 0 rechazados, 0 sin estado (aceptacion 100%)$')" "1"
+
   rm -rf "$tmp_home"
   echo
   if [ "$failures" -eq 0 ]; then
@@ -2438,6 +2808,8 @@ hook_main() {
   # or future Claude Code version that omits the field should not hard-block
   # Plan Mode.
   [ -n "$plan_text" ] || exit 0
+
+  record_missing_findings
 
   local hash
   hash="$(printf '%s' "$plan_text" | shasum -a 256 2>/dev/null | cut -c1-16)"

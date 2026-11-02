@@ -301,11 +301,18 @@ never `research`), run one foreground `Bash` call:
 
 ```
 crosscheck --metrics-findings --hash <hash> --round N --engines <codex|claude|both> \
-  --finding HIGH:codex --finding MEDIUM:ambos ...
+  --finding HIGH:codex:incorporated --finding MEDIUM:ambos:rejected:out of scope ...
 ```
 
-One `--finding SEVERITY:SOURCE` per finding of the list you just relayed (the
-deduplicated one), with the severity you relayed. `--engines` is the engine(s)
+One `--finding SEVERITY:SOURCE:STATUS[:reason]` per finding of the list you
+just relayed (the deduplicated one), with the severity you relayed. `STATUS` is
+what you did with it, the same as the `Status:` line of the relay:
+`incorporated`, `rejected` (a short reason is required: at most 60 characters
+of letters, digits, spaces and `. _ , -`, never finding text or code) or
+`not-applicable`. Never omit it: a finding without a status is recorded as
+unknown and counts against nobody's acceptance rate. Quote any `--finding`
+whose reason has spaces. If you forget the call altogether, the next
+`ExitPlanMode` hook call records the round as unknown. `--engines` is the engine(s)
 that actually reported this round, not the configured one: in `both`, if one
 engine failed, pass the one that survived. When a single engine reported, every
 source is that engine (`codex` or `claude`); only `--engines both` takes

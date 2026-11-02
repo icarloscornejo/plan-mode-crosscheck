@@ -277,9 +277,17 @@ crosscheck --stats ~/.claude/plan-mode-crosscheck/metrics.jsonl \
   ~/.claude-me/plan-mode-crosscheck/metrics.jsonl
 ```
 
+Each run line also carries when it started and ended, how long it took, whether
+it succeeded, failed or timed out (with the engine's error), and the tokens it
+used (Codex from its event stream, Claude from its JSON result, with cost).
+After each round the skill records what it did with every finding (incorporated,
+rejected with a short reason, or not applicable), and `--stats` shows the
+acceptance rate per engine and model. Research runs and legacy `--record` runs
+are listed in their own section, not in the audits table. If a round's
+findings were never recorded, the next `ExitPlanMode` hook call notes it as
+unknown and `--stats` counts those rounds apart, so they never skew the rates.
+
 Counting starts the day you install this version, old reports are not parsed.
-Accepted versus rejected findings are not tracked: findings are expected to be
-incorporated.
 
 ## Kill switch
 
