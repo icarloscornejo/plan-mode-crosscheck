@@ -1,9 +1,21 @@
 {
-  "description": "Plan Mode Crosscheck: on ExitPlanMode, gates showing the plan on an explicit decision (recorded per plan-hash) about an independent audit (Codex and/or Claude, per /crosscheck-setup), offered to the user via the crosscheck skill.",
+  "description": "Plan Mode Crosscheck: on ExitPlanMode, gates showing the plan on an explicit decision (recorded per plan-hash) about an independent audit (Codex and/or Claude, per /crosscheck-setup), offered to the user via the crosscheck skill. Records the user's AskUserQuestion answers so skipping an audit needs their own answer.",
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/crosscheck.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion",
         "hooks": [
           {
             "type": "command",

@@ -53,6 +53,9 @@
 #      the automatic per-report `run` lines `publish_report` appends there.
 #      `--stats [FILE...]` summarizes that file (or several, across instances).
 #      Numbers and short labels only, never finding text.
+#   Both `--skip` and `--accept-critical` need a token written by this same
+#   script when run as a PostToolUse hook on AskUserQuestion (see
+#   record_user_answers); `--manual` is the user-typed fallback.
 #   7. `--accept-critical --hash H`: records that the user accepts the
 #      CRITICAL findings of H's latest audit round as-is. Without it the hook
 #      denies a `reviewed`/`skipped` hash whose latest findings line has
@@ -417,11 +420,81 @@ read_plan_status() {
 }
 
 write_plan_state() {
-  local hash="$1" status="$2" artifact="${3:-}" f
+  local hash="$1" status="$2" artifact="${3:-}" decided_by="${4:-}" f
   f="$(plan_state_file "$hash")"
-  jq -n --arg status "$status" --arg artifact "$artifact" --argjson ts "$(date +%s)" \
-    '{status:$status, artifact:$artifact, ts:$ts}' >"$f.tmp.$$" 2>/dev/null \
+  jq -n --arg status "$status" --arg artifact "$artifact" --arg decided_by "$decided_by" --argjson ts "$(date +%s)" \
+    '{status:$status, artifact:$artifact, ts:$ts} + (if $decided_by == "" then {} else {decided_by:$decided_by} end)' >"$f.tmp.$$" 2>/dev/null \
     && mv "$f.tmp.$$" "$f" 2>/dev/null
+}
+
+# --- User-answer tokens. `--skip` and `--accept-critical` only act on a token
+# that the PostToolUse hook on AskUserQuestion writes when the user answers a
+# question carrying a marker `[crosscheck:skip:HASH]` / `[crosscheck:accept:HASH]`
+# with the matching option. A shell command the model runs cannot produce the
+# user's answer; it could still write the file itself, so this raises the bar
+# (the model must forge state on purpose, and the log shows no matching answer)
+# but is not a sandbox: both run as the same OS user. One token per kind and
+# hash, consumed on use. ---
+token_file() { printf '%s/tokens/%s-%s.token' "$STATE_DIR" "$1" "$2"; }
+
+# Atomically takes the token (rename first, so two racing callers cannot both
+# win). Prints the time the user answered; returns 1 when there is none.
+consume_token() {
+  local kind="$1" hash="$2" f taken answered_at
+  f="$(token_file "$kind" "$hash")"
+  taken="$f.used.$$"
+  mv "$f" "$taken" 2>/dev/null || return 1
+  answered_at="$(jq -r '.ts // empty' "$taken" 2>/dev/null)"
+  rm -f "$taken"
+  [[ "$answered_at" =~ ^[0-9]+$ ]] || return 1
+  # Stale: the answer belonged to a decision from long ago. The token is gone
+  # already (taken above), so just refuse.
+  [ $(( $(date +%s) - answered_at )) -le 86400 ] || return 1
+  printf '%s' "$answered_at"
+}
+
+# PostToolUse/AskUserQuestion: turn the user's answers into tokens. Skip token
+# when the answer to a `[crosscheck:skip:H]` question starts with "No"; accept
+# token when the answer to a `[crosscheck:accept:H]` question starts with
+# "Aceptar". Any other answer, question or payload shape writes nothing.
+record_user_answers() {
+  local input="$1" pairs kind hash answer bypass_pattern
+  # When the question lists its options, the answer must be one of them: a
+  # free-text "Other" answer ("No, quiero auditar") can never authorize.
+  pairs="$(printf '%s' "$input" | jq -r '
+    . as $in
+    | ((.tool_response | objects | .answers) // .tool_input.answers // {})
+    | if type == "object" then to_entries[] else empty end
+    | select((.value | type) == "string")
+    | .key as $question | .value as $label
+    | select(([$in.tool_input.questions[]? | select(.question == $question) | .options][0]) as $options
+        | ($options | type) != "array" or ([$options[]? | .label] | index($label)) != null)
+    | (.key | capture("\\[crosscheck:(?<kind>skip|accept):(?<hash>[0-9a-f]+)\\]")? // empty) as $m
+    | "\($m.kind) \($m.hash) \(.value | gsub("[\\r\\n]"; " "))"' 2>/dev/null)" || return 0
+  [ -n "$pairs" ] || return 0
+  mkdir -p "$STATE_DIR/tokens" 2>/dev/null
+  while read -r kind hash answer; do
+    # The label must be the word itself ("No", "No, saltear"), not a free-text
+    # answer that merely starts with the same letters ("Now audit it").
+    case "$kind" in
+      skip) bypass_pattern='^No([^[:alpha:]]|$)' ;;
+      *) bypass_pattern='^Aceptar([^[:alpha:]]|$)' ;;
+    esac
+    if ! [[ "$answer" =~ $bypass_pattern ]]; then
+      # A changed mind revokes an earlier token for the same hash.
+      rm -f "$(token_file "$kind" "$hash")"
+      log "user answer for $kind hash=$hash was not a yes-to-bypass, no token"
+      continue
+    fi
+    if jq -n --arg kind "$kind" --arg hash "$hash" --argjson ts "$(date +%s)" \
+        '{kind:$kind, hash:$hash, ts:$ts, decided_by:"user-answer"}' >"$(token_file "$kind" "$hash").tmp.$$" 2>/dev/null \
+      && mv "$(token_file "$kind" "$hash").tmp.$$" "$(token_file "$kind" "$hash")" 2>/dev/null; then
+      log "user answer recorded: $kind token for hash=$hash"
+    else
+      log "user answer for $kind hash=$hash: failed to write token"
+    fi
+  done <<<"$pairs"
+  return 0
 }
 
 # --- Config: persisted engine/model choice, set via the crosscheck-setup
@@ -938,9 +1011,13 @@ cmd_record() {
 
 # --- `--skip`: mark a plan hash skipped without calling Codex ---
 cmd_skip() {
-  local hash=""
+  local hash="" manual=0 answered_at decided_by
   while [ $# -gt 0 ]; do
-    case "$1" in --hash) hash="${2:-}"; shift 2 ;; *) shift ;; esac
+    case "$1" in
+      --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --manual) manual=1; shift ;;
+      *) shift ;;
+    esac
   done
   if [ -z "$hash" ]; then
     echo "crosscheck --skip: --hash is required" >&2
@@ -950,11 +1027,21 @@ cmd_skip() {
     echo "crosscheck --skip: cannot create state directory $STATE_DIR" >&2
     return 1
   fi
-  if ! write_plan_state "$hash" "skipped" ""; then
+  if [ "$manual" -eq 1 ]; then
+    decided_by="manual"
+    log "plan hash=$hash skip requested with --manual (no user-answer token)"
+  elif answered_at="$(consume_token skip "$hash")"; then
+    decided_by="user-answer@$answered_at"
+  else
+    log "plan hash=$hash skip refused: no user answer on record"
+    echo "crosscheck --skip: refused, no user answer on record for hash $hash. Ask the user with AskUserQuestion, with [crosscheck:skip:$hash] in the question text and an option labeled \"No\" for skipping the audit; skip only runs after they pick it. If the answer-capturing hook is not working, the USER can type: ! crosscheck --skip --hash $hash --manual" >&2
+    return 3
+  fi
+  if ! write_plan_state "$hash" "skipped" "" "$decided_by"; then
     echo "crosscheck --skip: failed to persist skipped state for hash $hash" >&2
     return 1
   fi
-  log "plan hash=$hash marked skipped"
+  log "plan hash=$hash marked skipped (decided_by=$decided_by)"
   return 0
 }
 
@@ -991,9 +1078,13 @@ critical_accepted_file() { printf '%s/plan-%s.critical-accepted.state' "$STATE_D
 # --- `--accept-critical`: record that the user accepts the CRITICAL findings
 # of the latest audit round of this hash as-is. ---
 cmd_accept_critical() {
-  local hash="" latest round record_ts critical_count
+  local hash="" latest round record_ts critical_count manual=0 decided_by answered_at
   while [ $# -gt 0 ]; do
-    case "$1" in --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;; *) shift ;; esac
+    case "$1" in
+      --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --manual) manual=1; shift ;;
+      *) shift ;;
+    esac
   done
   [[ "$hash" =~ ^[0-9a-f]+$ ]] || { echo "crosscheck --accept-critical: --hash is required and must be hex" >&2; return 2; }
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --accept-critical: jq not found on PATH" >&2; return 1; }
@@ -1007,6 +1098,18 @@ cmd_accept_critical() {
     return 1
   fi
   mkdir -p "$STATE_DIR" 2>/dev/null
+  # Same rule as --skip: only the user's own answer (or their typed --manual)
+  # can accept CRITICAL findings. Checked after the "nothing to accept" cases
+  # so a token is never spent on a no-op.
+  if [ "$manual" -eq 1 ]; then
+    decided_by="manual"
+  elif answered_at="$(consume_token accept "$hash")"; then
+    decided_by="user-answer@$answered_at"
+  else
+    log "plan hash=$hash accept-critical refused: no user answer on record"
+    echo "crosscheck --accept-critical: refused, no user answer on record for hash $hash. Ask the user with AskUserQuestion, with [crosscheck:accept:$hash] in the question text and an option labeled \"Aceptar tal cual\"; it only runs after they pick it. If the answer-capturing hook is not working, the USER can type: ! crosscheck --accept-critical --hash $hash --manual" >&2
+    return 3
+  fi
   # Tied to the exact findings record (round and its ts): a later round, or a
   # re-audit of the same text that reuses the round number, needs a fresh acceptance.
   if ! jq -n --argjson round "$round" --argjson record_ts "$record_ts" --argjson ts "$(date +%s)" '{round:$round, record_ts:$record_ts, ts:$ts}' \
@@ -1018,7 +1121,7 @@ cmd_accept_critical() {
   append_metric "$(jq -cn --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
     --argjson round "$round" --argjson ts "$(date +%s)" \
     '{type:"critical-accepted", ts:$ts, hash:$hash, round:$round, repo:$repo}')"
-  log "plan hash=$hash CRITICAL findings of round $round accepted as-is by the user"
+  log "plan hash=$hash CRITICAL findings of round $round accepted as-is (decided_by=$decided_by)"
   return 0
 }
 
@@ -1220,6 +1323,22 @@ run_selftest() {
     fi
   }
 
+  # Plays the user's AskUserQuestion answer through the real PostToolUse hook.
+  # $1 = state env (HOME or CROSSCHECK_STATE_DIR given as KEY=VALUE), $2 = kind
+  # (skip|accept), $3 = hash, $4 = the option label the user picked.
+  # $5 = where the answer sits in the payload: response (default),
+  # input (tool_input.answers only) or stringresponse (tool_response is a
+  # plain string, answer only in tool_input.answers).
+  give_answer() {
+    jq -n --arg question "Quieres auditoria? [crosscheck:$2:$3]" --arg label "$4" --arg cwd "$tmp_home" --arg where "${5:-response}" \
+      '{hook_event_name:"PostToolUse", tool_name:"AskUserQuestion", cwd:$cwd,
+        tool_input:{questions:[{question:$question}]}}
+       | if $where == "response" then .tool_response = {answers:{($question):$label}}
+         elif $where == "input" then .tool_input.answers = {($question):$label}
+         else .tool_input.answers = {($question):$label} | .tool_response = "User has answered your questions" end' \
+      | env "$1" "$run" >/dev/null 2>&1
+  }
+
   # Canned stub `codex`: captures every invocation's args AND its stdin (the
   # prompt now travels over stdin, not argv, so both are captured to prove it
   # went where it should and nowhere else) and emits one thread.started + one
@@ -1308,9 +1427,82 @@ run_selftest() {
   check "second call on a still-pending hash denies again" "$decision" "deny"
 
   # 8. `--skip --hash` marks skipped; ExitPlanMode for that same plan text now allows.
+  #    Without the user's answer the skip is refused and the hash stays pending.
+  out="$(HOME="$tmp_home" "$run" --skip --hash "$hash" 2>&1)"
+  rc=$?
+  check "--skip without a user answer is refused" "$rc" "3"
+  check "--skip refusal explains what is needed" "$(printf '%s' "$out" | grep -c 'no user answer on record')" "1"
+  check "refused --skip leaves the hash pending" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash}.state" 2>/dev/null)" "pending"
+  #    A "Si" answer (keep the audit) is not a skip.
+  give_answer "HOME=$tmp_home" skip "$hash" "Si, auditar"
+  HOME="$tmp_home" "$run" --skip --hash "$hash" >/dev/null 2>&1
+  check "a Si answer does not authorize --skip" "$?" "3"
+  #    The user answers No: skip works, records who and when, and the token is single use.
+  give_answer "HOME=$tmp_home" skip "$hash" "No, saltear"
   out="$(HOME="$tmp_home" "$run" --skip --hash "$hash")"
   rc=$?
   check "--skip exits 0" "$rc" "0"
+  check "--skip records the user answer as the decider" "$(jq -r '.decided_by' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash}.state" 2>/dev/null | cut -d@ -f1)" "user-answer"
+  HOME="$tmp_home" "$run" --skip --hash "$hash" >/dev/null 2>&1
+  check "a skip token is single use" "$?" "3"
+  #    Tokens are per hash: an answer for one hash does not skip another.
+  give_answer "HOME=$tmp_home" skip "$hash" "No, saltear"
+  HOME="$tmp_home" "$run" --skip --hash "abcdef0123456789" >/dev/null 2>&1
+  check "a skip token for hash A does not skip hash B" "$?" "3"
+  HOME="$tmp_home" "$run" --skip --hash "$hash" >/dev/null 2>&1
+  check "the token stays usable for its own hash" "$?" "0"
+  #    The typed manual fallback works and is recorded as manual.
+  HOME="$tmp_home" "$run" --skip --hash "$hash" --manual >/dev/null 2>&1
+  check "--skip --manual works without a token" "$?" "0"
+  check "--skip --manual is recorded as manual" "$(jq -r '.decided_by' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash}.state" 2>/dev/null)" "manual"
+  #    A changed mind (No, then Si for the same hash) revokes the token.
+  local skip_hash2="beef0123456789ab" tokens_dir="$tmp_home/.claude/plan-mode-crosscheck/state/tokens"
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "No, saltear"
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "Si, auditar"
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "No followed by Si revokes the skip token" "$?" "3"
+  #    A free-text answer that merely starts with "No" is not a skip.
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "Now audit it"
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "a free-text answer starting with the letters No does not authorize --skip" "$?" "3"
+  #    The round 2+ question: "No, mostrar el plan (Recommended)" on the edited plan's hash.
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "No, mostrar el plan (Recommended)"
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "the show-the-plan answer authorizes --skip" "$?" "0"
+  #    The answer may arrive only in tool_input.answers, with tool_response a
+  #    plain string: the real shape is not verified live, so both must work.
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "No, saltear" input
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "an answer only in tool_input.answers authorizes --skip" "$?" "0"
+  give_answer "HOME=$tmp_home" skip "$skip_hash2" "No, saltear" stringresponse
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "an answer in tool_input.answers with a string tool_response authorizes --skip" "$?" "0"
+  #    With the options listed, an answer that is not one of them (free text
+  #    typed as "Other") never authorizes; a listed option does.
+  local free_question="Quieres auditoria? [crosscheck:skip:${skip_hash2}]"
+  jq -n --arg q "$free_question" --arg label "No, quiero auditar" --arg cwd "$tmp_home" \
+    '{hook_event_name:"PostToolUse", tool_name:"AskUserQuestion", cwd:$cwd,
+      tool_input:{questions:[{question:$q, options:[{label:"Si, auditar"},{label:"No, saltear auditoria"}]}]},
+      tool_response:{answers:{($q):$label}}}' | HOME="$tmp_home" "$run" >/dev/null 2>&1
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "a free-text answer outside the listed options does not authorize --skip" "$?" "3"
+  jq -n --arg q "$free_question" --arg label "No, saltear auditoria" --arg cwd "$tmp_home" \
+    '{hook_event_name:"PostToolUse", tool_name:"AskUserQuestion", cwd:$cwd,
+      tool_input:{questions:[{question:$q, options:[{label:"Si, auditar"},{label:"No, saltear auditoria"}]}]},
+      tool_response:{answers:{($q):$label}}}' | HOME="$tmp_home" "$run" >/dev/null 2>&1
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "a listed No option authorizes --skip" "$?" "0"
+  #    Payloads that must write nothing: another tool, a non-hex marker, a non-string answer.
+  jq -n --arg q "$free_question" --arg cwd "$tmp_home" \
+    '{hook_event_name:"PostToolUse", tool_name:"Bash", cwd:$cwd, tool_response:{answers:{($q):"No"}}}' | HOME="$tmp_home" "$run" >/dev/null 2>&1
+  jq -n --arg cwd "$tmp_home" \
+    '{hook_event_name:"PostToolUse", tool_name:"AskUserQuestion", cwd:$cwd, tool_response:{answers:{"Q [crosscheck:skip:nothex]":"No", ("Q [crosscheck:skip:'"$skip_hash2"']"):7}}}' | HOME="$tmp_home" "$run" >/dev/null 2>&1
+  check "other tools, a non-hex marker and a non-string answer write no token" "$(ls "$tokens_dir" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  #    A token older than a day is refused and removed.
+  jq -n --argjson ts "$(( $(date +%s) - 90000 ))" '{kind:"skip", hash:"beef0123456789ab", ts:$ts, decided_by:"user-answer"}' >"$tokens_dir/skip-${skip_hash2}.token"
+  HOME="$tmp_home" "$run" --skip --hash "$skip_hash2" >/dev/null 2>&1
+  check "a stale skip token is refused" "$?" "3"
+  check "a stale skip token is removed" "$([ -e "$tokens_dir/skip-${skip_hash2}.token" ] && echo kept || echo gone)" "gone"
   check "--skip marks the hash skipped" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${hash}.state" 2>/dev/null)" "skipped"
   out="$(jq -n --arg cwd "$tmp_home" --arg plan "$plan_text" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | HOME="$tmp_home" "$run")"
   rc=$?
@@ -1579,7 +1771,7 @@ run_selftest() {
     local badstate_root2="$tmp_home/badstate2"
     mkdir -p "$badstate_root2"
     chmod 000 "$badstate_root2"
-    out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root2/state" "$run" --skip --hash "unwritablestate1" 2>&1 >/dev/null)"
+    out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root2/state" "$run" --skip --manual --hash "unwritablestate1" 2>&1 >/dev/null)"
     rc=$?
     check "--skip with unwritable state root exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
     out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$badstate_root2/state" "$run" --tmp-dir 2>&1 >/dev/null)"
@@ -1660,7 +1852,7 @@ run_selftest() {
     umask 000
     out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_input":{"plan":"perm test plan"},"cwd":"%s"}' "$perm_home" \
       | HOME="$perm_home" "$run" 2>/dev/null)"
-    HOME="$perm_home" "$run" --skip --hash "permtesthash1" >/dev/null 2>&1
+    HOME="$perm_home" "$run" --skip --manual --hash "permtesthash1" >/dev/null 2>&1
   )
   # `stat`'s flag for "just the permission bits" differs between BSD (macOS)
   # and GNU (Linux); try both, whichever exists on this box wins.
@@ -1749,7 +1941,7 @@ run_selftest() {
   check "--run with corrupt config never invokes codex" "$([ -s "$capture_stdin" ] && echo yes || echo no)" "no"
   check "--run with corrupt config does not blame codex" "$(printf '%s' "$out" | grep -c 'codex exec failed')" "0"
   local skip_hash="corruptconfigskiphash1"
-  out="$(HOME="$tmp_home" "$run" --skip --hash "$skip_hash")"
+  out="$(HOME="$tmp_home" "$run" --skip --manual --hash "$skip_hash")"
   rc=$?
   check "--skip works even with corrupt config" "$rc" "0"
   check "--skip with corrupt config marks the hash skipped" "$(jq -r '.status' "$tmp_home/.claude/plan-mode-crosscheck/state/plan-${skip_hash}.state" 2>/dev/null)" "skipped"
@@ -2081,7 +2273,19 @@ run_selftest() {
   check "critical gate: skipped hash with CRITICAL also denies" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
   jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_state"
   #      User acceptance passes and is logged; a later CRITICAL round needs a new one.
+  #      Without the user's answer the acceptance is refused and the gate still denies.
   CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash "$crit_hash" >/dev/null 2>&1
+  check "critical gate: --accept-critical without a user answer is refused" "$?" "3"
+  crit_out="$(crit_exit)"
+  check "critical gate: refused acceptance keeps denying" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  #      A skip answer is not an acceptance.
+  give_answer "CROSSCHECK_STATE_DIR=$crit_root" skip "$crit_hash" "No, saltear"
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash "$crit_hash" >/dev/null 2>&1
+  check "critical gate: a skip answer does not accept CRITICALs" "$?" "3"
+  rm -f "$crit_root/state/tokens/"*
+  give_answer "CROSSCHECK_STATE_DIR=$crit_root" accept "$crit_hash" "Aceptar tal cual" input
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash "$crit_hash" >/dev/null 2>&1
+  check "critical gate: an accept answer only in tool_input.answers authorizes --accept-critical" "$([ -s "$crit_root/state/plan-${crit_hash}.critical-accepted.state" ] && echo accepted)" "accepted"
   crit_out="$(crit_exit)"
   check "critical gate: accepted CRITICAL passes" "$crit_out" ""
   check "critical gate: acceptance is logged" "$(grep -c "hash=$crit_hash CRITICAL findings of round 1 accepted" "$crit_root/logs/crosscheck.log")" "1"
@@ -2196,13 +2400,16 @@ run_selftest() {
   fi
 }
 
-# --- hook entry point: PreToolUse/ExitPlanMode only ---
+# --- hook entry point: PreToolUse/ExitPlanMode (the gate) and
+# PostToolUse/AskUserQuestion (records the user's answers as tokens) ---
 hook_main() {
   mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null
   trim_log "$LOG_FILE"
   trim_log "$STDERR_LOG_FILE"
   find "$STATE_DIR" -maxdepth 1 -type f -name 'plan-*.state' -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
   find "$REPORTS_DIR" -maxdepth 1 -type f -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
+  # An answer is a decision for the moment it was given: stale tokens expire in a day.
+  find "$STATE_DIR/tokens" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
   # Prompt files (requests, plan text, possibly secrets/PII) live here too:
   # the README promises everything under state/ is pruned after
   # STATE_MAX_AGE_DAYS, but until now this loop never actually walked TMP_DIR.
@@ -2216,8 +2423,12 @@ hook_main() {
 
   local hook_event tool_name
   hook_event="$(printf '%s' "$input" | jq -r '.hook_event_name // ""' 2>/dev/null)"
-  [ "$hook_event" = "PreToolUse" ] || exit 0
   tool_name="$(printf '%s' "$input" | jq -r '.tool_name // ""' 2>/dev/null)"
+  if [ "$hook_event" = "PostToolUse" ] && [ "$tool_name" = "AskUserQuestion" ]; then
+    record_user_answers "$input"
+    exit 0
+  fi
+  [ "$hook_event" = "PreToolUse" ] || exit 0
   [ "$tool_name" = "ExitPlanMode" ] || exit 0
 
   local plan_text
@@ -2248,7 +2459,7 @@ hook_main() {
           local critical_reason
           critical_reason="Este plan no cambio desde una auditoria que reporto ${critical_count} hallazgo(s) CRITICAL (ronda ${critical_round}), asi que ninguno fue incorporado. ExitPlanMode no se permite para este texto exacto de plan.
 
-Opciones: (1) edita el plan para resolver los hallazgos CRITICAL (el hash cambia y se decide de nuevo), o (2) preguntale al usuario (AskUserQuestion) si acepta los CRITICAL tal cual; solo si dice que SI, corre \`crosscheck --accept-critical --hash ${hash}\` y volve a llamar ExitPlanMode.
+Opciones: (1) edita el plan para resolver los hallazgos CRITICAL (el hash cambia y se decide de nuevo), o (2) preguntale al usuario (AskUserQuestion, con [crosscheck:accept:${hash}] en el texto de la pregunta y una opcion llamada \"Aceptar tal cual\") si acepta los CRITICAL; solo si elige esa opcion, corre \`crosscheck --accept-critical --hash ${hash}\` (sin su respuesta el comando se rechaza) y volve a llamar ExitPlanMode.
 
 Hash de este plan: ${hash}."
           jq -n --arg reason "$critical_reason" '{
@@ -2285,7 +2496,7 @@ Hash de este plan: ${hash}."
 
 Si dice que SI: invoca la skill crosscheck en modo plan-review (ver skills/crosscheck/SKILL.md de este plugin), pasandole el pedido original y el texto de este plan. Espera el resultado, incorporalo al plan si corresponde, y volve a llamar ExitPlanMode.
 
-Si dice que NO: invoca la skill crosscheck en modo skip para este plan (corre \`crosscheck --skip --hash ${hash}\`), y volve a llamar ExitPlanMode.
+Si dice que NO: invoca la skill crosscheck en modo skip para este plan (corre \`crosscheck --skip --hash ${hash}\`), y volve a llamar ExitPlanMode. La pregunta del Si/No debe llevar [crosscheck:skip:${hash}] en el texto y la opcion de saltear llamarse \"No\": --skip solo funciona con esa respuesta del usuario y se rechaza si no.
 
 Al incorporar hallazgos del auditor al plan, corregi la misma causa en todas sus instancias dentro del alcance del pedido (cada engine, modo, entry point), sin cambios ajenos a el: un hallazgo no es licencia para ampliar el plan mas alla de eso. Al relayar hallazgos al usuario, ordenalos por severidad (CRITICAL primero) y no rellenes el resumen con nada que el auditor no haya marcado como material.
 

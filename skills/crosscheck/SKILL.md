@@ -42,9 +42,10 @@ If it exits nonzero, the config file is corrupt or invalid. Do not try to fix
 it here and do not run any engine:
 
 - **Entry A:** tell the user the config is broken and that `/crosscheck-setup`
-  repairs it, then run `crosscheck --skip --hash <hash>` and call
-  `ExitPlanMode` again. `--skip` never reads the config, so it always works
-  (it does not get past the CRITICAL deny, see "CRITICAL deny" below).
+  repairs it, ask the skip question (see "The skip question" below), and only
+  on their "No" run `crosscheck --skip --hash <hash>` and call
+  `ExitPlanMode` again. `--skip` never reads the config (it does not get past
+  the CRITICAL deny, see "CRITICAL deny" below).
 - **Entry B:** tell the user the same and stop. Nothing else to clean up.
 
 ## Entry point A: a Plan Mode `ExitPlanMode` call was denied
@@ -56,8 +57,23 @@ yourself.** If your recomputation differs from the hook's for any reason
 (whitespace, encoding), you'll write state under the wrong key and the hook
 will keep denying forever.
 
+**The skip question.** `--skip` and `--accept-critical` are refused unless the user answered an
+`AskUserQuestion` whose text contains the marker `[crosscheck:skip:<hash>]`
+(resp. `[crosscheck:accept:<hash>]`) with the bypass option: a PostToolUse hook
+turns that answer into a one-use token for that hash. Skip question: options
+labeled `Si, auditar` and `No, saltear auditoria`; the skip option label MUST
+start with "No". Accept question: the accept option label MUST start with
+"Aceptar" (for example `Aceptar tal cual`). Any other answer writes no token.
+If the command is refused, first check the question you asked carried the
+marker with the right hash and that the user's chosen label starts with "No"
+(or "Aceptar"); if not, ask again correctly. Only when a correctly marked
+answer was still refused is the hook not working: tell the user, and give them the manual fallback to type themselves (never run
+it yourself): `! crosscheck --skip --hash <hash> --manual`, or
+`! crosscheck --accept-critical --hash <hash> --manual`.
+
 1. Run Step 0, then ask the user with `AskUserQuestion`: do they want an
-   independent audit of this plan before it's shown? Yes/No, one question,
+   independent audit of this plan before it's shown? Yes/No (with the skip
+   marker in the question text, see above), one question,
    naming the configured engine and models (for example "auditoria con Codex
    gpt-6-astra", "con Claude fable" or "con Codex gpt-6-astra + Claude
    fable"). No need to over-explain: the deny reason already told you why
@@ -213,7 +229,8 @@ will keep denying forever.
         tool result says which). That still counts as a completed audit.
       - If every configured engine failed (Codex not installed, not logged
         in, timed out, `claude -p` failed or returned nothing, etc.), do not leave the
-        user stuck: tell them the audit failed and why, then run
+        user stuck: tell them the audit failed and why, ask the skip question
+        (marker in the text, "No" to skip), and only on their "No" run
         ```
         crosscheck --skip --hash <hash>
         ```
@@ -228,9 +245,10 @@ If the deny reason says the plan "no cambio desde una auditoria" that
 reported CRITICAL findings, this is NOT the pending-audit question above:
 do not ask "audit?" and do not run `--skip` (it cannot get past this deny).
 Either edit the plan to resolve the CRITICALs (new hash, normal flow), or ask
-the user with `AskUserQuestion` whether to accept them as-is; only on an
-explicit yes run `crosscheck --accept-critical --hash <hash>` and call
-`ExitPlanMode` again.
+the user with `AskUserQuestion` (marker `[crosscheck:accept:<hash>]` in the
+text, option `Aceptar tal cual`) whether to accept them as-is; only when they
+pick it, `crosscheck --accept-critical --hash <hash>` works (it is refused
+without that answer); then call `ExitPlanMode` again.
 
 ## Relaying a round's findings
 
@@ -334,6 +352,14 @@ Only after stating the recommendation, as a separate step, ask the user with
 "(Recommended)" (do not repeat the reasons in the question itself, they're
 already in the chat message above).
 
+Skip token for this question. An edited plan has a NEW hash that only exists
+once `ExitPlanMode` is called and denied (never compute it yourself): so
+state the recommendation in chat, call `ExitPlanMode`, and ask this question
+on that denial. The question text MUST contain `[crosscheck:skip:<new hash>]`
+and the "show the plan" option label MUST start with "No" (for example `No,
+mostrar el plan`); that answer is what lets `crosscheck --skip --hash <new
+hash>` run. Label "otra ronda" differently (it must not start with "No").
+
 ## Entry point B: the user typed `/crosscheck`
 
 No hash, no gating, nothing blocked. This is a standalone request for a
@@ -401,8 +427,9 @@ first.
   round there by itself. Always record the round (even with zero findings):
   the hook reads the latest line of the hash, and a plan left unedited after
   a round with CRITICAL findings is denied on ExitPlanMode. Only if the user
-  explicitly accepts those CRITICALs as-is (ask with `AskUserQuestion`), run
-  `crosscheck --accept-critical --hash <hash>`; otherwise edit the plan.
+  explicitly accepts those CRITICALs as-is (ask with `AskUserQuestion`, see
+  "CRITICAL deny"), run `crosscheck --accept-critical --hash <hash>`;
+  otherwise edit the plan.
 - `Bash` calls per audit: `codex` and `claude` are one call each (write the
   prompt, then `--run --engine ...`, backgrounded). `both` is one foreground
   call (write the prompt, print its path), then two backgrounded `--run`

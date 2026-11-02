@@ -2,6 +2,26 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.7.0
+
+**Skipping an audit needs the user's own answer.** `--skip --hash H` and
+`--accept-critical --hash H` are refused (exit 3, hash stays `pending`) unless
+the user answered an `AskUserQuestion` whose text carries `[crosscheck:skip:H]`
+(resp. `[crosscheck:accept:H]`) with the bypass option ("No..." to skip,
+"Aceptar..." to accept). A new PostToolUse hook on `AskUserQuestion` records
+that answer as a token under `state/tokens/`: one per kind and hash, consumed
+on use, expired after a day. The skipped state records `decided_by` and when.
+
+If the capturing hook fails, the user can type `! crosscheck --skip --hash H
+--manual` (or `--accept-critical ... --manual`); it is logged as manual.
+
+Known limit: the model and the hook run as the same OS user, so a model that
+writes the token file or passes `--manual` itself is not stopped by the OS.
+This closes the "it just ran `--skip`" path and leaves a log trail (no
+matching answer on record); it is not a sandbox. The model also writes the
+question text, so it could attach a marker to an unrelated question; the
+answer must be one of the listed options, which keeps free text out.
+
 ## 3.6.0
 
 **CRITICAL gate.** A `reviewed` or `skipped` hash is the same plan text the

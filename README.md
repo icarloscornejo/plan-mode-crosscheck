@@ -85,6 +85,14 @@ plugin is enabled, no manual edits to `settings.json`.
 
 One hook, two skills.
 
+**Skipping needs your answer.** `crosscheck --skip --hash H` (and
+`--accept-critical`, which lets an unedited plan with CRITICAL findings
+through) only works after you answered the matching `AskUserQuestion`: a
+`PostToolUse` hook on that tool records your answer as a one-use token for that
+plan hash. If that hook ever fails, type it yourself in the prompt:
+`! crosscheck --skip --hash H --manual` (logged as manual). This stops the
+model from skipping on its own; it is not a sandbox, both run as your user.
+
 **Hook** (`hooks/crosscheck.sh`, `PreToolUse` on `ExitPlanMode`): pure bash and
 `jq`, no audit call. It hashes the plan text (`tool_input.plan`) and checks a
 small state file for that hash:
