@@ -2,6 +2,20 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.6.0
+
+**CRITICAL gate.** A `reviewed` or `skipped` hash is the same plan text the
+audit saw, so if the latest `findings` line of that hash has CRITICAL > 0 none
+of them were incorporated, and ExitPlanMode is now denied. Editing the plan
+(new hash) restores the normal flow. A missing or unreadable findings record
+still fails open, with the reason in the log.
+
+New `--accept-critical --hash H` records that the user accepts the CRITICALs
+of the latest round as-is (logged, plus a `critical-accepted` metrics line);
+a later round with CRITICALs needs a fresh acceptance. Known limit: the
+command is not yet tied to a user answer, so the model could run it on its
+own (CC-2 closes that).
+
 ## 3.5.0
 
 Per-audit metrics, so the value of an audit can be quoted with numbers.

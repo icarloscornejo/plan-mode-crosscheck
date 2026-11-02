@@ -43,7 +43,8 @@ it here and do not run any engine:
 
 - **Entry A:** tell the user the config is broken and that `/crosscheck-setup`
   repairs it, then run `crosscheck --skip --hash <hash>` and call
-  `ExitPlanMode` again. `--skip` never reads the config, so it always works.
+  `ExitPlanMode` again. `--skip` never reads the config, so it always works
+  (it does not get past the CRITICAL deny, see "CRITICAL deny" below).
 - **Entry B:** tell the user the same and stop. Nothing else to clean up.
 
 ## Entry point A: a Plan Mode `ExitPlanMode` call was denied
@@ -73,7 +74,8 @@ will keep denying forever.
    crosscheck --skip --hash <hash>
    ```
    Run this directly with the `Bash` tool (it's instant, no need for
-   `run_in_background`). Then call `ExitPlanMode` again; it will be allowed.
+   `run_in_background`). Then call `ExitPlanMode` again; it will be allowed,
+   unless the CRITICAL deny applies (see below).
 
 3. **If the user says Yes:** write the prompt (3.a-3.b) and then launch the
    engine(s) (3.c).
@@ -216,7 +218,19 @@ will keep denying forever.
         crosscheck --skip --hash <hash>
         ```
         so the hash is marked `skipped` (an attempted-and-failed audit is not
-        a silent bypass, the user was told), and call `ExitPlanMode` again.
+        a silent bypass, the user was told), and call `ExitPlanMode` again
+        (an earlier round on this same unedited text with CRITICALs still
+        triggers the CRITICAL deny, see below).
+
+## CRITICAL deny (not the Yes/No question)
+
+If the deny reason says the plan "no cambio desde una auditoria" that
+reported CRITICAL findings, this is NOT the pending-audit question above:
+do not ask "audit?" and do not run `--skip` (it cannot get past this deny).
+Either edit the plan to resolve the CRITICALs (new hash, normal flow), or ask
+the user with `AskUserQuestion` whether to accept them as-is; only on an
+explicit yes run `crosscheck --accept-critical --hash <hash>` and call
+`ExitPlanMode` again.
 
 ## Relaying a round's findings
 
@@ -384,7 +398,11 @@ first.
 - `crosscheck --metrics-findings` records a plan-review round's findings as
   counts (never text) in `metrics.jsonl`, and `crosscheck --stats [FILE...]`
   prints the totals. `--run` already logs each report's engine, model and
-  round there by itself.
+  round there by itself. Always record the round (even with zero findings):
+  the hook reads the latest line of the hash, and a plan left unedited after
+  a round with CRITICAL findings is denied on ExitPlanMode. Only if the user
+  explicitly accepts those CRITICALs as-is (ask with `AskUserQuestion`), run
+  `crosscheck --accept-critical --hash <hash>`; otherwise edit the plan.
 - `Bash` calls per audit: `codex` and `claude` are one call each (write the
   prompt, then `--run --engine ...`, backgrounded). `both` is one foreground
   call (write the prompt, print its path), then two backgrounded `--run`

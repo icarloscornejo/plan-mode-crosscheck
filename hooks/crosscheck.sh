@@ -53,6 +53,11 @@
 #      the automatic per-report `run` lines `publish_report` appends there.
 #      `--stats [FILE...]` summarizes that file (or several, across instances).
 #      Numbers and short labels only, never finding text.
+#   7. `--accept-critical --hash H`: records that the user accepts the
+#      CRITICAL findings of H's latest audit round as-is. Without it the hook
+#      denies a `reviewed`/`skipped` hash whose latest findings line has
+#      CRITICAL > 0 (the plan text did not change, so nothing was addressed).
+#      A missing or unreadable findings record still fails open.
 #
 # There is no thread reuse across calls. Every `--run` is a fresh Codex
 # thread. This is a deliberate downgrade from v2, not an oversight: v2's
@@ -951,6 +956,80 @@ cmd_skip() {
   fi
   log "plan hash=$hash marked skipped"
   return 0
+}
+
+# --- CRITICAL gate: a `reviewed` (or `skipped`) hash is the SAME plan text the
+# audit saw, so if that audit recorded CRITICAL findings none of them were
+# incorporated. Reads the counts `--metrics-findings` recorded, never the
+# report. Prints "<round> <critical_count>" for the latest findings line of
+# the hash; prints nothing (and returns 1) when there is no usable record,
+# which the caller treats as fail open, with the reason in the log. ---
+latest_findings_critical() {
+  local hash="$1" result
+  if [ ! -e "$METRICS_FILE" ]; then
+    log "critical gate: hash=$hash no metrics file, failing open"
+    return 1
+  fi
+  if [ ! -r "$METRICS_FILE" ] || [ -d "$METRICS_FILE" ]; then
+    log "critical gate: hash=$hash metrics file unreadable, failing open"
+    return 1
+  fi
+  # fromjson? skips corrupt lines, one bad line must not hide the others.
+  result="$(jq -R 'fromjson? // empty' "$METRICS_FILE" 2>/dev/null | jq -rs --arg hash "$hash" '
+    map(select(type == "object" and .type == "findings" and .hash == $hash and (.round | type) == "number"))
+    | if length == 0 then empty
+      else max_by([.round, (.ts // 0)]) | "\(.round) \(.ts // 0 | floor) \([.counts[]? | .CRITICAL? // 0] | add // 0)" end' 2>/dev/null)"
+  if ! [[ "$result" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+    log "critical gate: hash=$hash no usable findings record, failing open"
+    return 1
+  fi
+  printf '%s' "$result"
+}
+
+critical_accepted_file() { printf '%s/plan-%s.critical-accepted.state' "$STATE_DIR" "$1"; }
+
+# --- `--accept-critical`: record that the user accepts the CRITICAL findings
+# of the latest audit round of this hash as-is. ---
+cmd_accept_critical() {
+  local hash="" latest round record_ts critical_count
+  while [ $# -gt 0 ]; do
+    case "$1" in --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;; *) shift ;; esac
+  done
+  [[ "$hash" =~ ^[0-9a-f]+$ ]] || { echo "crosscheck --accept-critical: --hash is required and must be hex" >&2; return 2; }
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --accept-critical: jq not found on PATH" >&2; return 1; }
+  if ! latest="$(latest_findings_critical "$hash")"; then
+    echo "crosscheck --accept-critical: no findings record for hash $hash, nothing to accept" >&2
+    return 1
+  fi
+  read -r round record_ts critical_count <<<"$latest"
+  if [ "$critical_count" -eq 0 ]; then
+    echo "crosscheck --accept-critical: latest round $round of hash $hash has no CRITICAL findings, nothing to accept" >&2
+    return 1
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  # Tied to the exact findings record (round and its ts): a later round, or a
+  # re-audit of the same text that reuses the round number, needs a fresh acceptance.
+  if ! jq -n --argjson round "$round" --argjson record_ts "$record_ts" --argjson ts "$(date +%s)" '{round:$round, record_ts:$record_ts, ts:$ts}' \
+      >"$(critical_accepted_file "$hash").tmp.$$" 2>/dev/null \
+    || ! mv "$(critical_accepted_file "$hash").tmp.$$" "$(critical_accepted_file "$hash")" 2>/dev/null; then
+    echo "crosscheck --accept-critical: failed to persist acceptance for hash $hash" >&2
+    return 1
+  fi
+  append_metric "$(jq -cn --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
+    --argjson round "$round" --argjson ts "$(date +%s)" \
+    '{type:"critical-accepted", ts:$ts, hash:$hash, round:$round, repo:$repo}')"
+  log "plan hash=$hash CRITICAL findings of round $round accepted as-is by the user"
+  return 0
+}
+
+# True (0) when the user accepted exactly the findings record of hash $1 with
+# round $2 and record ts $3.
+critical_accepted() {
+  local f accepted
+  f="$(critical_accepted_file "$1")"
+  [ -s "$f" ] || return 1
+  accepted="$(jq -r '"\(.round) \(.record_ts)"' "$f" 2>/dev/null)"
+  [ "$accepted" = "$2 $3" ]
 }
 
 # --- `--metrics-findings`: record one plan-review round's findings as counts
@@ -1970,6 +2049,100 @@ run_selftest() {
   metrics_findings_bad "ambos on a single-engine round" --hash abc123 --round 1 --engines codex --finding HIGH:ambos
   metrics_findings_bad "the other engine on a single-engine round" --hash abc123 --round 1 --engines codex --finding HIGH:claude
 
+  # 39b. CRITICAL gate. Own state root so the metrics file is controlled.
+  local crit_root="$tmp_home/crit-root" crit_plan="critical gate plan" crit_hash crit_out crit_state
+  mkdir -p "$crit_root/state"
+  crit_hash="$(printf '%s' "$crit_plan" | shasum -a 256 | cut -c1-16)"
+  crit_state="$crit_root/state/plan-${crit_hash}.state"
+  crit_exit() {
+    jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' \
+      | CROSSCHECK_STATE_DIR="$crit_root" "$run"
+  }
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_state"
+  #      No findings record at all: fails open and says why in the log.
+  crit_out="$(crit_exit)"
+  check "critical gate: no findings record fails open" "$crit_out" ""
+  check "critical gate: fail-open reason is logged" "$(grep -c "hash=$crit_hash no metrics file" "$crit_root/logs/crosscheck.log")" "1"
+  #      Unreadable record (a directory stands in): fails open and logs.
+  mkdir "$crit_root/metrics.jsonl"
+  crit_out="$(crit_exit)"
+  check "critical gate: unreadable metrics file fails open" "$crit_out" ""
+  check "critical gate: unreadable metrics reason is logged" "$(grep -c "hash=$crit_hash metrics file unreadable" "$crit_root/logs/crosscheck.log")" "1"
+  rmdir "$crit_root/metrics.jsonl"
+  #      A CRITICAL on the latest round of the same hash denies.
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash" --round 1 --engines codex --finding CRITICAL:codex >/dev/null 2>&1
+  crit_out="$(crit_exit)"
+  check "critical gate: unedited plan with CRITICAL denies" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  check "critical gate: deny says the plan was not changed since a CRITICAL audit" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -c 'no cambio desde una auditoria')" "1"
+  check "critical gate: deny keeps the reviewed state" "$(jq -r '.status' "$crit_state")" "reviewed"
+  #      The same applies to a skipped hash.
+  jq -n '{status:"skipped", artifact:"", ts:1}' >"$crit_state"
+  crit_out="$(crit_exit)"
+  check "critical gate: skipped hash with CRITICAL also denies" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_state"
+  #      User acceptance passes and is logged; a later CRITICAL round needs a new one.
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash "$crit_hash" >/dev/null 2>&1
+  crit_out="$(crit_exit)"
+  check "critical gate: accepted CRITICAL passes" "$crit_out" ""
+  check "critical gate: acceptance is logged" "$(grep -c "hash=$crit_hash CRITICAL findings of round 1 accepted" "$crit_root/logs/crosscheck.log")" "1"
+  #      A re-audit that reuses round 1 (a new plan-mode task restarts N) with a
+  #      newer ts is a different record: the old acceptance does not cover it.
+  printf '{"type":"findings","ts":9999999999,"hash":"%s","round":1,"engines":"codex","repo":"r","counts":{"codex":{"CRITICAL":2}}}\n' "$crit_hash" >>"$crit_root/metrics.jsonl"
+  crit_out="$(crit_exit)"
+  check "critical gate: acceptance does not carry over to a re-audit with the same round number" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash" --round 2 --engines codex --finding CRITICAL:codex >/dev/null 2>&1
+  crit_out="$(crit_exit)"
+  check "critical gate: a newer CRITICAL round voids the old acceptance" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  #      A newer round without CRITICAL (latest wins) passes.
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash" --round 3 --engines codex --finding HIGH:codex >/dev/null 2>&1
+  crit_out="$(crit_exit)"
+  check "critical gate: latest round without CRITICAL passes" "$crit_out" ""
+  #      An edited plan (new hash) goes through the normal flow.
+  crit_out="$(jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan edited" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$crit_root" "$run")"
+  check "critical gate: edited plan gets the normal pending deny" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -c 'auditoria independiente')" "1"
+  #      --accept-critical refuses when there is nothing to accept.
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash deadbeef >/dev/null 2>&1
+  check "critical gate: --accept-critical without a findings record exits 1" "$?" "1"
+  #      Latest round HIGH-only (round 3 above): nothing to accept, nothing written.
+  rm -f "$(printf '%s/state/plan-%s.critical-accepted.state' "$crit_root" "$crit_hash")"
+  local accepted_lines_before
+  accepted_lines_before="$(grep -c critical-accepted "$crit_root/metrics.jsonl")"
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --accept-critical --hash "$crit_hash" >/dev/null 2>&1
+  check "critical gate: --accept-critical on a HIGH-only round exits 1" "$?" "1"
+  check "critical gate: HIGH-only --accept-critical writes no file and no metrics line" "$([ -e "$crit_root/state/plan-${crit_hash}.critical-accepted.state" ] && echo file || echo none)/$(grep -c critical-accepted "$crit_root/metrics.jsonl")" "none/$accepted_lines_before"
+  #      Metrics file with a corrupt line and only OTHER hashes: no usable
+  #      record for this plan, fails open and logs why.
+  local crit_plan3="critical gate plan three" crit_hash3
+  crit_hash3="$(printf '%s' "$crit_plan3" | shasum -a 256 | cut -c1-16)"
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_root/state/plan-${crit_hash3}.state"
+  printf '{"type":"findings" truncated\n' >>"$crit_root/metrics.jsonl"
+  crit_out="$(jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan3" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$crit_root" "$run")"
+  check "critical gate: no usable record for this hash (corrupt line, other hashes) fails open" "$crit_out" ""
+  check "critical gate: no-usable-record reason is logged" "$(grep -c "hash=$crit_hash3 no usable findings record" "$crit_root/logs/crosscheck.log")" "1"
+  #      A CRITICAL line followed by a corrupt line still denies (bad lines are skipped).
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash3" --round 1 --engines codex --finding CRITICAL:codex >/dev/null 2>&1
+  printf 'not json at all\n' >>"$crit_root/metrics.jsonl"
+  crit_out="$(jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan3" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$crit_root" "$run")"
+  check "critical gate: a corrupt metrics line does not hide a CRITICAL" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  #      "Latest" is the highest round, not the last line written: a round 1
+  #      recorded AFTER a round 2 with CRITICAL (same plan text audited again
+  #      in a new plan-mode task) must not hide it.
+  local crit_plan4="critical gate plan four" crit_hash4
+  crit_hash4="$(printf '%s' "$crit_plan4" | shasum -a 256 | cut -c1-16)"
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_root/state/plan-${crit_hash4}.state"
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash4" --round 2 --engines codex --finding CRITICAL:codex >/dev/null 2>&1
+  CROSSCHECK_STATE_DIR="$crit_root" "$run" --metrics-findings --hash "$crit_hash4" --round 1 --engines codex >/dev/null 2>&1
+  crit_out="$(jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan4" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$crit_root" "$run")"
+  check "critical gate: a later-written lower round does not hide a CRITICAL" "$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')" "deny"
+  #      Same round: the later ts wins even when written first in the file.
+  local crit_plan5="critical gate plan five" crit_hash5
+  crit_hash5="$(printf '%s' "$crit_plan5" | shasum -a 256 | cut -c1-16)"
+  jq -n '{status:"reviewed", artifact:"", ts:1}' >"$crit_root/state/plan-${crit_hash5}.state"
+  printf '{"type":"findings","ts":200,"hash":"%s","round":1,"engines":"codex","repo":"r","counts":{}}\n' "$crit_hash5" >>"$crit_root/metrics.jsonl"
+  printf '{"type":"findings","ts":100,"hash":"%s","round":1,"engines":"codex","repo":"r","counts":{"codex":{"CRITICAL":1}}}\n' "$crit_hash5" >>"$crit_root/metrics.jsonl"
+  crit_out="$(jq -n --arg cwd "$tmp_home" --arg plan "$crit_plan5" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:$plan}, cwd:$cwd}' | CROSSCHECK_STATE_DIR="$crit_root" "$run")"
+  check "critical gate: within one round the later ts wins" "$crit_out" ""
+
   # 40. `--stats`: totals over a hand-built fixture. h1 is a `both` round
   #     (duplicated line, must count once); h2 is codex-only and must not leak
   #     into the codex-vs-claude split; plans A and B (same repo) reach rounds
@@ -2063,6 +2236,31 @@ hook_main() {
   status="$(read_plan_status "$hash")"
   case "$status" in
     reviewed|skipped)
+      local latest_findings critical_round critical_ts critical_count
+      if latest_findings="$(latest_findings_critical "$hash")"; then
+        read -r critical_round critical_ts critical_count <<<"$latest_findings"
+        if [ "$critical_count" -gt 0 ]; then
+          if critical_accepted "$hash" "$critical_round" "$critical_ts"; then
+            log "exitplanmode: hash=$hash status=$status, $critical_count CRITICAL in round $critical_round accepted by the user, allowing"
+            exit 0
+          fi
+          log "exitplanmode: hash=$hash status=$status, $critical_count CRITICAL in round $critical_round unaddressed, denying"
+          local critical_reason
+          critical_reason="Este plan no cambio desde una auditoria que reporto ${critical_count} hallazgo(s) CRITICAL (ronda ${critical_round}), asi que ninguno fue incorporado. ExitPlanMode no se permite para este texto exacto de plan.
+
+Opciones: (1) edita el plan para resolver los hallazgos CRITICAL (el hash cambia y se decide de nuevo), o (2) preguntale al usuario (AskUserQuestion) si acepta los CRITICAL tal cual; solo si dice que SI, corre \`crosscheck --accept-critical --hash ${hash}\` y volve a llamar ExitPlanMode.
+
+Hash de este plan: ${hash}."
+          jq -n --arg reason "$critical_reason" '{
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "deny",
+              permissionDecisionReason: $reason
+            }
+          }'
+          exit 0
+        fi
+      fi
       log "exitplanmode: hash=$hash status=$status, allowing"
       exit 0
       ;;
@@ -2138,6 +2336,12 @@ case "${1:-}" in
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
     shift
     cmd_skip "$@"
+    exit $?
+    ;;
+  --accept-critical)
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    shift
+    cmd_accept_critical "$@"
     exit $?
     ;;
   --tmp-dir)
