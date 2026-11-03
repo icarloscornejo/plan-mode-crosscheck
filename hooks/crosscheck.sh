@@ -2688,6 +2688,18 @@ run_selftest() {
   check "outcomes: a reason over 60 characters is refused" "$?" "2"
   check "outcomes: refused findings write nothing" "$(wc -l <"$usage_metrics" | tr -d ' ')" "$lines_before_bad"
 
+  # 41b2. No reason is always null: an empty or blank reason is "no reason",
+  #       and a rejected finding with only a blank reason is refused.
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce02 --round 1 --engines codex \
+    --finding HIGH:codex:incorporated: --finding "MEDIUM:codex:not-applicable: " >/dev/null 2>&1
+  check "reason: an empty or blank reason is stored as null, never an empty string" "$(jq -c 'select(.type == "findings" and .hash == "a11ce02") | [.outcomes[].reason]' "$usage_metrics" | tail -1)" '[null,null]'
+  lines_before_bad="$(wc -l <"$usage_metrics" | tr -d ' ')"
+  "${usage_env[@]}" "$run" --metrics-findings --hash a11ce02 --round 2 --engines codex --finding "HIGH:codex:rejected: " >/dev/null 2>&1
+  check "reason: a rejected finding with a blank reason is refused" "$?" "2"
+  check "reason: the refused blank reason writes nothing" "$(wc -l <"$usage_metrics" | tr -d ' ')" "$lines_before_bad"
+  #      Readers: old lines hold "" (or blank) with the same meaning as null.
+  check "reason: the stats reader reads an old empty or blank reason as null" "$(printf '%s\n' '{"type":"findings","outcomes":[{"reason":""},{"reason":" "},{"reason":null},{"reason":"kept"}]}' | jq -c "${normalize_outcomes_def:-} normalize_outcomes | [.outcomes[].reason]" 2>/dev/null)" '[null,null,null,"kept"]'
+
   # 41c. A round the model never recorded: the next ExitPlanMode hook call
   #      records it as unknown, once, and only after the grace period.
   local missing_root="$tmp_home/missing-root" missing_metrics recent_ts
@@ -2725,15 +2737,21 @@ run_selftest() {
   } >>"$missing_metrics"
   jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
   check "missing findings: a later unrecorded re-audit of the same hash and round is flagged" "$(jq -r 'select(.type == "findings-missing" and .hash == "again1") | .round' "$missing_metrics")" "1"
-  #      The scan stays fast on a long history: the hook must not approach its 15s timeout.
-  jq -nc --argjson recent_ts "$recent_ts" 'range(0; 8000) | {type:"run", ts:$recent_ts, mode:"plan-review", engine:"codex", model:"gpt-a", effort:"medium", round:1, hash:("bulk\(.)"), repo:"r", status:"success"}' >"$missing_metrics.bulk"
+  #      The scan stays cheap on a long history, with no wall clock involved:
+  #      the clock is injected (CROSSCHECK_NOW) and the timestamps are fixed, and
+  #      the cost is the number of jq processes the hook spawns, not seconds
+  #      (a per-round jq spawn is the regression this guards against).
+  local fixed_now=2000000000 jq_shim_dir="$tmp_home/jq-shim" real_jq jq_spawn_count
+  real_jq="$(command -v jq)"
+  mkdir -p "$jq_shim_dir"
+  printf '#!/bin/sh\necho x >>"%s/count"\nexec "%s" "$@"\n' "$jq_shim_dir" "$real_jq" >"$jq_shim_dir/jq"
+  chmod +x "$jq_shim_dir/jq"
+  jq -nc --argjson fixed_ts "$((fixed_now - 300))" 'range(0; 8000) | {type:"run", ts:$fixed_ts, mode:"plan-review", engine:"codex", model:"gpt-a", effort:"medium", round:1, hash:("bulk\(.)"), repo:"r", status:"success"}' >"$missing_metrics.bulk"
   cat "$missing_metrics.bulk" >>"$missing_metrics"; rm -f "$missing_metrics.bulk"
-  local scan_start scan_end
-  scan_start="$(date +%s)"
-  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" "$run" >/dev/null 2>&1
-  scan_end="$(date +%s)"
-  check "missing findings: 8000 unrecorded rounds are scanned in under 10 seconds" "$([ $((scan_end - scan_start)) -lt 10 ] && echo fast || echo slow)" "fast"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:"missing findings plan"}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$missing_root" CROSSCHECK_NOW="$fixed_now" PATH="$jq_shim_dir:$PATH" "$run" >/dev/null 2>&1
+  jq_spawn_count="$(wc -l <"$jq_shim_dir/count" 2>/dev/null | tr -d ' ')"
   check "missing findings: the bulk rounds were all recorded as unknown" "$(grep -c '"findings-missing"' "$missing_metrics")" "8002"
+  check "missing findings: 8000 rounds cost a bounded number of jq processes" "$([ "${jq_spawn_count:-9999}" -le 15 ] && echo bounded || echo "unbounded:$jq_spawn_count")" "bounded"
 
   # 41d. Stats: research and legacy --record runs get their own section, and
   #      acceptance is reported per engine and model.
@@ -2745,6 +2763,7 @@ run_selftest() {
     echo '{"type":"run","ts":4,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s3","repo":"r","status":"timeout","duration_s":600,"error":"codex exec exited 124"}'
     echo '{"type":"run","ts":5,"mode":"research","engine":"codex","model":"gpt-a","effort":"medium","round":null,"hash":null,"repo":"r"}'
     echo '{"type":"run","ts":6,"mode":"plan-review","engine":"claude","model":"","effort":"","round":null,"hash":"legacy1","repo":"r"}'
+    echo '{"type":"run","ts":7,"mode":"research","engine":"codex","model":"gpt-a","effort":"medium","round":null,"hash":null,"repo":"r","status":"failed","error":"boom"}'
     echo '{"type":"findings","ts":10,"hash":"s1","round":1,"engines":"both","repo":"r","counts":{"codex":{"HIGH":2},"ambos":{"LOW":1}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null},{"severity":"HIGH","source":"codex","status":"rejected","reason":"wrong"},{"severity":"LOW","source":"ambos","status":"incorporated","reason":null}]}'
     echo '{"type":"findings","ts":11,"hash":"s2","round":1,"engines":"codex","repo":"r","counts":{"codex":{"MEDIUM":1}},"outcomes":[{"severity":"MEDIUM","source":"codex","status":"incorporated","reason":null}]}'
   } >"$stats3"
@@ -2756,6 +2775,9 @@ run_selftest() {
   check "stats: research and legacy runs have their own section" "$(printf '%s' "$out" | grep -c 'fuera de la tabla de auditorias: 2')" "1"
   check "stats: the legacy run is named in that section" "$(printf '%s' "$out" | grep -c 'plan-review sin modelo (--record legacy): 1')" "1"
   check "stats: the legacy run is not in the audits table" "$(printf '%s' "$out" | awk '/^Auditorias por motor y modelo:/{f=1;next} /^Corridas fallidas/{f=0} f' | grep -c 'claude : \|(sin modelo)')" "0"
+  check "stats: a failed research run is counted as failed, not as research" "$(printf '%s' "$out" | grep -c '^Corridas fallidas o con timeout: 2$')" "1"
+  check "stats: the failed research run has its own line, apart from the plan-review one" "$(printf '%s' "$out" | grep -c '^  codex gpt-a (research): 1 (timeout: 0)$')" "1"
+  check "stats: the plan-review failure line is unchanged" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 1 (timeout: 1)$')" "1"
   check "stats: acceptance per engine and model (codex gpt-a 3 of 4)" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 3 incorporados, 1 rechazados, 0 sin estado (aceptacion 75%)$')" "1"
   check "stats: an ambos finding counts for both engines" "$(printf '%s' "$out" | grep -c '^  claude opus-x: 1 incorporados, 0 rechazados, 0 sin estado (aceptacion 100%)$')" "1"
 
