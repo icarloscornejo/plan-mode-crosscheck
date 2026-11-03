@@ -2,6 +2,19 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.8.1
+
+Fixes for three audit-metrics issues left open in 3.8.0.
+
+- **Failed research runs** are counted in the failed-runs section of `--stats`
+  (labelled with their mode), no longer in the research and legacy section.
+- **Reason is null when absent.** `--metrics-findings` stores `null` for an
+  empty or blank reason (never `""`) and refuses a `rejected` finding whose
+  reason is blank. `--stats` reads old `""` reasons as `null`.
+- **Clock-free 8000-round selftest.** The missing-findings scan takes its
+  clock from `CROSSCHECK_NOW` (a test seam, ignored unless an integer), and the
+  selftest checks the number of jq processes instead of elapsed seconds.
+
 ## 3.8.0
 
 Complete audit metrics.

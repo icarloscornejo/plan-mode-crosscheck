@@ -1276,6 +1276,9 @@ cmd_metrics_findings() {
       fi
       # SEVERITY:SOURCE[:STATUS[:reason]]; the reason is the rest of the string.
       IFS=: read -r severity source finding_status finding_reason <<<"$finding"
+      # A blank reason is no reason: a rejected finding is refused below and
+      # any other status stores null.
+      [[ "$finding_reason" =~ ^[[:space:]]*$ ]] && finding_reason=""
       # The reason is a short label, not finding text: metrics.jsonl is kept
       # forever and shared between instances.
       if [ -n "$finding_reason" ] && ! [[ "$finding_reason" =~ ^[A-Za-z0-9\ ._,-]{1,60}$ ]]; then
@@ -1323,7 +1326,7 @@ cmd_metrics_findings() {
     outcomes="$(printf '%s\n' "${findings[@]}" | tr '\r' ' ' | jq -R -s -c '
       split("\n") | map(select(length > 0) | split(":")
         | {severity: .[0], source: .[1], status: (if (.[2] // "") == "" then "unknown" else .[2] end),
-           reason: (if (.[3:] | length) == 0 then null else (.[3:] | join(":") | .[0:80]) end)})')" \
+           reason: ((.[3:] | join(":") | .[0:80]) as $reason | if ($reason | test("^\\s*$")) then null else $reason end)})')" \
       || { echo "crosscheck --metrics-findings: could not build outcomes" >&2; return 1; }
   fi
 
@@ -1346,6 +1349,10 @@ record_missing_findings() {
   [ -r "$METRICS_FILE" ] && [ -f "$METRICS_FILE" ] || return 0
   local pending now_epoch
   now_epoch="$(date +%s)"
+  # Test seam: the selftest injects a fixed clock here so its long-history scan
+  # does not depend on real time. Only this function reads it, and it never
+  # touches the CRITICAL gate; a non-integer value is ignored.
+  [[ "${CROSSCHECK_NOW:-}" =~ ^[0-9]+$ ]] && now_epoch="$CROSSCHECK_NOW"
   # Only the last week, the same horizon as the plan state: history from before
   # this check existed is not backfilled with thousands of "unknown" lines.
   pending="$(jq -R -c 'fromjson? // empty' "$METRICS_FILE" 2>/dev/null | jq -cs --argjson now "$now_epoch" '
@@ -1373,6 +1380,13 @@ record_missing_findings() {
   return 0
 }
 
+# Older findings lines may hold "" (or blank) as a reason; the writer now stores
+# null for "no reason" and readers treat both the same.
+normalize_outcomes_def='def normalize_outcomes:
+  if (.outcomes | type) == "array"
+  then .outcomes |= map(if type == "object" and (.reason | type) == "string" and (.reason | test("^\\s*$")) then .reason = null else . end)
+  else . end;'
+
 # jq program behind `--stats`. Input: every valid metrics line, slurped.
 # `findings` lines are deduplicated by hash (last wins); `run` lines are joined
 # to them by hash only to name the models behind the codex-vs-claude split.
@@ -1392,11 +1406,12 @@ def averages: . as $group
   | if length == 0 then "" else " (" + join(", ") + ")" end;
 def engine_model_of($runs; $hash; $round; $engine): ([$runs[] | select(.hash == $hash and .round == $round and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
 
-(map(select(.type == "run"))) as $all_runs
+map(if .type == "findings" then normalize_outcomes else . end)
+| (map(select(.type == "run"))) as $all_runs
 | ($all_runs | map(select(.mode == "plan-review" and (.model // "") != ""))) as $audit_runs
 | ($audit_runs | map(select((.status // "success") == "success"))) as $runs
-| ($audit_runs | map(select((.status // "success") != "success"))) as $failed_runs
-| ($all_runs | map(select(.mode != "plan-review" or (.model // "") == ""))) as $other_runs
+| ($all_runs | map(select((.status // "success") != "success"))) as $failed_runs
+| ($all_runs | map(select((.mode != "plan-review" or (.model // "") == "") and (.status // "success") == "success"))) as $other_runs
 | (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
 | (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
 | ($rounds | map(select(.engines != "both"))) as $single_rounds
@@ -1407,7 +1422,8 @@ def engine_model_of($runs; $hash; $round; $engine): ([$runs[] | select(.hash == 
     "Auditorias por motor y modelo:",
     ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length)\(averages)"),
     "Corridas fallidas o con timeout: \($failed_runs | length)",
-    ($failed_runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length) (timeout: \(map(select(.status == "timeout")) | length))"),
+    ($failed_runs | group_by([(.mode == "plan-review" and (.model // "") != ""), .mode, .engine, .model]) | .[]
+      | "  \(.[0].engine) \(.[0].model)\(if .[0].mode == "plan-review" and (.[0].model // "") != "" then "" else " (\(.[0].mode // "?"))" end): \(length) (timeout: \(map(select(.status == "timeout")) | length))"),
     "Investigacion y corridas legacy (--record), fuera de la tabla de auditorias: \($other_runs | length)",
     ($other_runs | group_by(.mode == "plan-review") | .[] | "  \(if .[0].mode == "plan-review" then "plan-review sin modelo (--record legacy)" else "research" end): \(length)"),
     "Aceptacion de hallazgos por motor y modelo (incorporados / rechazados):",
@@ -1481,7 +1497,7 @@ cmd_stats() {
     echo "sin metricas todavia"
     return 0
   fi
-  printf '%s\n' "$valid_lines" | jq -r -s "$stats_program"
+  printf '%s\n' "$valid_lines" | jq -r -s "$normalize_outcomes_def $stats_program"
   return 0
 }
 

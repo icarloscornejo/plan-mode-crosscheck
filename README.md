@@ -282,8 +282,11 @@ it succeeded, failed or timed out (with the engine's error), and the tokens it
 used (Codex from its event stream, Claude from its JSON result, with cost).
 After each round the skill records what it did with every finding (incorporated,
 rejected with a short reason, or not applicable), and `--stats` shows the
-acceptance rate per engine and model. Research runs and legacy `--record` runs
-are listed in their own section, not in the audits table. If a round's
+acceptance rate per engine and model. A finding with no reason stores `null`
+(older lines may hold `""`, read as the same thing). Successful research runs
+and legacy `--record` runs are listed in their own section, not in the audits
+table; failed or timed-out runs of any mode are counted in the failed section,
+apart from each other by mode. If a round's
 findings were never recorded, the next `ExitPlanMode` hook call notes it as
 unknown and `--stats` counts those rounds apart, so they never skew the rates.
 
