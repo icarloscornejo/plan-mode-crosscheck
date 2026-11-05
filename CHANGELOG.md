@@ -2,6 +2,46 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.9.0
+
+Scoped rounds: a cheaper next step when a round's HIGH findings are about
+process only.
+
+- **`Kind` labels.** Every `--run` (both modes) now asks the auditor to add
+  `Kind: change` or `Kind: process` to each finding (a stale or contradictory
+  description of what will be built is `change`; in doubt, `change`). The
+  instruction text sits above the data marker of each mode.
+- **`crosscheck --next-round --round N [--scoped-streak S] --item
+  SEV:KIND:STATUS ...`** prints `{"next":"full|scoped|show","launch":[...],
+  "reason":...}` and writes nothing. CRITICAL or a `change`/unknown HIGH gives
+  `full`; incorporated `process`-only HIGHs after a completed round give
+  `scoped` (one engine, Codex when configured); a scoped round just relayed,
+  or nothing at HIGH, gives `show`. Exit 2 for bad arguments, 1 for a broken
+  config or a missing `jq`.
+- **`--run --scope full|delta`.** `delta` adds a scoped-round block (changes
+  since the last round first, but any defect in what the request delivers,
+  anywhere, still counts) and needs a prompt line starting with
+  `CHANGES SINCE LAST ROUND:` (exit 2 otherwise, also for a large prompt).
+  `ROUND: 3. Audit ...` first lines now record their round. Run lines, failed
+  run lines and `--metrics-findings --scope` carry the scope, and `--stats`
+  lists scoped rounds in their own block.
+- **Skill.** The relay shows each finding's Kind, the recommendation comes from
+  `--next-round`, and the skill follows its launch list, asks before every
+  round, falls back to a full round if the command fails, and offers a full
+  round if a scoped run fails.
+- **No cap.** The 3.2.0 round cap does not return (see the README).
+
+Measured limits, not hidden: a scoped round is not cheaper per Codex round
+(mean input 164,716 scoped vs 164,961 full over 9 runs each; output and time
+about 10% lower, within the spread). The saving is not running Claude in
+process-only rounds and running fewer rounds. Scoped rounds lose process
+findings by design (they were seen almost only by full rounds). A weak
+assertion on the real rate table was seen in 1 of 9 full runs and 0 of 9
+scoped. 4 of 9 scoped rounds reported nothing, against 0 of 9 full. The
+acceptance criteria changed by decision of Carlos after the first failed in a
+full-round control too; the primary criterion of the replacement was empty
+twice and the verdict rests on a secondary criterion fixed beforehand.
+
 ## 3.8.1
 
 Fixes for three audit-metrics issues left open in 3.8.0.

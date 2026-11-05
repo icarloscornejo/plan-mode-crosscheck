@@ -173,6 +173,69 @@ that every round is written as if it were the only one:
 Nothing loops on its own: every extra round still needs your explicit "Otra
 ronda", with the skill's recommendation in front of you.
 
+### Scoped rounds (3.9.0)
+
+There is still no round cap and no limit that scales with the size of the
+change. A size-based limit would be the 3.2.0 cap again, and the 3.3.0
+reasoning still holds: a cap only cuts rounds, it does not make any of them
+find more. Size does not predict rounds anyway: in two measured tickets the
+small change took 6 and 8 rounds, because after the first rounds every HIGH was
+about how the work is run, measured or approved (each fix creating the next
+one), not about the change itself.
+
+What 3.9.0 adds is a cheaper next step for exactly that case. Each auditor now
+labels every finding `Kind: change` (a defect in what the plan delivers,
+including a stale or contradictory description of what will be built) or
+`Kind: process` (how the work is run, measured, approved or worded); in doubt,
+change. The labels are the auditors', never the orchestrator's, which can only
+raise a finding to `change`. `crosscheck --next-round --round N
+[--scoped-streak S] --item SEV:KIND:STATUS ...` is a pure function (it writes
+nothing) that turns the round's findings into `full`, `scoped` or `show` plus
+the exact `--run` arguments to launch:
+
+- any CRITICAL, or any HIGH that is `change` or has no valid Kind (rejected or
+  not): `full`, the usual round with the configured engines.
+- only incorporated `process` HIGHs after an earlier completed round: `scoped`,
+  one round with one engine (Codex when configured) launched with
+  `--run --scope delta`. The prompt anchors on `CHANGES SINCE LAST ROUND` but
+  still asks for any defect in what the request delivers, anywhere, including
+  unchanged text.
+- a `process`-only round right after a scoped one, no HIGH at all, or only
+  rejected `process` findings: `show` (a recommendation; "Otra ronda" still
+  gives a full round).
+
+The skill must call the command and follow its answer, ask you before every
+round as before, and offer a full round if a scoped run fails.
+
+What the measurements showed, stated plainly (replay of one saved ticket,
+Codex gpt-6-luna high, 9 full against 9 scoped rounds on the same input, plus
+the recorded rounds of two tickets):
+
+- A scoped round is not cheaper per round: mean Codex input was 164,716 tokens
+  scoped against 164,961 full (output and time were about 10% lower, within the
+  spread). The saving comes from not running the Claude auditor in
+  process-only rounds and from running fewer rounds. Projected on the two
+  recorded tickets with their measured costs: about 4.5 USD of 7.2 (auditors
+  plus orchestrator rounds) for the first and about 5.1 USD of 16.6 for the
+  second, a projection, not a re-run.
+- Scoped rounds lose process findings by design: the three process defects of
+  the replay were seen almost only by full rounds.
+- One CHANGE defect (a weak assertion on the real rate table) was seen by a
+  full run and never by a scoped one (1 of 9 against 0 of 9).
+- 4 of 9 scoped rounds reported nothing at all, against 0 of 9 full.
+- The acceptance criteria were changed during the work by decision of Carlos:
+  the first one (reproduce four specific defects with one run) was failed by a
+  full-round control too, so it measured auditor chance. The replacement
+  primary criterion (change defects present in 6 of 9 full runs must be present
+  in 6 of 9 scoped) was empty twice; the verdict rests on a secondary
+  criterion fixed beforehand (change defects present in 3 of 9 full runs, here
+  two, were present in 2 of 9 scoped each).
+- The real Stage 2 cost of a ticket under the new rule is still to be measured
+  on the first comparable ticket after release.
+
+Scoped rounds are in their own block of `--stats`, outside the per-engine
+tables and acceptance rates, which keep describing full rounds.
+
 ## Failure handling
 
 If an engine isn't available (Codex not installed, not logged in, timed out,
