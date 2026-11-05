@@ -892,7 +892,7 @@ cmd_run() {
 
   # A scoped round is anchored on the changes; without them it would review
   # nothing in particular, so it never reaches an engine.
-  if [ "$scope" = "delta" ] && ! printf '%s\n' "$prompt_body" | grep -q '^CHANGES SINCE LAST ROUND:'; then
+  if [ "$scope" = "delta" ] && ! grep -q '^CHANGES SINCE LAST ROUND:' <<<"$prompt_body"; then
     echo "crosscheck --run: --scope delta needs a prompt line starting with 'CHANGES SINCE LAST ROUND:'" >&2
     return 2
   fi
@@ -1421,7 +1421,7 @@ cmd_next_round() {
   elif [ "$process_incorporated" -eq 1 ] && [ "$round" -lt 2 ]; then
     next="full"; reason="incorporated process HIGHs on the first completed round: no scoped round yet"
   elif [ "$process_incorporated" -eq 1 ] && [ "$streak" -eq 0 ]; then
-    next="scoped"; reason="every HIGH is an incorporated process finding after an earlier full round"
+    next="scoped"; reason="only incorporated process HIGHs, after an earlier completed round, and no scoped round yet"
   elif [ "$process_incorporated" -eq 1 ]; then
     next="show"; reason="the scoped round just relayed found only process HIGHs"
   else
@@ -1505,8 +1505,8 @@ def averages: . as $group
 def engine_model_of($runs; $hash; $round; $engine): ([$runs[] | select(.hash == $hash and .round == $round and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
 
 map(if .type == "findings" then normalize_outcomes else . end)
-# Scoped rounds look at less and run one engine, so they get their own block and
-# stay out of every table below; lines without a scope are full rounds.
+# Scoped rounds run one engine anchored on the changes, so they get their own
+# block and stay out of every table below; lines without a scope are full rounds.
 | (map(select((.type == "run" or .type == "findings") and .scope == "delta"))) as $delta_lines
 | ($delta_lines | map(select(.type == "run"))) as $delta_runs
 | ($delta_lines | map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $delta_rounds
