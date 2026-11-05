@@ -3062,6 +3062,15 @@ run_selftest() {
   scope_run codex plan-review "$scope_prompt" --scope partial
   scope_rc=$?
   check "an unknown --scope exits 2 and invokes nothing" "$scope_rc/$([ -s "$capture_stdin" ] && echo invoked || echo none)" "2/none"
+  #     A big plan after the CHANGES line must not trip the guard (grep -q exits
+  #     at the first match, so a piped printf can die of SIGPIPE under pipefail).
+  local big_prompt="$tmp_home/big-prompt.md"
+  { printf 'ROUND: 2\n\nCHANGES SINCE LAST ROUND:\nreworded a step\n\nPROPOSED PLAN:\n'; head -c 300000 /dev/zero | tr '\0' 'a'; printf '\n'; } >"$big_prompt"
+  for scope_engine in codex claude; do
+    scope_run "$scope_engine" plan-review "$big_prompt" --scope delta
+    scope_rc=$?
+    check "scope delta ($scope_engine): a 300 KB prompt with the CHANGES line first still passes the guard" "$scope_rc/$([ -s "$(scope_stdin_of "$scope_engine")" ] && echo invoked || echo none)" "0/invoked"
+  done
   #     Failed and timed-out delta runs keep their scope, at every reachable
   #     record_failed_run call site.
   scope_fail_run() {
