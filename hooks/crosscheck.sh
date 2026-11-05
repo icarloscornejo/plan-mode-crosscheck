@@ -28,8 +28,9 @@
 #      Pure bash + jq; does not itself call `codex` or wait on anything, so
 #      it returns in well under its 15s hook timeout every time.
 #   2. `--run --mode research|plan-review --prompt-file PATH [--hash HASH]
-#      [--engine codex|claude]`: the actual engine call, Codex CLI (default)
-#      or a nested read-only `claude -p`. Invoked by the
+#      [--engine codex|claude] [--scope full|delta]`: the actual engine call,
+#      Codex CLI (default) or a nested read-only `claude -p`; `delta` is a
+#      scoped round anchored on CHANGES SINCE LAST ROUND. Invoked by the
 #      `crosscheck` skill via the Bash tool with run_in_background, NOT by a
 #      hook, so it can take as long as it needs without racing any hook
 #      timeout. On success in plan-review mode, marks the given hash
@@ -48,7 +49,8 @@
 #      engine, for when the user declines, or when a run attempt failed and
 #      the skill falls back to not blocking the user on a broken external
 #      tool.
-#   6. `--metrics-findings --hash H --round N --engines E --finding SEV:SRC`:
+#   6. `--metrics-findings --hash H --round N --engines E [--scope full|delta]
+#      --finding SEV:SRC`:
 #      records one round's findings as counts in `$METRICS_FILE`, next to
 #      the automatic per-report `run` lines `publish_report` appends there.
 #      `--stats [FILE...]` summarizes that file (or several, across instances).
@@ -61,6 +63,9 @@
 #      denies a `reviewed`/`skipped` hash whose latest findings line has
 #      CRITICAL > 0 (the plan text did not change, so nothing was addressed).
 #      A missing or unreadable findings record still fails open.
+#   8. `--next-round --round N [--scoped-streak S] --item SEV:KIND:STATUS...`:
+#      prints which round follows a relayed one (full, scoped or show) and
+#      the `--run` engine arguments to launch. Writes nothing.
 #
 # There is no thread reuse across calls. Every `--run` is a fresh Codex
 # thread. This is a deliberate downgrade from v2, not an oversight: v2's
@@ -285,6 +290,12 @@ No descriptive sections. Do not restate or summarize the plan back. Do not list 
 Original request and proposed plan follow:
 ---'
 
+# Both inserted by cmd_run above the mode's marker sentence, so the auditor
+# reads them as instructions. The auditor labels Kind, never the orchestrator.
+kind_instructions="If you report findings with a severity, add to each one a line 'Kind: change' when the defect is in what the plan delivers (code, stage text, logic, tests of that behavior, data contract), or 'Kind: process' when it is only about how the work is run, measured, approved or worded. A stale, contradictory or wrong DESCRIPTION of what will be built (design steps, test specs, data contract, expected values) is 'change', wherever it sits in the plan. When in doubt, change."
+
+delta_instructions="SCOPED ROUND. Earlier rounds (see PRIOR ROUNDS) already swept this plan in full, and the findings of the last round were about process. For THIS round the 'only review' rule applies to: (a) every defect in the text listed under CHANGES SINCE LAST ROUND; (b) unchanged text that those changes contradict or make stale; (c) any defect in what the request delivers, anywhere in the plan or in the code it changes, INCLUDING unchanged text. A stale, contradictory or wrong description of what will be built (design steps, test specs, data contract, expected values) counts under (c) even when the changes did not cause it. The only thing excluded is PROCESS topics (how the work is run, measured, approved or worded) in unchanged text: do not sweep for those. When in doubt, report. Everything else in these instructions (evidence, severity, Kind, no padding, Coverage line) applies unchanged."
+
 # Resolves which timeout wrapper to use: prefers GNU `timeout`, falls back to
 # `gtimeout` (Homebrew coreutils on a stock macOS box, where `timeout` itself
 # doesn't exist), prints nothing and returns 1 if neither is on PATH. Same
@@ -380,16 +391,17 @@ claude_usage_json() {
 # Extra fields for a `run` metrics line: when it started and ended, how long it
 # took, how it ended and the engine's token usage. $1 = status
 # (success|failed|timeout), $2 = start epoch, $3 = end epoch, $4 = error text
-# (may be empty), $5 = usage JSON or null. The error is one line, capped: an
+# (may be empty), $5 = usage JSON or null, $6 = scope (full|delta, default
+# full). The error is one line, capped: an
 # engine message, never the prompt or the report.
 run_extra_json() {
-  local status="$1" started="$2" ended="$3" error="${4:-}" usage="${5:-null}"
+  local status="$1" started="$2" ended="$3" error="${4:-}" usage="${5:-null}" scope="${6:-full}"
   [ -n "$usage" ] || usage="null"
   error="${error%"${error##*[![:space:]]}"}"
   jq -cn --arg status "$status" --argjson started "$started" --argjson ended "$ended" \
-    --arg error "$(printf '%s' "$error" | tr '\n\r' '  ' | head -c 300)" --argjson usage "$usage" \
+    --arg error "$(printf '%s' "$error" | tr '\n\r' '  ' | head -c 300)" --argjson usage "$usage" --arg scope "$scope" \
     '{started_at:$started, ended_at:$ended, duration_s:($ended - $started), status:$status,
-      error:(if $error == "" then null else $error end)}
+      error:(if $error == "" then null else $error end), scope:$scope}
      + (if $usage == null then {} else {input_tokens:$usage.input_tokens, output_tokens:$usage.output_tokens,
          cached_tokens:$usage.cached_tokens, cost_usd:$usage.cost_usd} end)' 2>/dev/null || printf '{}'
 }
@@ -398,16 +410,16 @@ run_extra_json() {
 # vanish from the metrics. This writes its `run` line. $1 = mode, $2 = engine,
 # $3 = model, $4 = effort, $5 = hash, $6 = round, $7 = start epoch, $8 = engine
 # exit code, $9 = error text, $10 = usage JSON (a failed run can still have
-# been billed).
+# been billed), $11 = scope (full|delta).
 record_failed_run() {
-  local mode="$1" engine="$2" model="$3" effort="$4" hash="$5" round="$6" started="$7" rc="$8" error="${9:-}" usage="${10:-null}"
+  local mode="$1" engine="$2" model="$3" effort="$4" hash="$5" round="$6" started="$7" rc="$8" error="${9:-}" usage="${10:-null}" scope="${11:-full}"
   local status="failed" round_json="null" ended
   [ "$rc" -eq 124 ] && status="timeout"
   [[ "$round" =~ ^[1-9][0-9]*$ ]] && round_json="$round"
   ended="$(date +%s)"
   append_metric "$(jq -cn --arg mode "$mode" --arg engine "$engine" --arg model "$model" \
     --arg effort "$effort" --arg hash "$hash" --arg repo "$(basename -- "$PWD")" \
-    --argjson round "$round_json" --argjson ts "$ended" --argjson extra "$(run_extra_json "$status" "$started" "$ended" "$error" "$usage")" \
+    --argjson round "$round_json" --argjson ts "$ended" --argjson extra "$(run_extra_json "$status" "$started" "$ended" "$error" "$usage" "$scope")" \
     '{type:"run", ts:$ts, mode:$mode, engine:$engine, model:$model, effort:$effort,
       round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo} + $extra' 2>/dev/null)"
 }
@@ -817,7 +829,7 @@ publish_report() {
 # it's actually true, so a real Codex problem is never mistaken for a setup
 # problem or vice versa.
 cmd_run() {
-  local mode="" prompt_file="" hash="" artifact_file="" engine="codex"
+  local mode="" prompt_file="" hash="" artifact_file="" engine="codex" scope="full"
   while [ $# -gt 0 ]; do
     case "$1" in
       --mode) mode="${2:-}"; shift 2 ;;
@@ -825,6 +837,7 @@ cmd_run() {
       --hash) hash="${2:-}"; shift 2 ;;
       --out) artifact_file="${2:-}"; shift 2 ;;
       --engine) engine="${2:-}"; shift 2 ;;
+      --scope) scope="${2:-}"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -835,18 +848,28 @@ cmd_run() {
     codex|claude) : ;;
     *) echo "crosscheck --run: unknown --engine '$engine' (want codex|claude)" >&2; return 2 ;;
   esac
+  case "$scope" in
+    full|delta) : ;;
+    *) echo "crosscheck --run: unknown --scope '$scope' (want full|delta)" >&2; return 2 ;;
+  esac
 
   if [ -z "$mode" ] || [ -z "$prompt_file" ] || [ ! -s "$prompt_file" ]; then
     echo "crosscheck --run: --mode and a non-empty --prompt-file are required" >&2
     return 2
   fi
 
-  local instructions
+  local instructions marker
   case "$mode" in
-    research) instructions="$research_instructions" ;;
-    plan-review) instructions="$plan_review_instructions" ;;
+    research) instructions="$research_instructions"; marker="The request to research:" ;;
+    plan-review) instructions="$plan_review_instructions"; marker="Original request and proposed plan follow:" ;;
     *) echo "crosscheck --run: unknown --mode '$mode' (want research|plan-review)" >&2; return 2 ;;
   esac
+  # Everything inserted goes above the marker sentence: below it the auditor
+  # treats text as data. `%` cuts at the last marker, the one closing the template.
+  local instructions_head inserted="$kind_instructions"$'\n\n'
+  [ "$scope" = "delta" ] && inserted="$inserted$delta_instructions"$'\n\n'
+  instructions_head="${instructions%"$marker"*}"
+  instructions="$instructions_head$inserted${instructions#"$instructions_head"}"
 
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --run: jq not found on PATH" >&2; return 1; }
   command -v "$engine" >/dev/null 2>&1 || { echo "crosscheck --run: $engine not found on PATH" >&2; return 1; }
@@ -867,11 +890,18 @@ cmd_run() {
     return 1
   fi
 
-  # The skill writes `ROUND: N` as the first prompt line (plan-review only).
-  # Anything else (research prompts, odd values) leaves the round unrecorded.
+  # A scoped round is anchored on the changes; without them it would review
+  # nothing in particular, so it never reaches an engine.
+  if [ "$scope" = "delta" ] && ! printf '%s\n' "$prompt_body" | grep -q '^CHANGES SINCE LAST ROUND:'; then
+    echo "crosscheck --run: --scope delta needs a prompt line starting with 'CHANGES SINCE LAST ROUND:'" >&2
+    return 2
+  fi
+
+  # The skill writes `ROUND: N` as the first prompt line; Doer writes
+  # `ROUND: N. Audit ...`. Anything else leaves the round unrecorded.
   local round="" first_line
   first_line="$(printf '%s' "$prompt_body" | head -n 1)"
-  local round_pattern='^ROUND: ([1-9][0-9]*)$'
+  local round_pattern='^ROUND: ([1-9][0-9]*)([^0-9]|$)'
   [[ "$first_line" =~ $round_pattern ]] && round="${BASH_REMATCH[1]}"
 
   # Setup: the log directory backs STDERR_LOG_FILE, which run_codex redirects
@@ -945,7 +975,7 @@ cmd_run() {
       failed_result="$(claude_result_json "$json_file")"
       failed_message="$(printf '%s' "$failed_result" | jq -r '.result // empty' 2>/dev/null)"
       record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" \
-        "${failed_message:-claude -p exited $rc}" "$([ -n "$failed_result" ] && claude_usage_json "$failed_result" || printf null)"
+        "${failed_message:-claude -p exited $rc}" "$([ -n "$failed_result" ] && claude_usage_json "$failed_result" || printf null)" "$scope"
       return 1
     fi
     local claude_result claude_output claude_usage="null" claude_is_error
@@ -957,7 +987,7 @@ cmd_run() {
       if [ "$claude_is_error" = "true" ]; then
         log "run ($mode) engine=claude reported an error result"
         echo "crosscheck --run: claude reported an error: $(printf '%s' "$claude_output" | head -c 300). See $STDERR_LOG_FILE." >&2
-        record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage"
+        record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage" "$scope"
         return 1
       fi
     else
@@ -966,15 +996,15 @@ cmd_run() {
     if [ -z "$claude_output" ]; then
       log "run ($mode) engine=claude produced empty output"
       echo "crosscheck --run: claude produced no output. See $STDERR_LOG_FILE." >&2
-      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage"
+      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage" "$scope"
       return 1
     fi
     publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" \
-      "$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage")"
+      "$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage" "$scope")"
     rc=$?
     # The engine ran (and was billed) but the report could not be published:
     # still a failed run in the metrics.
-    [ $rc -eq 0 ] || record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$claude_usage"
+    [ $rc -eq 0 ] || record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$claude_usage" "$scope"
     return $rc
   fi
 
@@ -989,7 +1019,7 @@ cmd_run() {
     codex_error="$(codex_stream_error "$json_file")"
     log "run ($mode) failed rc=$rc auth=$(auth_status) error=${codex_error:-none}"
     echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)).${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
-    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" "${codex_error:-codex exec exited $rc}" "$(codex_usage_json "$json_file")"
+    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" "${codex_error:-codex exec exited $rc}" "$(codex_usage_json "$json_file")" "$scope"
     return 1
   fi
 
@@ -1001,7 +1031,7 @@ cmd_run() {
     codex_error="$(codex_stream_error "$json_file")"
     log "run ($mode) produced empty output error=${codex_error:-none}"
     echo "crosscheck --run: codex produced no output.${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
-    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "${codex_error:-empty output}" "$(codex_usage_json "$json_file")"
+    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "${codex_error:-empty output}" "$(codex_usage_json "$json_file")" "$scope"
     return 1
   fi
 
@@ -1010,9 +1040,9 @@ cmd_run() {
   # replaced with a symlink since the first check. publish_report repeats the
   # check on its own, which is fine, it's cheap.
   publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort" \
-    "$(run_extra_json success "$run_started" "$run_ended" "" "$(codex_usage_json "$json_file")")"
+    "$(run_extra_json success "$run_started" "$run_ended" "" "$(codex_usage_json "$json_file")" "$scope")"
   rc=$?
-  [ $rc -eq 0 ] || record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$(codex_usage_json "$json_file")"
+  [ $rc -eq 0 ] || record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$(codex_usage_json "$json_file")" "$scope"
   return $rc
 }
 
@@ -1245,13 +1275,14 @@ critical_accepted() {
 # and which engines actually reported. Fails closed (exit 2, nothing written)
 # on any invalid argument. ---
 cmd_metrics_findings() {
-  local hash="" round="" engines="" finding severity source counts finding_status finding_reason
+  local hash="" round="" engines="" scope="full" finding severity source counts finding_status finding_reason
   local -a findings=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --round) round="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --engines) engines="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --scope) scope="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --finding) findings+=("${2:-}"); shift $(( $# >= 2 ? 2 : 1 )) ;;
       *) shift ;;
     esac
@@ -1262,6 +1293,10 @@ cmd_metrics_findings() {
   case "$engines" in
     codex|claude|both) : ;;
     *) echo "crosscheck --metrics-findings: --engines must be one of: codex claude both" >&2; return 2 ;;
+  esac
+  case "$scope" in
+    full|delta) : ;;
+    *) echo "crosscheck --metrics-findings: --scope must be one of: full delta" >&2; return 2 ;;
   esac
 
   # A single-engine round can only have findings from that engine: `ambos`
@@ -1331,11 +1366,74 @@ cmd_metrics_findings() {
   fi
 
   mkdir -p "$STATE_ROOT" 2>/dev/null
-  append_metric "$(jq -cn --arg hash "$hash" --arg engines "$engines" --arg repo "$(basename -- "$PWD")" \
+  append_metric "$(jq -cn --arg hash "$hash" --arg engines "$engines" --arg scope "$scope" --arg repo "$(basename -- "$PWD")" \
     --argjson round "$round" --argjson ts "$(date +%s)" --argjson counts "$counts" --argjson outcomes "$outcomes" \
-    '{type:"findings", ts:$ts, hash:$hash, round:$round, engines:$engines, repo:$repo, counts:$counts, outcomes:$outcomes}')"
-  log "metrics findings round=$round engines=$engines hash=$hash"
+    '{type:"findings", ts:$ts, hash:$hash, round:$round, engines:$engines, scope:$scope, repo:$repo, counts:$counts, outcomes:$outcomes}')"
+  log "metrics findings round=$round engines=$engines scope=$scope hash=$hash"
   return 0
+}
+
+# --- `--next-round`: what follows a relayed round, so the skill never picks
+# the next step, engine or scope by judgment. Reads the config, writes nothing.
+# --round = completed audit rounds including the relayed one; --scoped-streak =
+# consecutive scoped rounds ending with it. Prints {"next","launch","reason"},
+# where each launch entry is the engine part of one `--run`. ---
+cmd_next_round() {
+  local round="" streak="0" item severity kind item_status
+  local -a items=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --round) round="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --scoped-streak) streak="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --item) items+=("${2:-}"); shift $(( $# >= 2 ? 2 : 1 )) ;;
+      *) echo "crosscheck --next-round: unknown argument '$1'" >&2; return 2 ;;
+    esac
+  done
+  [[ "$round" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --next-round: --round is required and must be a positive integer" >&2; return 2; }
+  [[ "$streak" =~ ^[0-9]+$ ]] || { echo "crosscheck --next-round: --scoped-streak must be a non-negative integer" >&2; return 2; }
+
+  local item_pattern='^(CRITICAL|HIGH|MEDIUM|LOW):(change|process|unknown):(incorporated|rejected|not-applicable)$'
+  local needs_full=0 process_incorporated=0
+  if [ ${#items[@]} -gt 0 ]; then
+    for item in "${items[@]}"; do
+      [[ "$item" =~ $item_pattern ]] || { echo "crosscheck --next-round: invalid --item '$item' (want SEV:KIND:STATUS)" >&2; return 2; }
+      IFS=: read -r severity kind item_status <<<"$item"
+      # A missing Kind counts as change, and a CRITICAL is never process.
+      if [ "$severity" = "CRITICAL" ] || { [ "$severity" = "HIGH" ] && [ "$kind" != "process" ]; }; then
+        needs_full=1
+      elif [ "$severity" = "HIGH" ] && [ "$item_status" = "incorporated" ]; then
+        process_incorporated=1
+      fi
+    done
+  fi
+
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --next-round: jq not found on PATH" >&2; return 1; }
+  local resolved_config configured_engine
+  resolved_config="$(resolve_config)" || {
+    echo "crosscheck --next-round: $CONFIG_FILE is corrupt or invalid. Run /crosscheck-setup to fix it." >&2
+    return 1
+  }
+  configured_engine="$(printf '%s' "$resolved_config" | jq -r '.engine')"
+
+  local next reason
+  if [ "$needs_full" -eq 1 ]; then
+    next="full"; reason="a CRITICAL, or a HIGH whose kind is change or unknown, was relayed"
+  elif [ "$process_incorporated" -eq 1 ] && [ "$round" -lt 2 ]; then
+    next="full"; reason="incorporated process HIGHs on the first completed round: no scoped round yet"
+  elif [ "$process_incorporated" -eq 1 ] && [ "$streak" -eq 0 ]; then
+    next="scoped"; reason="every HIGH is an incorporated process finding after an earlier full round"
+  elif [ "$process_incorporated" -eq 1 ]; then
+    next="show"; reason="the scoped round just relayed found only process HIGHs"
+  else
+    next="show"; reason="no CRITICAL and no HIGH left to verify (none, or only rejected or not-applicable process ones)"
+  fi
+  jq -cn --arg next "$next" --arg engine "$configured_engine" --arg reason "$reason" '
+    (if $engine == "both" then ["codex", "claude"] else [$engine] end) as $engines
+    | {next: $next,
+       launch: (if $next == "full" then $engines | map("--engine " + .)
+                elif $next == "scoped" then ["--engine " + (if $engine == "claude" then "claude" else "codex" end) + " --scope delta"]
+                else [] end),
+       reason: $reason}'
 }
 
 # The round's findings are recorded by the model (only it sees the merged
@@ -1407,6 +1505,12 @@ def averages: . as $group
 def engine_model_of($runs; $hash; $round; $engine): ([$runs[] | select(.hash == $hash and .round == $round and .engine == $engine) | .model] | first // "") | if . == "" then "?" else . end;
 
 map(if .type == "findings" then normalize_outcomes else . end)
+# Scoped rounds look at less and run one engine, so they get their own block and
+# stay out of every table below; lines without a scope are full rounds.
+| (map(select((.type == "run" or .type == "findings") and .scope == "delta"))) as $delta_lines
+| ($delta_lines | map(select(.type == "run"))) as $delta_runs
+| ($delta_lines | map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $delta_rounds
+| map(select(.scope != "delta"))
 | (map(select(.type == "run"))) as $all_runs
 | ($all_runs | map(select(.mode == "plan-review" and (.model // "") != ""))) as $audit_runs
 | ($audit_runs | map(select((.status // "success") == "success"))) as $runs
@@ -1448,7 +1552,12 @@ map(if .type == "findings" then normalize_outcomes else . end)
       | "  codex \($pair[0]) + claude \($pair[1]) (\(length) rondas):",
         (["codex", "claude", "ambos"][] as $source
           | [$rows[] | select(.source == $source)] as $mine
-          | "    \(if $source == "ambos" then "ambos" else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))"))
+          | "    \(if $source == "ambos" then "ambos" else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))")),
+    "Rondas acotadas (delta): \($delta_rounds | length)",
+    ($delta_runs | group_by([.engine, .model]) | .[]
+      | (map(select((.status // "success") == "success"))) as $succeeded
+      | "  \(.[0].engine) \(.[0].model): \($succeeded | length) corridas, \(length - ($succeeded | length)) fallidas\($succeeded | averages)"),
+    ($delta_rounds | count_rows as $rows | "  hallazgos: \(severity_line($rows)) (critical+high: \(critical_high($rows)))")
   ] | .[]
 '
 
@@ -3163,6 +3272,11 @@ case "${1:-}" in
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
     shift
     cmd_metrics_findings "$@"
+    exit $?
+    ;;
+  --next-round)
+    shift
+    cmd_next_round "$@"
     exit $?
     ;;
   --stats)

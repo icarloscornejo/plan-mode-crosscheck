@@ -253,8 +253,8 @@ without that answer); then call `ExitPlanMode` again.
 ## Relaying a round's findings
 
 Applies to every `plan-review` run, round 1 and every round after it. (Entry
-point B, `/crosscheck`'s `research` mode, does not use this format; see its
-own section below.)
+point B, `/crosscheck`'s `research` mode, does not use this format except for
+a plan audit round; see its own section below.)
 
 Post the findings as plain chat text, one numbered block per finding,
 **strictly in descending severity order: CRITICAL, HIGH, MEDIUM, LOW.** Within
@@ -266,10 +266,25 @@ For each finding:
 
 ```
 N. [SEVERITY] one-line title
+Kind: change|process
 Evidence: <file/line the auditor cited>
 Required correction: <what the auditor said to fix>
 Status: incorporated (<exactly what you changed in the plan>) | rejected: <why> | not applicable: <why>
 ```
+
+**The Kind line is the auditor's, not yours.** `--run` asks every engine to
+label each finding `Kind: change` (a defect in what the plan delivers: code,
+stage text, logic, tests of that behavior, data contract) or `Kind: process`
+(only how the work is run, measured, approved or worded). A stale,
+contradictory or wrong description of what will be built (design steps, test
+specs, data contract, expected values) is `change`, wherever it sits. Copy the
+label from the report. You may raise a finding to `change` (say why in the
+relay), but never lower one to `process`: the label decides whether the next
+round is a full one. A finding with no Kind line or an unrecognized value is
+relayed as `Kind: unknown` (it counts as change); when two engines disagree on
+a merged finding it is `change`; a CRITICAL is never `process`. A rejected
+change HIGH is relayed as "rejected change finding, your decision": the user,
+not you, decides to show the plan anyway.
 
 Do this even if there are many findings and even if severity is low. Never
 substitute this with a count or a trend ("findings went from 12 down to 5"):
@@ -300,9 +315,13 @@ and produce a single deduplicated list in the same format and order.
 never `research`), run one foreground `Bash` call:
 
 ```
-crosscheck --metrics-findings --hash <hash> --round N --engines <codex|claude|both> \
+crosscheck --metrics-findings --hash <hash> --round N --engines <codex|claude|both> --scope <full|delta> \
   --finding HIGH:codex:incorporated --finding MEDIUM:ambos:rejected:out of scope ...
 ```
+
+`--scope` is `delta` when the round just relayed was a scoped round (its
+`--run` carried `--scope delta`), `full` otherwise; `--stats` keeps scoped
+rounds in their own block.
 
 One `--finding SEVERITY:SOURCE:STATUS[:reason]` per finding of the list you
 just relayed (the deduplicated one), with the severity you relayed. `STATUS` is
@@ -324,32 +343,83 @@ the audit.
 ## Recommending: one more round, or show the plan
 
 Runs once per round, immediately after "Relaying a round's findings" above,
-and before calling `ExitPlanMode` again. Skip it only when the plan text did
-not change (nothing was incorporated), since then there's no new hash and no
-pending decision to make.
+and before calling `ExitPlanMode` again. When the round relayed any CRITICAL
+or HIGH, run it even when nothing was incorporated (same plan text, same
+hash) and state the answer; skip it only when nothing was incorporated and no
+CRITICAL or HIGH came up.
 
-Before saying anything, reread this round's findings against every prior
-round on this same plan-mode task (the same `PRIOR ROUNDS` summary you
-already assemble for the prompt in step 3.b: severity, title, and whether
-each was incorporated or rejected). This is your own judgment call, not
-something the auditor does for you.
+**The next step comes from the command, not from your judgment.** Run one
+foreground `Bash` call:
 
-State an explicit recommendation, in the same message as the findings, right
-after the list: either **"I recommend one more round"** or **"I recommend
-showing the plan now"**, followed by reasons that cite findings by number or
-title, never by count. Decision rules:
+```
+crosscheck --next-round --round <completed> --scoped-streak <S> \
+  --item HIGH:process:incorporated --item MEDIUM:change:rejected ...
+```
 
-- This round incorporated a new CRITICAL or HIGH: recommend one more round.
-  Nobody has reviewed that change yet.
-- Only MEDIUM/LOW came up, all incorporated as small, scoped edits, or
-  nothing material came up at all: recommend showing the plan.
-- This round mostly repeated findings already rejected in an earlier round
-  with no new evidence behind them: that weighs toward showing the plan, not
-  continuing.
+- One `--item SEV:KIND:STATUS` per finding of the deduplicated relay: the
+  severity you relayed, the `Kind:` line (`change`, `process`, or `unknown`
+  when the auditor gave none) and the same status as the `Status:` line
+  (`incorporated`, `rejected` or `not-applicable`). No reason field: this is
+  not the `--metrics-findings` layout.
+- `--round` is the number of completed audit rounds on this request,
+  including the one just relayed. An attempt that failed in every engine does
+  not count, unlike `N` in the prompt, which counts attempts.
+- `--scoped-streak S` is the number of consecutive scoped rounds that end with
+  the round just relayed, including the round just relayed: 0 after a full
+  round, previous + 1 after each scoped round (so 1 right after the first
+  scoped round). Keep it yourself, like `N`.
+
+It prints one JSON line `{"next":"full|scoped|show","launch":[...],"reason":"..."}`
+and writes nothing. State it in chat right after the list: `full` -> **"I
+recommend one more round"**, `scoped` -> **"I recommend one scoped round
+with codex"** (or with claude when claude is the only configured engine),
+`show` -> **"I recommend showing the plan now"**, with the reason and the
+findings that drive it, cited by number or title, never by count.
+
+Each entry of `launch` is the engine part of one `--run` call (for example
+`--engine codex` or `--engine codex --scope delta`). When the user picks that
+round, every entry is launched verbatim as one backgrounded `--run`, with
+`--mode`, `--prompt-file` and (Entry A only) `--hash` added by you; several
+entries go in the same message, like `both` in A.3.c. Never pick the engine or
+the scope yourself. The scoped round uses the same prompt file shape
+(`ROUND`, `ORIGINAL REQUEST`, `PROPOSED PLAN`, `PRIOR ROUNDS`, `CHANGES SINCE
+LAST ROUND`), so in Entry A it is `crosscheck --run --engine codex --scope
+delta --mode plan-review --prompt-file "$pf" --hash <hash>`. `--run --scope
+delta` exits 2 without a line starting with `CHANGES SINCE LAST ROUND:`.
+
+Only two of the old rules still apply, and only in one direction each:
+
 - The auditor's closing `Coverage:` line lists every part it examined. A part
   of the plan that changed this round and does not appear there was not
-  reviewed: that weighs toward one more round. A part that appears with no
-  finding counts as reviewed.
+  reviewed: that raises the answer to `full`, never lowers it.
+- A `full` answer driven only by non-CRITICAL, non-change findings that
+  repeat findings already rejected in an earlier round, with no new evidence,
+  may be lowered to `show`; say so in the relay. Nothing else lowers the
+  answer.
+
+**Decision step after `--next-round`**, no improvisation:
+
+- (a) Entry A, plan edited (new hash): the usual denial question below, with
+  the recommended option first.
+- (a') Entry A, nothing incorporated (same hash, already `reviewed`, so the
+  hook would allow `ExitPlanMode` at once): when the answer is `full` or
+  `scoped`, ask BEFORE calling `ExitPlanMode`, with `AskUserQuestion`,
+  "another round on the same plan" or "show the plan", recommended option
+  first; on "Otra ronda" run that round on the same hash.
+- (b) Entry B (no hash, no `ExitPlanMode`): ask the same two-option question
+  with `AskUserQuestion` and launch nothing without the user's "Otra ronda".
+- (c) Overrides: when the answer is `show` and the user still says "Otra
+  ronda", launch the `full` set for the configured engine(s), one `--run` per
+  configured engine (`--engine codex`, `--engine claude`, or both). When the
+  answer is `scoped`, the question also offers "a full round" as a third
+  option, which launches that same full set.
+
+**Failures.** If `--next-round` exits nonzero or prints empty or invalid
+output, treat the answer as `full` with the engines as configured and say
+"next-round unavailable, recommending a full round". When a scoped run fails
+(it is a single engine), tell the user why and offer a full round; the
+"only one engine failed" and "every engine failed" branches of A.3.f describe
+multi-engine rounds and do not apply to it.
 
 There is no round limit: the user decides when to stop, and never gets an
 extra round without saying "Otra ronda".
@@ -412,6 +482,19 @@ first.
    with that same structure, merging the two reports and marking where the
    engines disagreed.
 
+   **Exception, a plan audit round:** when the request carries a `ROUND:`
+   line and `PRIOR ROUNDS` (the shape Doer sends) and the reports carry
+   severities, relay it in the "Relaying a round's findings" format
+   (findings by severity, `Kind:` line included; severity from the auditor,
+   status from what you did with each finding), then run the same
+   `--next-round` call with the same streak (see "Recommending"), following
+   decision step (b). A scoped round there is `crosscheck --run --engine
+   codex --mode research --scope delta --prompt-file "$pf"` (the entry
+   `launch` gives, plus `--mode research --prompt-file`, still no `--hash`),
+   and the prompt needs a line starting with `CHANGES SINCE LAST ROUND:`. A
+   plan round whose reports carry no severities is not a plan-audit round:
+   keep the behavior above, no `--next-round`.
+
 3. **On failure:** if one engine failed in `both`, use the other and say which
    failed. If every engine failed, report the failure and why, and stop: there
    is no hash, so no `--skip` and no `ExitPlanMode`.
@@ -427,7 +510,9 @@ first.
   interactively, `/crosscheck-setup`.
 - There is no round cap. Round counting (`N`) is entirely on this skill's
   side: it goes in the `ROUND: N` prompt line, task descriptions, `PRIOR
-  ROUNDS` and `--metrics-findings --round N`; no other command takes it.
+  ROUNDS` and `--metrics-findings --round N`. `--next-round --round` takes
+  the completed audit rounds instead, and `--scoped-streak` is kept the same
+  way; neither is stored anywhere.
 - `crosscheck --metrics-findings` records a plan-review round's findings as
   counts (never text) in `metrics.jsonl`, and `crosscheck --stats [FILE...]`
   prints the totals. `--run` already logs each report's engine, model and
