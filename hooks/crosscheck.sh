@@ -2797,6 +2797,196 @@ run_selftest() {
   check "stats: acceptance per engine and model (codex gpt-a 3 of 4)" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 3 incorporados, 1 rechazados, 0 sin estado (aceptacion 75%)$')" "1"
   check "stats: an ambos finding counts for both engines" "$(printf '%s' "$out" | grep -c '^  claude opus-x: 1 incorporados, 0 rechazados, 0 sin estado (aceptacion 100%)$')" "1"
 
+  # 42. `--next-round`: a pure recommendation from the relayed findings and the
+  #     configured engine. Every call carries its own </dev/null: an undispatched
+  #     flag falls into the hook's stdin read and would otherwise block.
+  local next_root="$tmp_home/next-root" next_engine next_out next_rc
+  for next_engine in both codex claude; do
+    CROSSCHECK_STATE_DIR="$next_root/$next_engine" "$run" --config set --engine "$next_engine" --codex-model gpt-a \
+      --claude-model opus-x --codex-effort medium --claude-effort medium >/dev/null 2>&1 </dev/null
+  done
+  # Prints `[next, launch]` as compact JSON. $1 = config (both|codex|claude).
+  next_round() {
+    local config="$1"; shift
+    CROSSCHECK_STATE_DIR="$next_root/$config" "$run" --next-round "$@" </dev/null 2>/dev/null | jq -c '[.next, .launch]' 2>/dev/null
+  }
+  local full_both='["full",["--engine codex","--engine claude"]]' scoped_codex='["scoped",["--engine codex --scope delta"]]' show_none='["show",[]]'
+  check "next-round: round 1 with an incorporated process HIGH is full" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated)" "$full_both"
+  check "next-round: an incorporated CRITICAL is full" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
+  check "next-round: a change HIGH is full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" "$full_both"
+  check "next-round: a rejected change HIGH is still full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:rejected)" "$full_both"
+  check "next-round: process and change HIGHs mixed is full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:change:incorporated)" "$full_both"
+  check "next-round: a HIGH with kind unknown counts as change (full)" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:unknown:incorporated)" "$full_both"
+  check "next-round: config both, round 2, incorporated process HIGH, streak 0 is scoped with codex only" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: config codex gives the same scoped codex launch" "$(next_round codex --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: config claude scopes the claude engine" "$(next_round claude --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine claude --scope delta"]]'
+  for next_engine in both codex claude; do
+    check "next-round: config $next_engine, streak 1 (the scoped round just relayed) is show" "$(next_round "$next_engine" --round 3 --scoped-streak 1 --item HIGH:process:incorporated)" "$show_none"
+  done
+  check "next-round: a process-only round after a full round (streak 0) is scoped again" "$(next_round both --round 3 --scoped-streak 0 --item HIGH:process:incorporated --item MEDIUM:change:incorporated)" "$scoped_codex"
+  check "next-round: full launch for config codex is codex alone" "$(next_round codex --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine codex"]]'
+  check "next-round: full launch for config claude is claude alone" "$(next_round claude --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine claude"]]'
+  check "next-round: a rejected process HIGH is show" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:rejected)" "$show_none"
+  check "next-round: a not-applicable process HIGH is show" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:not-applicable)" "$show_none"
+  check "next-round: MEDIUM only is show" "$(next_round both --round 2 --scoped-streak 0 --item MEDIUM:change:incorporated)" "$show_none"
+  check "next-round: no items is show" "$(next_round both --round 2 --scoped-streak 0)" "$show_none"
+  check "next-round: the answer carries a reason" "$(CROSSCHECK_STATE_DIR="$next_root/both" "$run" --next-round --round 2 --scoped-streak 0 --item HIGH:change:incorporated </dev/null 2>/dev/null | jq -r '.reason | type == "string" and length > 0' 2>/dev/null)" "true"
+  check "next-round: answers and writes no metrics line" "$(next_round both --round 2 --item LOW:change:incorporated)/$([ -e "$next_root/both/metrics.jsonl" ] && echo written || echo none)" "$show_none/none"
+  #     A first completed round after an attempt that failed in every engine is
+  #     still round 1 (the skill passes completed rounds), so it is full.
+  check "next-round: the first completed round after an all-engines-failed attempt is full" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:process:incorporated)" "$full_both"
+  check "next-round: the second completed round with the same findings is scoped" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:process:incorporated)" "$scoped_codex"
+  next_round_bad() {
+    local desc="$1" want_rc="$2" config="$3"; shift 3
+    next_out="$(CROSSCHECK_STATE_DIR="$next_root/$config" "$run" --next-round "$@" </dev/null 2>/dev/null)"
+    next_rc=$?
+    check "next-round rejects $desc (exit $want_rc, no stdout)" "$next_rc/$next_out" "$want_rc/"
+  }
+  next_round_bad "a metrics-findings style 4-field item" 2 both --round 2 --item HIGH:codex:incorporated:x
+  next_round_bad "a bad severity" 2 both --round 2 --item BOGUS:process:incorporated
+  next_round_bad "a bad kind token" 2 both --round 2 --item HIGH:wording:incorporated
+  next_round_bad "a bad status" 2 both --round 2 --item HIGH:process:maybe
+  next_round_bad "a missing round" 2 both --scoped-streak 0 --item HIGH:process:incorporated
+  next_round_bad "a non-numeric round" 2 both --round x --item HIGH:process:incorporated
+  next_round_bad "a non-numeric streak" 2 both --round 2 --scoped-streak x --item HIGH:process:incorporated
+  next_round_bad "an unknown token" 2 both --round 2 --bogus
+  mkdir -p "$next_root/corrupt"
+  printf 'not valid json at all' >"$next_root/corrupt/config.json"
+  next_round_bad "a corrupt config.json" 1 corrupt --round 2 --scoped-streak 0 --item HIGH:process:incorporated
+
+  # 43. Scope in the metrics: `--metrics-findings --scope`, and `--stats` keeps
+  #     delta rounds apart so the per-engine tables stay full-round only.
+  local scope_metrics_root="$tmp_home/scope-metrics-root" scope_lines_before
+  mkdir -p "$scope_metrics_root"
+  CROSSCHECK_STATE_DIR="$scope_metrics_root" "$run" --metrics-findings --hash d0d0 --round 2 --engines codex --scope delta --finding HIGH:codex:incorporated >/dev/null 2>&1
+  check "metrics-findings: --scope delta is stored in the findings line" "$(jq -r '.scope' "$scope_metrics_root/metrics.jsonl" 2>/dev/null | tail -1)" "delta"
+  CROSSCHECK_STATE_DIR="$scope_metrics_root" "$run" --metrics-findings --hash d0d1 --round 1 --engines codex --finding HIGH:codex:incorporated >/dev/null 2>&1
+  check "metrics-findings: the scope defaults to full" "$(jq -r '.scope' "$scope_metrics_root/metrics.jsonl" 2>/dev/null | tail -1)" "full"
+  scope_lines_before="$(wc -l <"$scope_metrics_root/metrics.jsonl" 2>/dev/null | tr -d ' ')"
+  CROSSCHECK_STATE_DIR="$scope_metrics_root" "$run" --metrics-findings --hash d0d2 --round 1 --engines codex --scope partial >/dev/null 2>&1
+  check "metrics-findings rejects an unknown --scope (exit 2, nothing written)" "$?/$(wc -l <"$scope_metrics_root/metrics.jsonl" 2>/dev/null | tr -d ' ')" "2/$scope_lines_before"
+  local scope_stats="$tmp_home/scope-stats.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"f1","repo":"r","status":"success","duration_s":100,"scope":"full"}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"f1","repo":"r","status":"success","duration_s":100,"cost_usd":1,"scope":"full"}'
+    echo '{"type":"findings","ts":2,"hash":"f1","round":1,"engines":"both","scope":"full","repo":"r","counts":{"codex":{"HIGH":2}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null},{"severity":"HIGH","source":"codex","status":"rejected","reason":"wrong"}]}'
+    echo '{"type":"run","ts":3,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":2,"hash":"d1","repo":"r","status":"success","duration_s":40,"scope":"delta"}'
+    echo '{"type":"findings","ts":4,"hash":"d1","round":2,"engines":"codex","scope":"delta","repo":"r","counts":{"codex":{"HIGH":1}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null}]}'
+  } >"$scope_stats"
+  out="$("$run" --stats "$scope_stats")"
+  # The indented lines under a header, up to the next unindented line, so a
+  # delta block placed anywhere cannot leak into the section being checked.
+  stats_section() { printf '%s\n' "$1" | awk -v header="$2" 'f && !/^  / {f=0} index($0, header) == 1 {f=1; next} f'; }
+  check "stats: delta rounds get their own block" "$(printf '%s' "$out" | grep -c '^Rondas acotadas (delta)')" "1"
+  check "stats: the delta block lists the delta round and its codex run" "$(stats_section "$out" "Rondas acotadas (delta)" | grep -q codex && echo yes || echo no)" "yes"
+  check "stats: the audits table counts full rounds only" "$(stats_section "$out" "Auditorias por motor y modelo:" | grep -c '^  codex gpt-a: 1 (duracion media 100s)$')" "1"
+  check "stats: acceptance is computed over full rounds only" "$(stats_section "$out" "Aceptacion de hallazgos por motor y modelo" | grep -c '^  codex gpt-a: 1 incorporados, 1 rechazados, 0 sin estado (aceptacion 50%)$')" "1"
+  check "stats: a delta codex round of a both config is not a single-engine round" "$(stats_section "$out" "Rondas de un solo motor" | grep -c '^  codex: CRITICAL 0, HIGH 0, MEDIUM 0, LOW 0 (critical+high: 0)$')" "1"
+
+  # 44. `--run --scope delta`, both engines and both modes: the Kind sentence
+  #     (every run) and the delta block (delta only) sit ABOVE the mode's marker
+  #     sentence, so the auditor reads them as instructions, never as data.
+  local scope_root="$tmp_home/scope-root" scope_prompt="$tmp_home/scope-prompt.md" doer_prompt="$tmp_home/doer-prompt.md" noprefix_prompt="$tmp_home/noprefix-prompt.md"
+  local scope_engine scope_mode scope_marker scope_copy delta_at kind_at marker_at body_at scope_rc
+  mkdir -p "$scope_root"
+  CROSSCHECK_STATE_DIR="$scope_root" "$run" --config set --engine both --codex-model gpt-a --claude-model opus-x --codex-effort medium --claude-effort medium >/dev/null 2>&1
+  printf 'ROUND: 2\n\nORIGINAL REQUEST:\nscopebody request\n\nPROPOSED PLAN:\nscopebody plan\n\nPRIOR ROUNDS:\nround 1: HIGH process, incorporated\n\nCHANGES SINCE LAST ROUND:\nreworded the test step\n' >"$scope_prompt"
+  printf 'ROUND: 3. Audit x\n\nscopebody doer\n\nCHANGES SINCE LAST ROUND: only "Revision 2" changed\n' >"$doer_prompt"
+  printf 'ROUND: 2\n\nscopebody plan\n\nsee CHANGES SINCE LAST ROUND: none listed\n' >"$noprefix_prompt"
+  # $1 engine, $2 mode, $3 prompt, rest extra --run args; the engine's stdin
+  # ends up in its capture file, truncated first.
+  scope_run() {
+    local engine="$1" mode="$2" prompt="$3"; shift 3
+    : >"$capture_stdin"; : >"$claude_stdin"
+    HOME="$tmp_home" CROSSCHECK_STATE_DIR="$scope_root" PATH="$claude_stub:$stub_bin:$PATH" "$run" --run --engine "$engine" --mode "$mode" --prompt-file "$prompt" "$@" >/dev/null 2>&1 </dev/null
+  }
+  scope_stdin_of() { if [ "$1" = claude ]; then printf '%s' "$claude_stdin"; else printf '%s' "$capture_stdin"; fi; }
+  # Offset of $2 in file $1 with whitespace runs collapsed (a wrapped
+  # instruction line still matches); 0 when absent.
+  flat_pos() { tr -s '[:space:]' ' ' <"$1" | awk -v needle="$2" '{print index($0, needle)} END {if (NR == 0) print 0}'; }
+  flat_text() { tr -s '[:space:]' ' ' <"$1" | awk '{print}' | tr -s ' '; }
+  # The delta stdin with the scoped block cut out, or the block alone.
+  without_delta() { tr -s '[:space:]' ' ' <"$1" | awk -v start="SCOPED ROUND." -v stop="Coverage line) applies unchanged." '{i = index($0, start); j = index($0, stop); if (i == 0 || j < i) print "no scoped block"; else print substr($0, 1, i - 1) substr($0, j + length(stop))}' | tr -s ' '; }
+  delta_block() { tr -s '[:space:]' ' ' <"$1" | awk -v start="SCOPED ROUND." -v stop="Coverage line) applies unchanged." '{i = index($0, start); j = index($0, stop); if (i > 0 && j > i) print substr($0, i, j + length(stop) - i)}'; }
+  local kind_needle="add to each one a line 'Kind: change'"
+  for scope_engine in codex claude; do
+    for scope_mode in plan-review research; do
+      if [ "$scope_mode" = research ]; then scope_marker="The request to research: ---"; else scope_marker="Original request and proposed plan follow: ---"; fi
+      scope_copy="$tmp_home/scope-stdin-$scope_engine-$scope_mode"
+      scope_run "$scope_engine" "$scope_mode" "$scope_prompt" --scope delta
+      cp "$(scope_stdin_of "$scope_engine")" "$scope_copy-delta"
+      check "scope delta ($scope_engine, $scope_mode): the run line records scope delta" "$(jq -r '.scope' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "delta"
+      delta_at="$(flat_pos "$scope_copy-delta" "SCOPED ROUND.")"; kind_at="$(flat_pos "$scope_copy-delta" "$kind_needle")"
+      marker_at="$(flat_pos "$scope_copy-delta" "$scope_marker")"; body_at="$(flat_pos "$scope_copy-delta" "scopebody")"
+      check "scope delta ($scope_engine, $scope_mode): delta and Kind text above the marker, the request below it" \
+        "$([ "${delta_at:-0}" -gt 0 ] && [ "${kind_at:-0}" -gt 0 ] && [ "$delta_at" -lt "${marker_at:-0}" ] && [ "$kind_at" -lt "${marker_at:-0}" ] && [ "${marker_at:-0}" -lt "${body_at:-0}" ] && echo yes || echo "no:$delta_at/$kind_at/$marker_at/$body_at")" "yes"
+      scope_run "$scope_engine" "$scope_mode" "$scope_prompt"
+      cp "$(scope_stdin_of "$scope_engine")" "$scope_copy-default"
+      check "scope default ($scope_engine, $scope_mode): the run line records scope full" "$(jq -r '.scope' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "full"
+      kind_at="$(flat_pos "$scope_copy-default" "$kind_needle")"; marker_at="$(flat_pos "$scope_copy-default" "$scope_marker")"
+      check "scope default ($scope_engine, $scope_mode): the Kind sentence is present above the marker" "$([ "${kind_at:-0}" -gt 0 ] && [ "$kind_at" -lt "${marker_at:-0}" ] && echo yes || echo "no:$kind_at/$marker_at")" "yes"
+      scope_run "$scope_engine" "$scope_mode" "$scope_prompt" --scope full
+      cp "$(scope_stdin_of "$scope_engine")" "$scope_copy-full"
+      check "scope full ($scope_engine, $scope_mode): stdin equals the default run" "$(cmp -s "$scope_copy-full" "$scope_copy-default" && echo same || echo differs)" "same"
+      check "scope delta ($scope_engine, $scope_mode): the delta block is the only difference from the default run" "$(without_delta "$scope_copy-delta")" "$(flat_text "$scope_copy-default")"
+    done
+  done
+  local scope_block
+  scope_block="$(delta_block "$tmp_home/scope-stdin-codex-plan-review-delta")"
+  check "delta text reports changes anywhere, INCLUDING unchanged text" "$(printf '%s' "$scope_block" | grep -c -F 'INCLUDING unchanged text')" "1"
+  check "delta text carries the stale-spec clause" "$(printf '%s' "$scope_block" | grep -c -F 'counts under (c) even when the changes did not cause it')" "1"
+  check "delta text has no files-touched limit and does not exclude wording generally" "$([ -n "$scope_block" ] && ! printf '%s' "$scope_block" | grep -q -i -e 'files those edits touch' -e 'wording' && echo yes || echo no)" "yes"
+  check "Kind sentence names the process label" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-plan-review-default" "or 'Kind: process' when it is only about how the work is run")" -gt 0 ] && echo yes || echo no)" "yes"
+  check "Kind sentence defines a stale description of what will be built as change" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-plan-review-default" "A stale, contradictory or wrong DESCRIPTION of what will be built")" -gt 0 ] && echo yes || echo no)" "yes"
+  check "Kind sentence ends with when in doubt, change" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-research-default" "When in doubt, change.")" -gt 0 ] && echo yes || echo no)" "yes"
+  #     Doer's one-line CHANGES form and its `ROUND: 3. Audit ...` first line.
+  scope_run codex research "$doer_prompt" --scope delta
+  scope_rc=$?
+  check "scope delta: a Doer-shaped one-line CHANGES prompt passes and records round 3" "$scope_rc $(jq -r '"\(.round) \(.scope)"' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "0 3 delta"
+  scope_run codex research "$doer_prompt"
+  check "a first line ROUND: 3. Audit x records round 3" "$(jq -r '"\(.round) \(.scope)"' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "3 full"
+  for scope_engine in codex claude; do
+    scope_run "$scope_engine" plan-review "$noprefix_prompt" --scope delta
+    scope_rc=$?
+    check "scope delta ($scope_engine): no line starting with CHANGES SINCE LAST ROUND exits 2, engine never invoked" "$scope_rc/$([ -s "$(scope_stdin_of "$scope_engine")" ] && echo invoked || echo none)" "2/none"
+  done
+  scope_run codex plan-review "$scope_prompt" --scope partial
+  scope_rc=$?
+  check "an unknown --scope exits 2 and invokes nothing" "$scope_rc/$([ -s "$capture_stdin" ] && echo invoked || echo none)" "2/none"
+  #     Failed and timed-out delta runs keep their scope, at every reachable
+  #     record_failed_run call site.
+  scope_fail_run() {
+    local stub_dir="$1" engine="$2"; shift 2
+    HOME="$tmp_home" CROSSCHECK_STATE_DIR="$scope_root" PATH="$stub_dir:$PATH" "$run" --run --engine "$engine" --mode plan-review --prompt-file "$scope_prompt" --scope delta "$@" >/dev/null 2>&1 </dev/null
+    jq -r '"\(.status) \(.scope)"' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1
+  }
+  check "scope delta: a failing codex leaves a failed line with scope delta" "$(scope_fail_run "$fail_stub" codex)" "failed delta"
+  check "scope delta: a timed-out codex leaves a timeout line with scope delta" "$(scope_fail_run "$usage_stub/codextimeout" codex)" "timeout delta"
+  check "scope delta: a nonzero claude exit leaves a failed line with scope delta" "$(scope_fail_run "$claude_fail" claude)" "failed delta"
+  check "scope delta: a claude error result leaves a failed line with scope delta" "$(scope_fail_run "$usage_stub/claudeerror" claude)" "failed delta"
+  check "scope delta: empty claude output leaves a failed line with scope delta" "$(scope_fail_run "$claude_empty" claude)" "failed delta"
+  if [ "$(id -u)" != "0" ]; then
+    mkdir -p "$scope_root/state"
+    chmod 500 "$scope_root/state"
+    check "scope delta: a claude publish failure leaves a failed line with scope delta" "$(scope_fail_run "$claude_stub" claude --hash 5c09ef01)" "failed delta"
+    chmod 700 "$scope_root/state"
+  else
+    echo "  skip  delta publish-failure run line (running as root ignores directory permissions)"
+  fi
+
+  # 45. SKILL.md carries every decision the model needs, as literal text. A
+  #     model executes it, so this only guards that the text exists.
+  local skill_md phrase
+  skill_md="$(dirname "$run")/../skills/crosscheck/SKILL.md"
+  check "SKILL.md is found next to the hook" "$([ -r "$skill_md" ] && echo yes || echo no)" "yes"
+  for phrase in "--next-round" "--item SEV:KIND:STATUS" "--scoped-streak" "including the round just relayed" "launched verbatim" \
+    "--engine codex --scope delta" "--mode research --scope delta" "even when nothing was incorporated" "(a')" "(b)" "(c)" \
+    "stale, contradictory or wrong description of what will be built" "completed audit rounds" \
+    "next-round unavailable, recommending a full round" "scoped run fails" "never lower" "Kind: change|process"; do
+    check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -i -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "SKILL.md passes --scope to --metrics-findings" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -E -- '--metrics-findings.{0,200}--scope' && echo yes || echo no)" "yes"
+
   rm -rf "$tmp_home"
   echo
   if [ "$failures" -eq 0 ]; then
