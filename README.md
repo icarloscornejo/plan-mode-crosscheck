@@ -1,480 +1,153 @@
-# Plan Mode Crosscheck
+<h1 align="center">Plan Mode Crosscheck</h1>
 
-**Get an independent second opinion on a finished Plan Mode plan, or on
-whatever's being discussed right now, from [Codex CLI](https://github.com/openai/codex)
-(the default), from a Claude model such as Fable, from Gemini through the
-Antigravity CLI (`agy`), or from all three at once, in parallel.**
+<p align="center"><b>A second opinion before you say yes.</b></p>
 
-Today that is three engines (Claude, Codex and Gemini) running side by side,
-each in its own process with its own model, and Claude merges their reports
-into one list. If one engine fails (out of quota, not signed in, timed out),
-the others carry on: you get the reports that came back and a note saying
-which engine failed and why. Nothing in the design stops at three: the engine list is a
-plain comma list, so more engines (more models, more CLIs) can join in future
-versions without changing how you use it.
+<p align="center">
+  Claude finishes a plan. Other models tear it apart. You see the plan after.
+</p>
 
-Two ways to trigger it:
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.10.0-0071e3">
+  <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=anthropic&logoColor=white">
+  <img alt="Engines" src="https://img.shields.io/badge/engines-Claude%20%7C%20Codex%20%7C%20Gemini-1d1d1f">
+  <img alt="Read-only" src="https://img.shields.io/badge/auditors-read--only-5FA04E">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-lightgrey">
+</p>
 
-- **Automatic, on `ExitPlanMode`.** When Claude finishes a plan and tries to
-  show it to you, this plugin denies that call once and asks Claude to check
-  with you first: do you want an independent audit of this plan before
-  you see it? Say yes and Claude runs the audit, reconciles anything it finds,
-  and shows you the plan. Say no and it shows you the plan as-is.
-- **Manual, `/crosscheck`, any time.** Ask for a second opinion mid-conversation
-  on whatever's currently being discussed, no plan required.
+Plan Mode Crosscheck is a Claude Code plugin. When Claude finishes a plan, it
+asks you one question: audit it first? Say yes, and Claude, Codex and Gemini
+review the plan against your real repo, all at the same time. Claude merges
+what they found into one list, fixes the plan, and only then shows it to you.
 
-Both routes run the audit in the background, so you keep working (or
-reading) while it runs.
+```mermaid
+flowchart LR
+  P[Claude finishes a plan] --> Q{Audit it first?}
+  Q -- no --> S[You see the plan]
+  Q -- yes --> C[Claude]
+  Q -- yes --> X[Codex]
+  Q -- yes --> G[Gemini]
+  C --> M[One merged list]
+  X --> M
+  G --> M
+  M --> F[Claude fixes the plan] --> S
+```
 
-## Engines and setup
+## Three opinions. One plan.
 
-Type `/crosscheck-setup` once to pick who audits, and again whenever a new
-model version ships:
+**Different models, different blind spots.** Each engine runs in its own
+process with its own model and a fresh context. None of them sees how Claude
+reasoned its way to the plan, so they catch what it didn't think to mention.
 
-| Engine | What runs | Notes |
-|---|---|---|
-| `claude` | A nested, read-only `claude -p --safe-mode` (`fable` by default; any alias or full model ID such as `claude-fable-5-1`) at the effort you pick | Launched by `crosscheck --run --engine claude`. |
-| `codex` (default) | `codex exec`, read-only sandbox, separate process | Default model `gpt-6-astra`; `gpt-5.6-sol` is the alternative. |
-| `gemini` | The Antigravity CLI (`agy`) in read-only `--mode plan --sandbox` (default model `gemini-4-argon`, alternative `gemini-3.8-flash`) at the effort you pick | Launched by `crosscheck --run --engine gemini`. See the `agy` notes under [Prerequisites](#prerequisites). |
-| several | Any combination of the above in parallel: `/crosscheck-setup` asks "Which engines?" as a multi-select; saved as a comma list (`claude,codex,gemini`), or the legacy `both` (Claude and Codex) | Claude reads every report and keeps one deduplicated list, each finding labeled `claude:<model>`, `codex`, `gemini:<model>`, a `+` combination such as `claude+gemini`, or `ambos` (Claude and Codex). |
+**In parallel, not in line.** All three run at the same time, in the
+background. Three reviews take as long as the slowest one, and you keep
+working while they run.
 
-Engines are always listed in the order Claude, Codex, Gemini. Out of the box
-nothing changes: Codex `gpt-6-astra` only.
+**One engine down? The rest carry on.** Out of quota, not signed in, timed
+out: you get the reports that did come back, and a note saying which engine
+failed and why. If every engine fails, you still get your plan. You're never
+stuck waiting on a broken tool.
 
-**Models are typed, not listed.** `/crosscheck-setup` offers a few shortcuts
-(full IDs such as `claude-fable-5-1`, so each one pins a version) but "Other"
-takes any exact model ID, for Claude, Codex and Gemini, so a new model needs no
-plugin update. A Claude alias (`fable`, `opus`) typed there means whatever
-version Claude Code maps it to today (for example
-`ANTHROPIC_DEFAULT_OPUS_MODEL`); a full ID pins the version.
+**Three today, more tomorrow.** The engine list is a plain list, not three
+hardcoded slots. Today that's Claude, Codex and Gemini; more models and more
+CLIs can join in future versions without changing how you use it.
 
-**The Claude engine is not isolated like Codex.** Codex runs under a
-read-only sandbox. The Claude engine is a separate `claude -p` process with
-`--safe-mode` (no CLAUDE.md, skills, plugins, hooks or MCP servers, so no
-recursion into this plugin) and `--tools Read,Grep,Glob` (no Bash, Edit or
-Write), a fresh context and your normal Claude login. It is read-only by tool
-restriction, not by an OS sandbox. It needs the `claude` CLI on `PATH`.
+**Any model, no plugin update.** Pick a model from the shortcuts or type any
+exact model ID. When a new model ships, you just pick it.
 
-## Why this shape, not "research the whole time in the background"
+## Two ways to use it
 
-Earlier versions of this plugin launched Codex the instant Plan Mode started
-and fed it whatever your most recent chat message happened to be, on the
-theory that running in parallel with Claude's own exploration was worth more
-than waiting. In practice that meant Codex was as likely to receive a bare
-"go ahead" or "sounds good" as an actual task description, and it would
-confidently investigate the wrong thing. A finished plan does not have that
-problem: it is, by construction, a complete, self-contained description of
-what's being built. Trading the parallelism for a research target that's
-actually worth researching turned out to be a better deal.
+**Automatic.** Every time Claude tries to leave Plan Mode, the plugin stops it
+once and asks you whether to audit. Yes runs the audit; no shows the plan as
+is. If the plan changes, you're asked again: an approval never carries over to
+a plan that's since been edited.
 
-## Prerequisites
+**On demand.** Type `/crosscheck` any time to get a second opinion on whatever
+you're discussing right now. No plan needed.
 
-- [Codex CLI](https://github.com/openai/codex) installed and on your `PATH`,
-  logged in with a ChatGPT account (`codex login status` should print
-  `Logged in using ChatGPT`). Only required if your engines include `codex`.
-- The Claude CLI (`claude`) on your `PATH` if your engines include `claude`.
-- The Antigravity CLI (`agy`), only if your engines include `gemini`:
-  install the CLI, run `agy` once interactively and sign in with the Google AI
-  Pro account, then check with `agy models` (it lists the model ids). Notes:
-  - Over ssh `agy` can fail with "authentication required" even when you are
-    logged in, because its credentials live in the macOS keychain. Run it in a
-    local session, or in a tmux started from the GUI. That case is reported as
-    a failed run with `agy`'s own message.
-  - The plugin calls it read-only (`--mode plan --sandbox`). `agy` has no stdin
-    mode for the prompt, so the task goes through a `0600` file the run
-    deletes afterwards, and the task ends with a read-proof line that the reply
-    must open with: a reply that does not echo it is a failed run, not a
-    review.
-  - **The Gemini engine is not isolated like `claude -p --safe-mode`.** `agy`
-    (1.5.6) has no flag to turn off MCP servers, extensions, hooks or
-    workspace rule files, so those load as they would in your own `agy`
-    session. The plugin uses every restriction that exists (`--mode plan
-    --sandbox --disable-slash-commands`).
-  - Failures (not signed in, quota, unknown model, timeout, empty answer) are
-    reported with their reason, never as an empty review.
-- `jq` installed (used for all JSON parsing).
-- A `timeout` command on your `PATH`, GNU coreutils' `timeout` or its
-  `gtimeout` alias. Stock macOS ships neither; `brew install coreutils` gets
-  you `gtimeout`, which `hooks/crosscheck.sh` falls back to automatically.
+After each round you see every finding, one by one, most severe first, with a
+recommendation: one more round, or show the plan. Nothing loops on its own:
+another round always waits for your answer.
 
-If any of these isn't true, `/crosscheck` and the plan-review flow will tell
-you so directly, a failed tool result, not a silent no-op. See
-[Failure handling](#failure-handling) below.
-
-## Install
+## Get started
 
 ```bash
 claude plugin marketplace add https://github.com/icarloscornejo/plan-mode-crosscheck.git
 claude plugin install plan-mode-crosscheck@plan-mode-crosscheck
 ```
 
-That's it: the hook and the `crosscheck` skill register automatically once the
-plugin is enabled, no manual edits to `settings.json`.
+Then, inside Claude Code:
 
-## How it actually works
+```
+/crosscheck-setup
+```
 
-One hook, two skills.
+Pick your engines, a model and an effort for each, and you're done. Run it
+again whenever a new model ships. Out of the box, before setup, only Codex
+audits.
 
-**Skipping needs your answer.** `crosscheck --skip --hash H` (and
-`--accept-critical`, which lets an unedited plan with CRITICAL findings
-through) only works after you answered the matching `AskUserQuestion`: a
-`PostToolUse` hook on that tool records your answer as a one-use token for that
-plan hash. If that hook ever fails, type it yourself in the prompt:
-`! crosscheck --skip --hash H --manual` (logged as manual). This stops the
-model from skipping on its own; it is not a sandbox, both run as your user.
+## Engines
 
-**Hook** (`hooks/crosscheck.sh`, `PreToolUse` on `ExitPlanMode`): pure bash and
-`jq`, no audit call. It hashes the plan text (`tool_input.plan`) and checks a
-small state file for that hash:
-
-- No decision on record yet: mark it `pending`, **deny** the `ExitPlanMode`
-  call with a reason telling Claude to ask you and invoke the `crosscheck`
-  skill.
-- Already `reviewed` or `skipped` for this exact plan text: **allow**.
-
-Because the hook never runs an audit itself, it returns in a fraction of a
-second every time. There's nothing to wait on.
-
-**Skill** (`skills/crosscheck/SKILL.md`, invoked by Claude after the deny, or
-by you via `/crosscheck`): assembles the actual request (the plan plus the
-original task, or whatever's live in the conversation for a manual
-`/crosscheck`), runs the engine in the background via the `Bash` tool, waits
-for the result, and relays the findings to you in its own words rather than
-dumping the raw report. On the plan-review path, a successful run marks that
-plan's hash `reviewed`, which is what lets the next `ExitPlanMode` call
-through. With the Claude engine, the skill itself makes the `Agent` call
-(a shell script cannot) and the script only does the mechanical halves:
-`crosscheck --prepare` assembles the task and `crosscheck --record` publishes
-the report, so the `ExitPlanMode` gate sees the same `reviewed` state whatever
-the engine. It invokes the CLI as a bare `crosscheck` command rather than a
-full path: this plugin ships a thin wrapper at `bin/crosscheck`, and Claude
-Code adds an enabled plugin's own `bin/` directory to `PATH`, so the skill
-never has to know (or guess wrong, across installs and updates) where the
-plugin actually lives on disk.
-
-**Setup skill** (`skills/crosscheck-setup/SKILL.md`, `/crosscheck-setup`):
-asks for engine and models and saves them with `crosscheck --config set`.
-
-If the plan changes after being reviewed or skipped, its hash changes too, and
-the whole cycle starts over for the new text. You can't silently carry a stale
-approval forward onto a plan that's since been edited.
-
-## Multiple rounds
-
-If a finding changes the plan text, that's a new hash, and the cycle
-above runs again on it: the hook denies `ExitPlanMode` again, and Claude asks
-again whether to audit. That's not a bug, it's the same one-hash-one-decision
-gate applying to the plan's new text. Round 2, round 3, and so on are all
-independent audits with no memory of earlier rounds; there's no state
-that numbers them against each other or remembers what an earlier round found
-(each round's prompt carries a `PRIOR ROUNDS` summary instead, assembled by
-the skill).
-
-Because each round is independent, the `crosscheck` skill is instructed to
-post every finding from the round that just finished as plain chat text, one
-at a time, ordered by severity, **before** asking whether to run another
-round or stop, never as a bare count or trend. A shrinking finding count
-doesn't tell you whether it's safe to stop; the actual findings do. Right
-after the findings, the skill states an explicit recommendation, one more
-round or show the plan, with reasons that weigh this round's findings against
-what earlier rounds already found, incorporated, or rejected, and only then
-asks you to decide, with the recommended option listed first.
-
-**There is no round cap.** Version 3.2.0 capped rounds at 3 so each one would
-be as valuable as possible, but a cap only cuts rounds off; it does not make
-any of them find more. 3.3.0 removes it and goes after the cause instead, so
-that every round is written as if it were the only one:
-
-- The auditor is told this is the only review the plan will get, and sweeps
-  every path the plan adds or changes against every existing mechanism those
-  paths touch (state, permissions, counters, error handling, cleanup, gates),
-  checking sibling paths for the same defect. The old "at most 8 findings"
-  limit is gone; "do not pad" stays, so nothing is reported just to have a
-  finding.
-- The sweep stays tied to what the request and the conversation require, plus
-  what the plan changes and what depends on it. It is not a survey of the
-  project.
-- Fixes cover every instance of a defect, not only the one cited, and from
-  round 2 on the prompt carries `CHANGES SINCE LAST ROUND`, which the auditor
-  reviews as unreviewed text.
-- Each report ends with a `Coverage:` line listing what was examined, so "found
-  nothing" can be told apart from "did not look".
-
-Nothing loops on its own: every extra round still needs your explicit "Otra
-ronda", with the skill's recommendation in front of you.
-
-### Scoped rounds (3.9.0)
-
-There is still no round cap and no limit that scales with the size of the
-change. A size-based limit would be the 3.2.0 cap again, and the 3.3.0
-reasoning still holds: a cap only cuts rounds, it does not make any of them
-find more. Size does not predict rounds anyway: in two measured tickets the
-small change took 6 and 8 rounds, because after the first rounds every HIGH was
-about how the work is run, measured or approved (each fix creating the next
-one), not about the change itself.
-
-What 3.9.0 adds is a cheaper next step for exactly that case. Each auditor now
-labels every finding `Kind: change` (a defect in what the plan delivers,
-including a stale or contradictory description of what will be built) or
-`Kind: process` (how the work is run, measured, approved or worded); in doubt,
-change. The labels are the auditors', never the orchestrator's, which can only
-raise a finding to `change`. `crosscheck --next-round --round N
-[--scoped-streak S] --item SEV:KIND:STATUS ...` is a pure function (it writes
-nothing) that turns the round's findings into `full`, `scoped` or `show` plus
-the exact `--run` arguments to launch:
-
-- any CRITICAL, or any HIGH that is `change` or has no valid Kind (rejected or
-  not): `full`, the usual round with the configured engines.
-- only incorporated `process` HIGHs after an earlier completed round: `scoped`,
-  one round with one engine (Codex when configured) launched with
-  `--run --scope delta`. The prompt anchors on `CHANGES SINCE LAST ROUND` but
-  still asks for any defect in what the request delivers, anywhere, including
-  unchanged text.
-- a `process`-only round right after a scoped one, no HIGH at all, or only
-  rejected `process` findings: `show` (a recommendation; "Otra ronda" still
-  gives a full round).
-
-The skill must call the command and follow its answer, ask you before every
-round as before, and offer a full round if a scoped run fails.
-
-What the measurements showed, stated plainly (replay of one saved ticket,
-Codex gpt-6-luna high, 9 full against 9 scoped rounds on the same input, plus
-the recorded rounds of two tickets):
-
-- A scoped round is not cheaper per round: mean Codex input was 164,716 tokens
-  scoped against 164,961 full (output and time were about 10% lower, within the
-  spread). The saving comes from not running the Claude auditor in
-  process-only rounds and from running fewer rounds. Projected on the two
-  recorded tickets with their measured costs: about 4.5 USD of 7.2 (auditors
-  plus orchestrator rounds) for the first and about 5.1 USD of 16.6 for the
-  second, a projection, not a re-run.
-- Scoped rounds lose process findings by design: the three process defects of
-  the replay were seen almost only by full rounds.
-- One CHANGE defect (a weak assertion on the real rate table) was seen by a
-  full run and never by a scoped one (1 of 9 against 0 of 9).
-- 4 of 9 scoped rounds reported nothing at all, against 0 of 9 full.
-- The acceptance criteria were changed during the work by decision of Carlos:
-  the first one (reproduce four specific defects with one run) was failed by a
-  full-round control too, so it measured auditor chance. The replacement
-  primary criterion (change defects present in 6 of 9 full runs must be present
-  in 6 of 9 scoped) was empty twice; the verdict rests on a secondary
-  criterion fixed beforehand (change defects present in 3 of 9 full runs, here
-  two, were present in 2 of 9 scoped each).
-- The real Stage 2 cost of a ticket under the new rule is still to be measured
-  on the first comparable ticket after release.
-
-Scoped rounds are in their own block of `--stats`, outside the per-engine
-tables and acceptance rates, which keep describing full rounds.
-
-## Failure handling
-
-If an engine isn't available (Codex not installed, not logged in, timed out,
-`agy` missing or not signed in, or the subagent returns nothing), the skill
-tells you which one failed and why (for Gemini, `agy`'s own message). With
-several engines, if some failed and at least one worked, it carries on with
-the ones that worked. An `agy` run that succeeds with an empty answer counts
-as failed, never as a clean review. If every configured
-engine fails, it marks that plan's hash `skipped` so you aren't stuck waiting
-on a broken tool, and continues. A corrupt `config.json` is handled the same
-way (`--skip` never reads the config) and is repaired by re-running
-`/crosscheck-setup`. You always find out; you're never blocked indefinitely.
-
-## Configuration
-
-Engine and models are saved by `/crosscheck-setup` in `config.json`, in the
-state root next to `logs/` and `state/` (it is never pruned). Precedence for
-the Codex model: `CROSSCHECK_MODEL` env var, then `config.json`, then the
-default. You can also manage it directly: `crosscheck --config get` and
-`crosscheck --config set --engine E --claude-model C --codex-model M
---claude-effort G --codex-effort F [--gemini-model N --gemini-effort H]` (the
-first five are required, the Gemini pair is optional and defaults to
-`gemini-4-argon` and `high`; it replaces the file whole, which also repairs a
-corrupt one). `E` is one engine, the legacy `both` (Claude and Codex), or a
-comma list of engines in any order (`claude,gemini`), saved in the order
-Claude, Codex, Gemini. Effort for Claude and Gemini is `low`,
-`medium`, `high`, `xhigh` or `max` and is saved as `claude_effort` and
-`gemini_effort`. Model IDs
-are opaque strings: they may not be empty, start with `-`, or contain
-whitespace or shell metacharacters. If you compose that command by hand,
-single-quote every value.
-
-The rest are optional environment variables, read by `hooks/crosscheck.sh --run`:
-
-| Variable | Default | Purpose |
+| Engine | Needs | Runs as |
 |---|---|---|
-| `CROSSCHECK_MODEL` | from `config.json`, else `gpt-6-astra` | Model passed to `codex exec -m`. Overrides the saved choice. |
-| `CROSSCHECK_EFFORT` | from `config.json`, else `medium` | `model_reasoning_effort` passed to Codex (`low`, `medium`, `high`, `xhigh`). Overrides the saved choice. See below for why `medium` is the default. |
-| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh`/`max` 1800 | Budget, in seconds, for each engine call (Claude, Codex or Gemini, by that engine's effort). Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if an engine is genuinely stuck. |
-| `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
+| **Claude** | The `claude` CLI | A separate `claude -p --safe-mode`, read-only tools only, fresh context |
+| **Codex** | [Codex CLI](https://github.com/openai/codex), signed in with ChatGPT | `codex exec` in a read-only sandbox |
+| **Gemini** | The Antigravity CLI (`agy`), signed in with Google AI Pro | `agy` in read-only plan mode with its sandbox |
 
-**About the default model:** `gpt-6-astra` is what the author uses day to day;
-it may not be available on every Codex CLI account or region. The previous
-default, `gpt-5.6-sol`, is a known-good fallback if ASTRA isn't available on
-yours. If Codex fails with the default and you don't know why, set
-`CROSSCHECK_MODEL` to whatever model your own `codex exec` normally uses.
+You only need the CLIs of the engines you pick. The plugin itself also needs
+`jq` and a `timeout` command (`brew install coreutils` on macOS gives you
+`gtimeout`, which the plugin finds on its own).
 
-**About the default effort:** `medium`, not `high`, unless you pick otherwise in
-`/crosscheck-setup`. Measured in practice,
-`high` reasoning effort took Codex up to roughly 11 minutes on some plan
-reviews. That's a real cost even with nothing else waiting on it, and one good
-result at `high` isn't evidence it's worth paying by default: set
-`CROSSCHECK_EFFORT=high` yourself if you want to try it for a specific review.
+**Gemini setup:** run `agy` once and sign in, then check with `agy models`.
+On macOS its login lives in the keychain, so over ssh it may say
+"authentication required": run it from a local session or a tmux started from
+the desktop.
 
-### Privacy of prompts, reports, and state
-
-Plan text, the original request, and Codex's findings can contain secrets or
-PII, so `hooks/crosscheck.sh` treats all of it as sensitive:
-
-- The prompt handed to `codex exec` travels over its stdin, never as a
-  process argument, so it isn't visible to `ps`, `/proc`, or other
-  same-user process inspection. `agy` has no stdin mode, so for Gemini the
-  assembled task is written to a `0600` file in a per-run `0700` directory
-  under `state/tmp`, and only a fixed sentence naming that file goes in
-  argv. The file is deleted when the run ends and any left over by a killed run
-  is pruned after 7 days. `agy`'s stderr goes to a per-run file that is
-  deleted with it, not to the persistent log (a failed run logs one capped
-  line of its error).
-- Everything the script creates under its own state directory (prompts,
-  reports, state files, logs) is created under a `umask 077` the script sets
-  for itself: new directories `0700`, new files `0600`. This only applies to
-  paths the plugin manages; a custom `CROSSCHECK_STATE_DIR` you point
-  elsewhere isn't recursively re-permissioned.
-- `--out` (used internally and by `--selftest`) is confined to resolve
-  strictly under the state root; this protects against an untrusted or
-  injected path value and against an ancestor directory being swapped out
-  during the long Codex call, not against a concurrent same-user attacker
-  winning the exact final rename.
-
-### Where logs and state live
-
-Resolved in this order:
-1. `CROSSCHECK_STATE_DIR`, if set.
-2. `$CLAUDE_CONFIG_DIR/plan-mode-crosscheck`, if `CLAUDE_CONFIG_DIR` is set
-   (this is how Claude Code multi-profile setups pick a config directory
-   other than `~/.claude`).
-3. `~/.claude/plan-mode-crosscheck`, otherwise.
-
-Inside that directory: `config.json`, `metrics.jsonl` (see Metrics below, never
-pruned), `logs/crosscheck.log` (structured, one line per run),
-`logs/crosscheck.stderr.log` (Codex's own stderr, timestamped and delimited
-per call), and `state/`, one small JSON file per plan hash (`pending`,
-`reviewed`, or `skipped`), a `reports/` subdirectory holding the full text of
-every Codex report (so a large one that doesn't fit inline in a tool result is
-never lost, just pointed at), and a `tmp/` subdirectory the skill uses to stage
-prompt files before a run. Everything under `state/` is pruned after 7 days.
-
-## Metrics
-
-Every audit leaves numbers behind in `metrics.jsonl`, next to `config.json`
-(never pruned, unlike `state/`): which engine and model ran, the round, and
-how many findings of each severity each engine (Claude, Codex, Gemini) found.
-With several engines it also records which findings only one engine found, or
-which engines found together (`claude`, `codex`, `gemini`, `claude+gemini`,
-`ambos` for Claude and Codex, ...). It stores
-counts and short labels only, never finding text, so it is safe to keep and
-share even when the plans were about private repos.
-
-```
-crosscheck --stats
-```
-
-prints the totals. To combine several instances, pass each one's file (with
-explicit paths it reads only those):
-
-```
-crosscheck --stats ~/.claude/plan-mode-crosscheck/metrics.jsonl \
-  ~/.claude-me/plan-mode-crosscheck/metrics.jsonl
-```
-
-Each run line also carries when it started and ended, how long it took, whether
-it succeeded, failed or timed out (with the engine's error), and the tokens it
-used (Codex from its event stream, Claude and Gemini from their JSON result,
-Claude with cost, Gemini with cost `null` because `agy` reports none).
-After each round the skill records what it did with every finding (incorporated,
-rejected with a short reason, or not applicable), and `--stats` shows the
-acceptance rate per engine and model. A finding with no reason stores `null`
-(older lines may hold `""`, read as the same thing). Successful research runs
-and legacy `--record` runs are listed in their own section, not in the audits
-table; failed or timed-out runs of any mode are counted in the failed section,
-apart from each other by mode. If a round's
-findings were never recorded, the next `ExitPlanMode` hook call notes it as
-unknown and `--stats` counts those rounds apart, so they never skew the rates.
-
-Counting starts the day you install this version, old reports are not parsed.
-
-## Kill switch
-
-Touch `<state dir>/state/DISABLED` to disable the hook entirely until you
-remove that file. No restart needed; it's checked on every hook invocation.
-This does not affect manual `/crosscheck`, which is a separate, unblocked path
-by design.
-
-## Verifying it works
-
-From a checkout of this repo:
-
-```bash
-./hooks/crosscheck.sh --selftest
-```
-
-Or, from inside a live Claude Code session with the plugin enabled, the bare
-`crosscheck` command works too (see [How it actually
-works](#how-it-actually-works)): `crosscheck --selftest`.
-
-Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
-`--run` in both modes against stubbed Claude, Codex and Gemini (`agy`) binaries,
-`--config`, `--prepare`, `--record`, `--skip`, argument
-validation, state-root resolution) with no real API calls and no ChatGPT or
-Google auth needed (a sentinel `agy` first on `PATH` fails the run if any test
-reaches the real one), finishes in a few seconds. This is the fastest way to confirm the
-plugin's own logic works after any change. It does not confirm that the Codex
-CLI or `agy` is installed and signed in, or that the skill behaves correctly
-inside an actual Claude Code session. For that, try both routes for real
-(`/crosscheck`, and a real Plan Mode session through to `ExitPlanMode`) and
-check `logs/crosscheck.log` (lines carry `engine=claude`, `engine=codex` or
-`engine=gemini`).
+**How read-only is read-only?** Codex runs in an OS sandbox. The Claude and
+Gemini engines are not isolated like Codex: Claude is read-only because it
+only gets `Read`, `Grep` and `Glob`, and `agy` still loads your own MCP
+servers, extensions and rule files, since it has no flag to turn them off.
+Details in [How it works](docs/how-it-works.md#how-isolated-each-engine-is).
 
 ## Troubleshooting
 
-**Deny reason never shows up on `ExitPlanMode`, or shows up but Claude never
-asks me anything.** Confirm the hook is registered: `claude plugin list`
-should show `plan-mode-crosscheck` enabled, and changes to `hooks/hooks.json`
-need `/reload-plugins` or a restart to take effect (unlike `SKILL.md`, which
-applies immediately).
+**Claude never asks me to audit.** Check that `claude plugin list` shows
+`plan-mode-crosscheck` enabled. After changing `hooks/hooks.json`, run
+`/reload-plugins` or restart.
 
-**`crosscheck --run: codex exec failed` in the log.** Check `auth=` on the
-same log line: `auth=NOT_LOGGED_IN` means `codex login status` needs
-attention; `auth=ok` with a timeout means Codex didn't finish within
-`CROSSCHECK_TIMEOUT`, raise it, or lower `CROSSCHECK_EFFORT` to `low` for a
-faster (if shallower) pass.
+**Codex failed.** Look at `auth=` on its line in `logs/crosscheck.log`.
+`NOT_LOGGED_IN` means `codex login status` needs attention. A timeout means it
+ran out of time: pick a lower effort or raise `CROSSCHECK_TIMEOUT`.
 
-**`crosscheck --run: agy failed` in the log.** The `reason=` on the same log
-line carries `agy`'s own message. "authentication required" means `agy` is not
-signed in for this session: run `agy` once interactively and check with
-`agy models`. Over ssh it can fail even when you are signed in, because its
-credentials live in the macOS keychain: run it from a local session, or a tmux
-started from the GUI. A timeout means Gemini didn't finish within
-`CROSSCHECK_TIMEOUT`: raise it, or pick a lower Gemini effort in
-`/crosscheck-setup`.
+**Gemini failed.** The `reason=` on its log line is `agy`'s own message.
+"authentication required" means signing in again, or not running it over ssh
+(see Gemini setup above). A timeout works like Codex's.
 
-**`ExitPlanMode` keeps getting denied no matter what I answer.** The hash is
-keyed to the exact plan text. If Claude revises the plan after you say yes but
-before the audit finishes, or between reviews, that's a new hash and a fresh
-decision is expected. If it's denying without ever asking you anything, Claude
-isn't following the deny reason's instructions: check whether the `crosscheck`
-skill is actually being invoked (visible as a background `Bash` task with a
-descriptive label) rather than skipped.
+**It keeps asking me to audit.** Each question is tied to the exact plan text.
+If the plan changed, it's a new plan and a new question. If it denies without
+ever asking, the `crosscheck` skill isn't being invoked: look for a background
+`Bash` task with a descriptive label.
 
-## How it's different from just asking Claude twice
+**I want it off for a while.** Create `state/DISABLED` in the plugin's state
+folder. `/crosscheck` keeps working. See
+[Configuration](docs/configuration.md#kill-switch).
 
-Codex and Gemini each run as a genuinely separate process, separate model,
-separate context window, with their own read-only view of the repo, and the
-Claude engine is a fresh `claude -p` with none of this conversation. None of
-them sees the planning session's reasoning, and the planning session doesn't
-see theirs until the skill relays it. Run all three in parallel and you get
-three independent takes in the time of the slowest one, merged into one list
-that marks where they agree. The plan-review prompt instructs every engine to
-derive the task's real requirements from the repository itself before judging
-the plan, rather than just checking the plan for internal consistency. The goal is catching what the
-plan didn't think to mention, not just whether the plan is coherent on its own
-terms.
+## Learn more
+
+- [How it works](docs/how-it-works.md): the hook and skills, failure handling,
+  review rounds, scoped rounds and their measurements, and why it audits the
+  finished plan.
+- [Configuration and reference](docs/configuration.md): saved config,
+  environment variables, where logs live, privacy, metrics, the kill switch
+  and the selftest.
+- [Changelog](CHANGELOG.md)
+
+## Your plans stay yours.
+
+Prompts never go in process arguments, everything the plugin writes is
+private to your user (`0600`), staged prompts are cleaned up (Gemini's right
+after its run, the rest within 7 days), and the metrics keep counts only, never
+what a finding said.
+
+---
+
+<p align="center"><sub>MIT licensed.</sub></p>
