@@ -449,6 +449,61 @@ run_claude() {
   return $rc
 }
 
+# Inserted above the marker for the gemini engine only. agy has no stdin mode,
+# so the task travels as a file whose last line is a nonce; echoing it back is
+# the proof the whole file was read. That line is the one exception to the
+# "only thing allowed" and "no descriptive sections" rules of the review text.
+gemini_read_check_instructions="The last line of the task file you were told to read is 'READ-CHECK: <value>'. When you reply, begin your reply with exactly that line, copied unchanged, then continue with your answer. That line is the one exception to every rule in these instructions about what a reply may contain (the 'only thing allowed besides findings' rule and the 'no descriptive sections' rule): it is not a finding and not a section."
+
+# agy's `--output-format json` usage, normalized to the repo contract
+# (`input_tokens` = ALL input, cached part included). agy counts cache reads
+# apart when its total is input + output + cache reads, or when the cache
+# reads are larger than the input (real runs: total = input + output with
+# 194,827 cache reads against 76,495 input, so they cannot be part of it), and
+# inside input otherwise. Thinking tokens are already inside
+# output_tokens. agy reports no cost. $1 = the result object; prints `null`
+# when it has no usage.
+gemini_usage_json() {
+  printf '%s' "$1" | jq -c '(.usage // null) as $usage | if $usage == null then null else
+      ($usage.input_tokens // 0) as $input | ($usage.output_tokens // 0) as $output | ($usage.cache_read_tokens // 0) as $cache
+      | {input_tokens: (if $cache > $input or ($cache > 0 and ($usage.total_tokens // null) == ($input + $output + $cache)) then $input + $cache else $input end),
+         output_tokens: $output, cached_tokens: $cache, cost_usd: null} end' 2>/dev/null || printf 'null'
+}
+
+# Gemini twin of run_claude, but the task cannot travel over stdin or argv:
+# `agy -p` needs a value and ignores stdin, and an argv entry shows up in `ps`.
+# So the task is a 0600 file in a per-run directory (cmd_run wrote it) and the
+# argv holds only a fixed sentence naming that file. $1 = task dir, $2 = task
+# path, $3 budget, $4 file for agy's stdout, $5 timeout binary, $6 model,
+# $7 effort. agy's stderr goes to $1/stderr.txt, never the persistent log (it
+# can echo task text). `</dev/null`: a backgrounded caller's open stdin pipe
+# must not hang agy. The outer `timeout -k 30` bounds the run even if agy
+# ignores SIGTERM; `--print-timeout` is set 30 s (or half) earlier so agy's own
+# timeout fires first and its JSON, with usage, is still readable. Returns the
+# exit code (124 on timeout, 137 after the kill).
+run_gemini() {
+  local task_dir="$1" task_path="$2" budget="$3" out_file="$4" timeout_bin="$5" model="$6" effort="$7" rc
+  local -a print_timeout_args=()
+  if [[ "$budget" =~ ^[0-9]+$ ]] && [ $((10#$budget)) -ge 2 ]; then
+    local print_timeout=$(( 10#$budget - 30 ))
+    [ "$print_timeout" -lt $(( 10#$budget / 2 )) ] && print_timeout=$(( 10#$budget / 2 ))
+    print_timeout_args=(--print-timeout "${print_timeout}s")
+  fi
+  "$timeout_bin" -k 30 "$budget" agy \
+    -p "Read the file $task_path and follow the instructions in it exactly. Reply with your final answer only." \
+    --model "$model" \
+    --effort "$effort" \
+    --mode plan \
+    --sandbox \
+    --add-dir "$task_dir" \
+    --disable-slash-commands \
+    ${print_timeout_args[@]+"${print_timeout_args[@]}"} \
+    --output-format json \
+    </dev/null >"$out_file" 2>"$task_dir/stderr.txt"
+  rc=$?
+  return $rc
+}
+
 # Confines $1 (a target file path, may not exist yet) to resolve strictly
 # under $STATE_ROOT, and rejects it if the final path component is itself a
 # symlink. `--out` is accepted verbatim by cmd_run and was, before this
@@ -580,21 +635,61 @@ record_user_answers() {
 # skill (`/crosscheck-setup`). ---
 #
 # Lives at $CONFIG_FILE, a sibling of logs/ and state/. Schema:
-# {"engine": "codex"|"claude"|"both", "codex_model": "<id>",
-# "claude_model": "<id>", "codex_effort": "low"|"medium"|"high"|"xhigh",
-# "claude_effort": "low"|"medium"|"high"|"xhigh"|"max"} (both efforts are
-# optional on read: a config saved before they existed resolves to "medium").
+# {"engine": one engine, "both" (claude+codex) or a comma list of engines,
+# "codex_model": "<id>", "claude_model": "<id>", "gemini_model": "<id>",
+# "codex_effort": "low"|"medium"|"high"|"xhigh",
+# "claude_effort"|"gemini_effort": "low"|"medium"|"high"|"xhigh"|"max"} (the
+# efforts and the gemini fields are optional on read: a config saved before
+# they existed resolves to "medium", and to gemini-4-argon / "high").
 # Models are opaque IDs, never an enum: new ones ship all the time and
 # `claude --model` / `codex -m` are the ones that know which exist. The claude
 # engine runs as a nested `claude -p` (see run_claude), not through the Agent
 # tool, precisely because Agent's `model` parameter only takes aliases.
-CONFIG_ENGINES="codex claude both"
 CONFIG_EFFORTS="low medium high xhigh"
 CONFIG_CLAUDE_EFFORTS="low medium high xhigh max"
+# The values `agy --effort` documents; which one a given model accepts is agy's call.
+CONFIG_GEMINI_EFFORTS="low medium high xhigh max"
+# Canonical order everywhere engines are listed, written or launched.
+ENGINE_ORDER="claude codex gemini"
+GEMINI_DEFAULT_MODEL="gemini-4-argon"
+GEMINI_DEFAULT_EFFORT="high"
 
-valid_engine() {
-  local e="$1" x
-  for x in $CONFIG_ENGINES; do [ "$x" = "$e" ] && return 0; done
+# Canonical engines of a config/metrics engine value, space separated: one
+# engine, the legacy `both` (claude codex), or a comma list in any order.
+# Returns 1 for anything else (unknown, empty or duplicated token, a stray
+# comma, `both` inside a list), printing nothing.
+engine_list() {
+  local value="$1" token seen=" " canonical="" engine
+  local -a tokens
+  if [ "$value" = "both" ]; then printf 'claude codex'; return 0; fi
+  # read -a drops a trailing empty field, so stray commas are rejected up front.
+  [[ "$value" =~ ^[a-z]+(,[a-z]+)*$ ]] || return 1
+  IFS=, read -r -a tokens <<<"$value"
+  for token in "${tokens[@]}"; do
+    case " $ENGINE_ORDER " in *" $token "*) : ;; *) return 1 ;; esac
+    case "$seen" in *" $token "*) return 1 ;; esac
+    seen="$seen$token "
+  done
+  for engine in $ENGINE_ORDER; do
+    case "$seen" in *" $engine "*) canonical="${canonical:+$canonical }$engine" ;; esac
+  done
+  printf '%s' "$canonical"
+}
+
+# The engine value as stored: `both` stays as typed, lists are comma joined in
+# canonical order.
+engine_normalized() {
+  local value="$1" list
+  [ "$value" = "both" ] && { printf 'both'; return 0; }
+  list="$(engine_list "$value")" || return 1
+  printf '%s' "${list// /,}"
+}
+
+valid_engine() { engine_list "$1" >/dev/null; }
+
+valid_gemini_effort() {
+  local f="$1" x
+  for x in $CONFIG_GEMINI_EFFORTS; do [ "$x" = "$f" ] && return 0; done
   return 1
 }
 
@@ -637,6 +732,7 @@ valid_model_id() {
 resolve_config() {
   local engine="codex" codex_model="gpt-6-astra" claude_model="fable" codex_effort="medium"
   local codex_effort_source="default" claude_effort="medium" claude_effort_source="default"
+  local gemini_model="$GEMINI_DEFAULT_MODEL" gemini_effort="$GEMINI_DEFAULT_EFFORT" gemini_effort_source="default"
   if [ -s "$CONFIG_FILE" ]; then
     local cfg
     cfg="$(cat "$CONFIG_FILE" 2>/dev/null)" || return 1
@@ -661,6 +757,19 @@ resolve_config() {
       claude_effort="$saved_claude_effort"
       claude_effort_source="config"
     fi
+    # Configs saved before the Gemini engine existed have neither field.
+    local saved_gemini_model saved_gemini_effort
+    saved_gemini_model="$(printf '%s' "$cfg" | jq -r '.gemini_model // empty' 2>/dev/null)"
+    if [ -n "$saved_gemini_model" ]; then
+      valid_model_id "$saved_gemini_model" || return 1
+      gemini_model="$saved_gemini_model"
+    fi
+    saved_gemini_effort="$(printf '%s' "$cfg" | jq -r '.gemini_effort // empty' 2>/dev/null)"
+    if [ -n "$saved_gemini_effort" ]; then
+      valid_gemini_effort "$saved_gemini_effort" || return 1
+      gemini_effort="$saved_gemini_effort"
+      gemini_effort_source="config"
+    fi
   fi
   if [ -n "${CROSSCHECK_EFFORT:-}" ]; then
     # Not validated against CONFIG_EFFORTS: as before config.json existed, the
@@ -674,11 +783,15 @@ resolve_config() {
     codex_model="$CROSSCHECK_MODEL"
     codex_model_source="env"
   fi
-  jq -n --arg engine "$engine" --arg codex_model "$codex_model" \
+  jq -n --arg engine "$engine" --arg engines "$(engine_list "$engine")" --arg codex_model "$codex_model" \
     --arg claude_model "$claude_model" --arg codex_model_source "$codex_model_source" \
     --arg codex_effort "$codex_effort" --arg codex_effort_source "$codex_effort_source" \
     --arg claude_effort "$claude_effort" --arg claude_effort_source "$claude_effort_source" \
-    '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort, claude_effort:$claude_effort, codex_model_source:$codex_model_source, codex_effort_source:$codex_effort_source, claude_effort_source:$claude_effort_source}'
+    --arg gemini_model "$gemini_model" --arg gemini_effort "$gemini_effort" --arg gemini_effort_source "$gemini_effort_source" \
+    '{engine:$engine, engines:($engines | split(" ")), claude_model:$claude_model, codex_model:$codex_model, gemini_model:$gemini_model,
+      claude_effort:$claude_effort, codex_effort:$codex_effort, gemini_effort:$gemini_effort,
+      codex_model_source:$codex_model_source, claude_effort_source:$claude_effort_source,
+      codex_effort_source:$codex_effort_source, gemini_effort_source:$gemini_effort_source}'
 }
 
 # --- `--config get|set`: read or persist the engine/model choice ---
@@ -694,6 +807,7 @@ cmd_config() {
       ;;
     set)
       local engine="" codex_model="" claude_model="" codex_effort="" claude_effort=""
+      local gemini_model="$GEMINI_DEFAULT_MODEL" gemini_effort="$GEMINI_DEFAULT_EFFORT"
       while [ $# -gt 0 ]; do
         case "$1" in
           --engine) engine="${2:-}"; shift 2 ;;
@@ -701,14 +815,19 @@ cmd_config() {
           --claude-model) claude_model="${2:-}"; shift 2 ;;
           --codex-effort) codex_effort="${2:-}"; shift 2 ;;
           --claude-effort) claude_effort="${2:-}"; shift 2 ;;
+          --gemini-model) gemini_model="${2:-}"; shift 2 ;;
+          --gemini-effort) gemini_effort="${2:-}"; shift 2 ;;
           *) shift ;;
         esac
       done
       if [ -z "$engine" ] || [ -z "$codex_model" ] || [ -z "$claude_model" ] || [ -z "$codex_effort" ] || [ -z "$claude_effort" ]; then
-        echo "crosscheck --config set: --engine, --codex-model, --claude-model, --codex-effort, and --claude-effort are all required" >&2
+        echo "crosscheck --config set: --engine, --claude-model, --codex-model, --claude-effort, and --codex-effort are all required (--gemini-model and --gemini-effort are optional)" >&2
         return 2
       fi
-      valid_engine "$engine" || { echo "crosscheck --config set: --engine must be one of: $CONFIG_ENGINES" >&2; return 2; }
+      valid_engine "$engine" || { echo "crosscheck --config set: --engine must be claude, codex, gemini, both (claude+codex), or a comma list of those engines (e.g. claude,codex,gemini)" >&2; return 2; }
+      engine="$(engine_normalized "$engine")"
+      valid_model_id "$gemini_model" || { echo "crosscheck --config set: --gemini-model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
+      valid_gemini_effort "$gemini_effort" || { echo "crosscheck --config set: --gemini-effort must be one of: $CONFIG_GEMINI_EFFORTS" >&2; return 2; }
       valid_model_id "$claude_model" || { echo "crosscheck --config set: --claude-model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
       valid_effort "$codex_effort" || { echo "crosscheck --config set: --codex-effort must be one of: $CONFIG_EFFORTS" >&2; return 2; }
       valid_claude_effort "$claude_effort" || { echo "crosscheck --config set: --claude-effort must be one of: $CONFIG_CLAUDE_EFFORTS" >&2; return 2; }
@@ -723,12 +842,14 @@ cmd_config() {
       local json
       json="$(jq -n --arg engine "$engine" --arg codex_model "$codex_model" --arg claude_model "$claude_model" \
         --arg codex_effort "$codex_effort" --arg claude_effort "$claude_effort" \
-        '{engine:$engine, codex_model:$codex_model, claude_model:$claude_model, codex_effort:$codex_effort, claude_effort:$claude_effort}')"
+        --arg gemini_model "$gemini_model" --arg gemini_effort "$gemini_effort" \
+        '{engine:$engine, claude_model:$claude_model, codex_model:$codex_model, gemini_model:$gemini_model,
+          claude_effort:$claude_effort, codex_effort:$codex_effort, gemini_effort:$gemini_effort}')"
       atomic_write "$CONFIG_FILE" "$json" || {
         echo "crosscheck --config set: failed to write $CONFIG_FILE" >&2
         return 1
       }
-      log "config set engine=$engine codex_model=$codex_model claude_model=$claude_model codex_effort=$codex_effort claude_effort=$claude_effort"
+      log "config set engine=$engine claude_model=$claude_model codex_model=$codex_model gemini_model=$gemini_model claude_effort=$claude_effort codex_effort=$codex_effort gemini_effort=$gemini_effort"
       resolve_config
       ;;
     *)
@@ -845,8 +966,8 @@ cmd_run() {
   # Fails closed like --mode: a typo must not silently run Codex and mark the
   # hash reviewed under the wrong engine label.
   case "$engine" in
-    codex|claude) : ;;
-    *) echo "crosscheck --run: unknown --engine '$engine' (want codex|claude)" >&2; return 2 ;;
+    codex|claude|gemini) : ;;
+    *) echo "crosscheck --run: unknown --engine '$engine' (want claude|codex|gemini)" >&2; return 2 ;;
   esac
   case "$scope" in
     full|delta) : ;;
@@ -868,11 +989,16 @@ cmd_run() {
   # treats text as data. `%` cuts at the last marker, the one closing the template.
   local instructions_head inserted="$kind_instructions"$'\n\n'
   [ "$scope" = "delta" ] && inserted="$inserted$delta_instructions"$'\n\n'
+  [ "$engine" = "gemini" ] && inserted="$inserted$gemini_read_check_instructions"$'\n\n'
   instructions_head="${instructions%"$marker"*}"
   instructions="$instructions_head$inserted${instructions#"$instructions_head"}"
 
+  # The engine name is not always the binary name: Gemini runs through `agy`,
+  # so a stray `gemini` binary must neither satisfy nor replace the check.
+  local engine_binary="$engine"
+  [ "$engine" = "gemini" ] && engine_binary="agy"
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --run: jq not found on PATH" >&2; return 1; }
-  command -v "$engine" >/dev/null 2>&1 || { echo "crosscheck --run: $engine not found on PATH" >&2; return 1; }
+  command -v "$engine_binary" >/dev/null 2>&1 || { echo "crosscheck --run: $engine_binary not found on PATH" >&2; return 1; }
 
   local timeout_bin
   timeout_bin="$(resolve_timeout_bin)" || {
@@ -957,8 +1083,93 @@ cmd_run() {
   # shellcheck disable=SC2064
   trap "rm -f $(printf '%q' "$json_file")" EXIT
 
+  # Setup (gemini only), before run_started like every other setup step, so a
+  # failure here is a setup failure (no run line, agy never invoked): the
+  # per-run 0700 directory, the nonce and the 0600 task file agy will read.
+  local gemini_dir="" gemini_task="" gemini_nonce=""
+  if [ "$engine" = "gemini" ]; then
+    if ! mkdir -p "$TMP_DIR" 2>/dev/null || ! gemini_dir="$(mktemp -d "$TMP_DIR/gemini.XXXXXX" 2>/dev/null)"; then
+      echo "crosscheck --run: could not create a task directory under $TMP_DIR. See $STDERR_LOG_FILE." >&2
+      return 1
+    fi
+    # shellcheck disable=SC2064
+    trap "rm -rf $(printf '%q' "$json_file") $(printf '%q' "$gemini_dir")" EXIT
+    gemini_nonce="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    if ! [[ "$gemini_nonce" =~ ^[0-9a-f]{32}$ ]]; then
+      echo "crosscheck --run: could not generate a random read-check value" >&2
+      return 1
+    fi
+    gemini_task="$gemini_dir/task.md"
+    if ! { assemble_task "$instructions" "$prompt_body"; printf '\nREAD-CHECK: %s\n' "$gemini_nonce"; } >"$gemini_task" 2>/dev/null; then
+      echo "crosscheck --run: could not write the task file under $gemini_dir" >&2
+      return 1
+    fi
+  fi
+
   local run_started run_ended
   run_started="$(date +%s)"
+  if [ "$engine" = "gemini" ]; then
+    run_gemini "$gemini_dir" "$gemini_task" "$budget" "$json_file" "$timeout_bin" "$engine_model" "$engine_effort"
+    rc=$?
+    run_ended="$(date +%s)"
+    # agy prints one JSON object, also on failure; raw stdout is never echoed.
+    local gemini_result gemini_status="" gemini_finished="" gemini_error="" gemini_denied="" gemini_usage="null" gemini_reason=""
+    gemini_result="$(jq -c 'select(type == "object")' "$json_file" 2>/dev/null | tail -n 1)"
+    if [ -n "$gemini_result" ]; then
+      gemini_status="$(jq -r '.status // ""' <<<"$gemini_result" 2>/dev/null)"
+      gemini_finished="$(jq -r '.finished_reason // ""' <<<"$gemini_result" 2>/dev/null)"
+      gemini_error="$(jq -r '(.error // "") | tostring' <<<"$gemini_result" 2>/dev/null)"
+      gemini_denied="$(jq -r '[.denied_actions[]? | .action? // empty] | unique | join(",")' <<<"$gemini_result" 2>/dev/null)"
+      gemini_usage="$(gemini_usage_json "$gemini_result")"
+    fi
+    local gemini_body="" gemini_proof="no"
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ] || [ "$gemini_finished" = "print_timeout" ]; then
+      rc=124
+      gemini_reason="timeout${gemini_error:+: $gemini_error}"
+    elif [ -z "$gemini_result" ]; then
+      if [ $rc -ne 0 ]; then gemini_reason="agy exited $rc"; else gemini_reason="no JSON result from agy"; fi
+    elif [ $rc -ne 0 ] || [ "$gemini_status" != "SUCCESS" ]; then
+      gemini_reason="${gemini_error:-agy exited $rc (status ${gemini_status:-none})}"
+    elif [ "$(jq -r '(.response // "") | test("\\S")' <<<"$gemini_result" 2>/dev/null)" != "true" ]; then
+      gemini_reason="empty response${gemini_denied:+ (denied: $gemini_denied)}"
+    else
+      # Read proof: the first non-blank line of the reply, trimmed and without
+      # one surrounding pair of ** or backticks, must be the nonce line. Only
+      # that line leaves the body. jq on here-strings, never an early-exit
+      # pipe: pipefail would turn a SIGPIPE on a big reply into a false failure.
+      local gemini_checked
+      gemini_checked="$(jq -c --arg expected "READ-CHECK: $gemini_nonce" '
+        def unwrap: if length >= 4 and startswith("**") and endswith("**") then .[2:-2]
+                    elif length >= 2 and startswith("`") and endswith("`") then .[1:-1] else . end;
+        (.response // "" | split("\n")) as $lines
+        | ($lines | to_entries | map(select(.value | test("\\S"))) | first) as $first
+        | {proof: (($first.value | gsub("^\\s+|\\s+$"; "") | unwrap) == $expected),
+           body: ($lines[($first.key + 1):] | join("\n") | sub("^\\s+"; ""))}' <<<"$gemini_result" 2>/dev/null)"
+      gemini_proof="$(jq -r '.proof' <<<"$gemini_checked" 2>/dev/null)"
+      if [ "$gemini_proof" != "true" ]; then
+        gemini_reason="agy did not read the whole task file"
+      else
+        gemini_body="$(jq -r '.body' <<<"$gemini_checked" 2>/dev/null)"
+        [[ "$gemini_body" =~ [^[:space:]] ]] || gemini_reason="empty response after read check"
+      fi
+    fi
+    if [ -n "$gemini_reason" ]; then
+      gemini_reason="$(printf '%s' "$gemini_reason" | tr '\n\r' '  ' | head -c 300)"
+      log "run ($mode) engine=gemini failed rc=$rc reason=$gemini_reason"
+      echo "crosscheck --run: agy failed: $gemini_reason" >&2
+      # One capped line of agy's own error, never its whole stderr (it can echo task text).
+      local gemini_log_line
+      gemini_log_line="$(grep -m 1 '^error:' "$gemini_dir/stderr.txt" 2>/dev/null | tr '\r' ' ' | head -c 300)"
+      printf '%s\n' "${gemini_log_line:-$gemini_reason}" >>"$STDERR_LOG_FILE" 2>/dev/null
+      record_failed_run "$mode" gemini "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$([ $rc -eq 124 ] && echo 124 || echo 1)" "$gemini_reason" "$gemini_usage" "$scope"
+      return 1
+    fi
+    publish_report "$mode" "$hash" "$artifact_file" "$gemini_body" "gemini" "$round" "$engine_model" "$engine_effort" \
+      "$(run_extra_json success "$run_started" "$run_ended" "" "$gemini_usage" "$scope")"
+    rc=$?
+    [ $rc -eq 0 ] || record_failed_run "$mode" gemini "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$gemini_usage" "$scope"
+    return $rc
+  fi
   if [ "$engine" = "claude" ]; then
     # `json_file` holds claude's `--output-format json` result (or plain text
     # from a claude that ignores the flag). Its failures never mention Codex
@@ -1274,6 +1485,30 @@ critical_accepted() {
 # relays a round, because only the skill knows the merged, deduplicated list
 # and which engines actually reported. Fails closed (exit 2, nothing written)
 # on any invalid argument. ---
+# $1 = a finding source (`ambos`, an engine, or engines joined with `+`),
+# $2 = the round's engines, space separated. Prints the stored form or returns 1.
+normalize_finding_source() {
+  local source="$1" round_engines="$2" part seen=" " engine canonical=""
+  local -a parts
+  if [ "$source" = "ambos" ]; then
+    case " $round_engines " in *" claude "*) : ;; *) return 1 ;; esac
+    case " $round_engines " in *" codex "*) printf 'ambos'; return 0 ;; esac
+    return 1
+  fi
+  [[ "$source" =~ ^[a-z]+(\+[a-z]+)*$ ]] || return 1
+  IFS=+ read -r -a parts <<<"$source"
+  for part in "${parts[@]}"; do
+    case " $round_engines " in *" $part "*) : ;; *) return 1 ;; esac
+    case "$seen" in *" $part "*) return 1 ;; esac
+    seen="$seen$part "
+  done
+  for engine in $ENGINE_ORDER; do
+    case "$seen" in *" $engine "*) canonical="${canonical:+$canonical+}$engine" ;; esac
+  done
+  [ "$canonical" = "claude+codex" ] && canonical="ambos"
+  printf '%s' "$canonical"
+}
+
 cmd_metrics_findings() {
   local hash="" round="" engines="" scope="full" finding severity source counts finding_status finding_reason
   local -a findings=()
@@ -1290,10 +1525,14 @@ cmd_metrics_findings() {
 
   [[ "$hash" =~ ^[0-9a-f]+$ ]] || { echo "crosscheck --metrics-findings: --hash is required and must be hex" >&2; return 2; }
   [[ "$round" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --metrics-findings: --round is required and must be a positive integer" >&2; return 2; }
-  case "$engines" in
-    codex|claude|both) : ;;
-    *) echo "crosscheck --metrics-findings: --engines must be one of: codex claude both" >&2; return 2 ;;
-  esac
+  # claude,codex is stored as `both` so old and new rounds group together.
+  local round_engines
+  if ! round_engines="$(engine_list "$engines")"; then
+    echo "crosscheck --metrics-findings: --engines must be one engine, both, or a comma list of claude, codex, gemini (no repeats)" >&2
+    return 2
+  fi
+  engines="$(engine_normalized "$engines")"
+  [ "$engines" = "claude,codex" ] && engines="both"
   case "$scope" in
     full|delta) : ;;
     *) echo "crosscheck --metrics-findings: --scope must be one of: full delta" >&2; return 2 ;;
@@ -1302,7 +1541,9 @@ cmd_metrics_findings() {
   # A single-engine round can only have findings from that engine: `ambos`
   # or the other engine there would corrupt the codex-only / claude-only split.
   if [ ${#findings[@]} -gt 0 ]; then
-    for finding in "${findings[@]}"; do
+    local finding_index finding_rest
+    for finding_index in "${!findings[@]}"; do
+      finding="${findings[$finding_index]}"
       # A line break or control character would split this finding into rows
       # that were never validated (and feed the CRITICAL gate's counts).
       if [[ "$finding" == *[[:cntrl:]]* ]]; then
@@ -1324,10 +1565,15 @@ cmd_metrics_findings() {
         CRITICAL|HIGH|MEDIUM|LOW) : ;;
         *) echo "crosscheck --metrics-findings: invalid severity in --finding '$finding'" >&2; return 2 ;;
       esac
-      case "$source" in
-        codex|claude|ambos) : ;;
-        *) echo "crosscheck --metrics-findings: invalid source in --finding '$finding'" >&2; return 2 ;;
-      esac
+      # Every component of the source must have taken part in the round; the
+      # stored form is canonical, and claude+codex keeps its old spelling ambos.
+      local normalized_source
+      normalized_source="$(normalize_finding_source "$source" "$round_engines")" || {
+        echo "crosscheck --metrics-findings: invalid source in --finding '$finding' (not an engine of this round)" >&2
+        return 2
+      }
+      finding_rest="${finding#"$severity:$source"}"
+      findings[finding_index]="$severity:$normalized_source$finding_rest"
       case "$finding_status" in
         ''|incorporated|not-applicable) : ;;
         rejected)
@@ -1335,10 +1581,6 @@ cmd_metrics_findings() {
           ;;
         *) echo "crosscheck --metrics-findings: invalid status in --finding '$finding' (want incorporated|rejected|not-applicable)" >&2; return 2 ;;
       esac
-      if [ "$engines" != "both" ] && [ "$source" != "$engines" ]; then
-        echo "crosscheck --metrics-findings: source '$source' is not possible with --engines $engines" >&2
-        return 2
-      fi
     done
   fi
 
@@ -1408,12 +1650,12 @@ cmd_next_round() {
   fi
 
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --next-round: jq not found on PATH" >&2; return 1; }
-  local resolved_config configured_engine
+  local resolved_config configured_engines
   resolved_config="$(resolve_config)" || {
     echo "crosscheck --next-round: $CONFIG_FILE is corrupt or invalid. Run /crosscheck-setup to fix it." >&2
     return 1
   }
-  configured_engine="$(printf '%s' "$resolved_config" | jq -r '.engine')"
+  configured_engines="$(printf '%s' "$resolved_config" | jq -c '.engines')"
 
   local next reason
   if [ "$needs_full" -eq 1 ]; then
@@ -1427,11 +1669,11 @@ cmd_next_round() {
   else
     next="show"; reason="no CRITICAL and no HIGH left to verify (none, or only rejected or not-applicable process ones)"
   fi
-  jq -cn --arg next "$next" --arg engine "$configured_engine" --arg reason "$reason" '
-    (if $engine == "both" then ["codex", "claude"] else [$engine] end) as $engines
-    | {next: $next,
+  # A scoped round runs ONE engine: codex if configured, else claude, else gemini.
+  jq -cn --arg next "$next" --argjson engines "$configured_engines" --arg reason "$reason" '
+    {next: $next,
        launch: (if $next == "full" then $engines | map("--engine " + .)
-                elif $next == "scoped" then ["--engine " + (if $engine == "claude" then "claude" else "codex" end) + " --scope delta"]
+                elif $next == "scoped" then ["--engine " + (if ($engines | index("codex")) != null then "codex" elif ($engines | index("claude")) != null then "claude" else "gemini" end) + " --scope delta"]
                 else [] end),
        reason: $reason}'
 }
@@ -1518,8 +1760,10 @@ map(if .type == "findings" then normalize_outcomes else . end)
 | ($all_runs | map(select((.mode != "plan-review" or (.model // "") == "") and (.status // "success") == "success"))) as $other_runs
 | (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
 | (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
-| ($rounds | map(select(.engines != "both"))) as $single_rounds
+| ($rounds | map(select(((.engines // "") | contains(",") | not) and .engines != "both"))) as $single_rounds
 | ($rounds | map(select(.engines == "both"))) as $both_rounds
+# Every other engine set has several engines and includes gemini (claude,codex is stored as both).
+| ($rounds | map(select(((.engines // "") | contains(",")) and ((.engines // "") | contains("gemini"))))) as $gemini_rounds
 | [
     "Planes auditados: \($rounds | map(select(.round == 1)) | length)",
     "Planes con mas de una ronda: \($rounds | map(select(.round == 2)) | length)",
@@ -1532,7 +1776,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
     ($other_runs | group_by(.mode == "plan-review") | .[] | "  \(if .[0].mode == "plan-review" then "plan-review sin modelo (--record legacy)" else "research" end): \(length)"),
     "Aceptacion de hallazgos por motor y modelo (incorporados / rechazados):",
     ([ $round_records[] | . as $record | ($record.outcomes // [])[]
-       | (if .source == "ambos" then ["codex", "claude"] else [.source] end)[] as $engine
+       | (if .source == "ambos" then ["claude", "codex"] else (.source | split("+")) end)[] as $engine
        | {engine: $engine, model: engine_model_of($all_runs; $record.hash; $record.round; $engine), status: .status} ]
       | if length == 0 then ["  sin hallazgos con estado todavia"][]
         else (group_by([.engine, .model]) | .[]
@@ -1542,17 +1786,28 @@ map(if .type == "findings" then normalize_outcomes else . end)
           | "  \(.[0].engine) \(.[0].model): \($accepted) incorporados, \($rejected) rechazados, \($unknown) sin estado\(if $accepted + $rejected > 0 then " (aceptacion \(($accepted * 100 / ($accepted + $rejected)) | round)%)" else "" end)") end),
     "Rondas sin registro de hallazgos: \([ .[] | select(.type == "findings-missing") | "\(.hash) \(.round)" ] as $missing | ([ $round_records[] | "\(.hash) \(.round)" ]) as $have | [ $missing[] | select(IN($have[]) | not) ] | unique | length)",
     "Rondas de un solo motor, hallazgos por motor:",
-    ($single_rounds | count_rows as $rows | ["codex", "claude"][] as $engine
+    ($single_rounds | count_rows as $rows | ["claude", "codex", "gemini"][] as $engine
       | [$rows[] | select(.engines == $engine)] as $mine
       | "  \($engine): \(severity_line($mine)) (critical+high: \(critical_high($mine)))"),
     "Rondas con ambos motores: \($both_rounds | length)",
-    ($both_rounds | group_by([model_of($runs; .hash; "codex"), model_of($runs; .hash; "claude")]) | .[]
-      | ([model_of($runs; .[0].hash; "codex"), model_of($runs; .[0].hash; "claude")]) as $pair
+    ($both_rounds | group_by([model_of($runs; .hash; "claude"), model_of($runs; .hash; "codex")]) | .[]
+      | ([model_of($runs; .[0].hash; "claude"), model_of($runs; .[0].hash; "codex")]) as $pair
       | count_rows as $rows
-      | "  codex \($pair[0]) + claude \($pair[1]) (\(length) rondas):",
-        (["codex", "claude", "ambos"][] as $source
+      | "  claude \($pair[0]) + codex \($pair[1]) (\(length) rondas):",
+        (["claude", "codex", "ambos"][] as $source
           | [$rows[] | select(.source == $source)] as $mine
           | "    \(if $source == "ambos" then "ambos" else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))")),
+    "Rondas con Gemini y otros motores: \($gemini_rounds | length)",
+    ($gemini_rounds | map(. as $round | . + {label: ($round.engines | split(",") | map(. as $engine | "\($engine) \(model_of($runs; $round.hash; $engine))") | join(" + "))})
+      | group_by([.engines, .label]) | .[]
+      | . as $group | count_rows as $rows
+      | ($rows | map(.source |= if . == "ambos" then "claude+codex" else . end)) as $named_rows
+      | ([$named_rows[].source] | unique) as $present
+      | ((["claude", "codex", "gemini"] | map(select(IN($present[])))) + ($present | map(select(contains("+"))) | sort)) as $sources
+      | "  \($group[0].label) (\($group | length) rondas):",
+        ($sources[] as $source
+          | [$named_rows[] | select(.source == $source)] as $mine
+          | "    \(if $source | contains("+") then $source else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))")),
     "Rondas acotadas (delta): \($delta_rounds | length)",
     ($delta_runs | group_by([.engine, .model]) | .[]
       | (map(select((.status // "success") == "success"))) as $succeeded
@@ -1639,6 +1894,22 @@ run_selftest() {
   }
   echo "selftest: sandbox at $tmp_home"
 
+  # Hygiene: a sentinel `agy` goes first on PATH for the whole run, so a test
+  # that forgets its own stub can never reach the real Antigravity CLI installed
+  # on the machine. Per-test stubs are put before it; the last check asserts
+  # the sentinel was never called.
+  local agy_sentinel_dir="$tmp_home/agysentinel" agy_sentinel_log="$tmp_home/agysentinel.log"
+  mkdir -p "$agy_sentinel_dir"
+  : >"$agy_sentinel_log"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'printf "sentinel agy called: %%s\\n" "$*" >>%q\n' "$agy_sentinel_log"
+    echo 'exit 1'
+  } >"$agy_sentinel_dir/agy"
+  chmod +x "$agy_sentinel_dir/agy"
+  PATH="$agy_sentinel_dir:$PATH"
+  export PATH
+
   check() {
     local desc="$1" got="$2" want="$3"
     if [ "$got" = "$want" ]; then
@@ -1694,6 +1965,88 @@ run_selftest() {
   chmod +x "$fail_stub/codex"
 
   local run="$0"
+
+  # Fake `agy` (Antigravity CLI) for the Gemini engine. Its behavior is picked
+  # by the file $AGY_STUB_DIR/mode; it records every call, copies the task file
+  # named in the prompt argument (agy has no stdin mode, so the task travels by
+  # file) and answers like the real `--output-format json`. Usage numbers come
+  # from $AGY_STUB_DIR/usage as "input output thinking cache_read total".
+  local agy_dir="$tmp_home/agystub"
+  mkdir -p "$agy_dir"
+  printf 'ok' >"$agy_dir/mode"
+  printf '100 40 10 0 140' >"$agy_dir/usage"
+  cat >"$agy_dir/agy" <<'AGY_STUB_EOF'
+#!/usr/bin/env bash
+stub_dir="${AGY_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$stub_dir/args.log"
+printf '%s\n' "$@" >"$stub_dir/argv.last"
+prompt_text="" add_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt_text="${2:-}"; shift 2 ;;
+    --add-dir) add_dir="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+task_path="${prompt_text#Read the file }"
+task_path="${task_path%% and follow*}"
+printf '%s' "$add_dir" >"$stub_dir/add_dir.last"
+nonce_line=""
+if [ -r "$task_path" ]; then
+  cp "$task_path" "$stub_dir/task.copy"
+  sed -E 's/READ-CHECK: [0-9a-f]{32}/READ-CHECK: NONCE/' "$task_path" >"$stub_dir/task.masked"
+  { stat -f '%Lp' "$task_path" 2>/dev/null || stat -c '%a' "$task_path"; } >"$stub_dir/file.mode"
+  { stat -f '%Lp' "$(dirname "$task_path")" 2>/dev/null || stat -c '%a' "$(dirname "$task_path")"; } >"$stub_dir/dir.mode"
+  printf '%s' "$task_path" >"$stub_dir/task.path"
+  nonce_line="$(tail -n 1 "$task_path")"
+fi
+mode="$(cat "$stub_dir/mode")"
+read -r usage_in usage_out usage_think usage_cache usage_total <"$stub_dir/usage"
+emit_json() {
+  local extra="${3:-}"
+  [ -n "$extra" ] || extra='{}'
+  jq -nc --arg status "$1" --arg response "$2" --argjson extra "$extra" \
+    --argjson input "$usage_in" --argjson output "$usage_out" --argjson thinking "$usage_think" \
+    --argjson cache "$usage_cache" --argjson total "$usage_total" \
+    '{conversation_id:"stub-1", status:$status, response:$response, duration_seconds:3, num_turns:2,
+      usage:{input_tokens:$input, output_tokens:$output, thinking_tokens:$thinking, cache_read_tokens:$cache, total_tokens:$total}} + $extra'
+}
+finding_body=$'CRITICAL: gemini stub finding\nKind: change'
+case "$mode" in
+  ok) emit_json SUCCESS "$nonce_line"$'\n'"$finding_body" ;;
+  drain) cat >/dev/null; emit_json SUCCESS "$nonce_line"$'\n'"$finding_body" ;;
+  noread) emit_json SUCCESS "$finding_body" ;;
+  partial) emit_json SUCCESS "READ-CHECK: $(head -c 200 "$task_path" | tail -n 1)"$'\nHIGH: partial read' ;;
+  only_nonce) emit_json SUCCESS "$nonce_line"$'\n\n\n' ;;
+  messy) emit_json SUCCESS $'\n\n  '"$nonce_line"$'  \r\nHIGH: crlf body\r\n' ;;
+  bold) emit_json SUCCESS "**$nonce_line**"$'\nHIGH: bold body' ;;
+  tick) emit_json SUCCESS '`'"$nonce_line"'`'$'\nHIGH: tick body' ;;
+  wrong) emit_json SUCCESS $'READ-CHECK: 00000000000000000000000000000000\nHIGH: wrong nonce' ;;
+  late) emit_json SUCCESS $'Here is my review.\n'"$nonce_line"$'\nHIGH: late nonce' ;;
+  big) emit_json SUCCESS "$nonce_line"$'\nHIGH: big body\n'"$(head -c 110000 /dev/zero | tr '\0' 'a')" ;;
+  error)
+    echo "error: authentication required" >&2
+    emit_json ERROR "" '{"error":"authentication required: run agy and sign in"}'
+    exit 1 ;;
+  emptysuccess) emit_json SUCCESS "" '{"denied_actions":[{"action":"command"}]}' ;;
+  printtimeout)
+    emit_json ERROR "" '{"error":"print timeout reached","finished_reason":"print_timeout"}'
+    exit 3 ;;
+  nonjson) echo "this is not json at all" ;;
+  rc1) exit 1 ;;
+  rc124) exit 124 ;;
+  trapterm) trap '' TERM; exec sleep 60 ;;
+  stderr_ok)
+    echo "GEMSTDERRMARKER9f3a plan text echoed to stderr" >&2
+    emit_json SUCCESS "$nonce_line"$'\n'"$finding_body" ;;
+  stderr_fail)
+    echo "GEMSTDERRMARKER9f3a plan text echoed to stderr" >&2
+    echo "error: authentication required" >&2
+    emit_json ERROR "" '{"error":"authentication required"}'
+    exit 1 ;;
+esac
+AGY_STUB_EOF
+  chmod +x "$agy_dir/agy"
 
   # 1. hook mode, non-PreToolUse event -> exit 0, no stdout.
   local out rc
@@ -1935,6 +2288,9 @@ run_selftest() {
       [ "$d" = "$codex_dir" ] && continue
       safe_path="${safe_path:+$safe_path:}$d"
     done
+    # `local IFS` above lasts for the whole selftest, and later checks rely on
+    # word splitting (`wait $pids`, `$(seq ...)`): restore the default.
+    IFS=$' \t\n'
   fi
   out="$(HOME="$tmp_home" PATH="$safe_path" "$run" --run --mode research --prompt-file "$research_prompt" 2>&1 >/dev/null)"
   rc=$?
@@ -2700,7 +3056,7 @@ run_selftest() {
   check "stats: codex-only in both rounds ignores single-engine rounds" "$(printf '%s' "$out" | grep -c 'solo codex: CRITICAL 0, HIGH 2, MEDIUM 0, LOW 0 (critical+high: 2)')" "1"
   check "stats: the duplicated both round counts once (ambos HIGH 1)" "$(printf '%s' "$out" | grep -c 'ambos: CRITICAL 0, HIGH 1, MEDIUM 0, LOW 0')" "1"
   check "stats: single-engine totals are reported separately" "$(printf '%s' "$out" | grep -c '^  codex: CRITICAL 0, HIGH 5')" "1"
-  check "stats: the both split names the model pair from the run lines" "$(printf '%s' "$out" | grep -c 'codex gpt-a + claude opus-x (1 rondas)')" "1"
+  check "stats: the both split names the model pair from the run lines" "$(printf '%s' "$out" | grep -c 'claude opus-x + codex gpt-a (1 rondas)')" "1"
   ln -s "$tmp_home" "$tmp_home/fixture-link"
   check "stats: the same file twice equals the file once" "$("$run" --stats "$fixture" "$fixture")" "$out"
   check "stats: the same file via a symlinked directory equals once" "$("$run" --stats "$fixture" "$tmp_home/fixture-link/fixture.jsonl")" "$out"
@@ -2919,7 +3275,7 @@ run_selftest() {
     local config="$1"; shift
     CROSSCHECK_STATE_DIR="$next_root/$config" "$run" --next-round "$@" </dev/null 2>/dev/null | jq -c '[.next, .launch]' 2>/dev/null
   }
-  local full_both='["full",["--engine codex","--engine claude"]]' scoped_codex='["scoped",["--engine codex --scope delta"]]' show_none='["show",[]]'
+  local full_both='["full",["--engine claude","--engine codex"]]' scoped_codex='["scoped",["--engine codex --scope delta"]]' show_none='["show",[]]'
   check "next-round: round 1 with an incorporated process HIGH is full" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated)" "$full_both"
   check "next-round: an incorporated CRITICAL is full" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
   check "next-round: a change HIGH is full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" "$full_both"
@@ -2996,7 +3352,7 @@ run_selftest() {
   #     (every run) and the delta block (delta only) sit ABOVE the mode's marker
   #     sentence, so the auditor reads them as instructions, never as data.
   local scope_root="$tmp_home/scope-root" scope_prompt="$tmp_home/scope-prompt.md" doer_prompt="$tmp_home/doer-prompt.md" noprefix_prompt="$tmp_home/noprefix-prompt.md"
-  local scope_engine scope_mode scope_marker scope_copy delta_at kind_at marker_at body_at scope_rc
+  local scope_engine scope_mode scope_marker scope_copy delta_at kind_at marker_at body_at scope_rc read_at
   mkdir -p "$scope_root"
   CROSSCHECK_STATE_DIR="$scope_root" "$run" --config set --engine both --codex-model gpt-a --claude-model opus-x --codex-effort medium --claude-effort medium >/dev/null 2>&1
   printf 'ROUND: 2\n\nORIGINAL REQUEST:\nscopebody request\n\nPROPOSED PLAN:\nscopebody plan\n\nPRIOR ROUNDS:\nround 1: HIGH process, incorporated\n\nCHANGES SINCE LAST ROUND:\nreworded the test step\n' >"$scope_prompt"
@@ -3006,10 +3362,11 @@ run_selftest() {
   # ends up in its capture file, truncated first.
   scope_run() {
     local engine="$1" mode="$2" prompt="$3"; shift 3
-    : >"$capture_stdin"; : >"$claude_stdin"
-    HOME="$tmp_home" CROSSCHECK_STATE_DIR="$scope_root" PATH="$claude_stub:$stub_bin:$PATH" "$run" --run --engine "$engine" --mode "$mode" --prompt-file "$prompt" "$@" >/dev/null 2>&1 </dev/null
+    : >"$capture_stdin"; : >"$claude_stdin"; : >"$agy_dir/task.masked"
+    HOME="$tmp_home" CROSSCHECK_STATE_DIR="$scope_root" AGY_STUB_DIR="$agy_dir" PATH="$agy_dir:$claude_stub:$stub_bin:$PATH" "$run" --run --engine "$engine" --mode "$mode" --prompt-file "$prompt" "$@" >/dev/null 2>&1 </dev/null
   }
-  scope_stdin_of() { if [ "$1" = claude ]; then printf '%s' "$claude_stdin"; else printf '%s' "$capture_stdin"; fi; }
+  # The gemini copy has its per-run nonce masked, so two runs compare equal.
+  scope_stdin_of() { case "$1" in claude) printf '%s' "$claude_stdin" ;; gemini) printf '%s' "$agy_dir/task.masked" ;; *) printf '%s' "$capture_stdin" ;; esac; }
   # Offset of $2 in file $1 with whitespace runs collapsed (a wrapped
   # instruction line still matches); 0 when absent.
   flat_pos() { tr -s '[:space:]' ' ' <"$1" | awk -v needle="$2" '{print index($0, needle)} END {if (NR == 0) print 0}'; }
@@ -3018,7 +3375,7 @@ run_selftest() {
   without_delta() { tr -s '[:space:]' ' ' <"$1" | awk -v start="SCOPED ROUND." -v stop="Coverage line) applies unchanged." '{i = index($0, start); j = index($0, stop); if (i == 0 || j < i) print "no scoped block"; else print substr($0, 1, i - 1) substr($0, j + length(stop))}' | tr -s ' '; }
   delta_block() { tr -s '[:space:]' ' ' <"$1" | awk -v start="SCOPED ROUND." -v stop="Coverage line) applies unchanged." '{i = index($0, start); j = index($0, stop); if (i > 0 && j > i) print substr($0, i, j + length(stop) - i)}'; }
   local kind_needle="add to each one a line 'Kind: change'"
-  for scope_engine in codex claude; do
+  for scope_engine in codex claude gemini; do
     for scope_mode in plan-review research; do
       if [ "$scope_mode" = research ]; then scope_marker="The request to research: ---"; else scope_marker="Original request and proposed plan follow: ---"; fi
       scope_copy="$tmp_home/scope-stdin-$scope_engine-$scope_mode"
@@ -3029,6 +3386,13 @@ run_selftest() {
       marker_at="$(flat_pos "$scope_copy-delta" "$scope_marker")"; body_at="$(flat_pos "$scope_copy-delta" "scopebody")"
       check "scope delta ($scope_engine, $scope_mode): delta and Kind text above the marker, the request below it" \
         "$([ "${delta_at:-0}" -gt 0 ] && [ "${kind_at:-0}" -gt 0 ] && [ "$delta_at" -lt "${marker_at:-0}" ] && [ "$kind_at" -lt "${marker_at:-0}" ] && [ "${marker_at:-0}" -lt "${body_at:-0}" ] && echo yes || echo "no:$delta_at/$kind_at/$marker_at/$body_at")" "yes"
+      if [ "$scope_engine" = gemini ]; then
+        # The read-proof instruction sits above the marker like the Kind text,
+        # and the nonce line is the very last line, after the closing ---.
+        read_at="$(flat_pos "$scope_copy-delta" "READ-CHECK:")"
+        check "scope delta (gemini, $scope_mode): the READ-CHECK instruction is above the marker" "$([ "${read_at:-0}" -gt 0 ] && [ "$read_at" -lt "${marker_at:-0}" ] && echo yes || echo "no:$read_at/$marker_at")" "yes"
+        check "scope delta (gemini, $scope_mode): the nonce line is last, right after the closing ---" "$(tail -n 2 "$agy_dir/task.copy" | sed -E 's/READ-CHECK: [0-9a-f]{32}/READ-CHECK: NONCE/' | paste -sd'|' -)" "---|READ-CHECK: NONCE"
+      fi
       scope_run "$scope_engine" "$scope_mode" "$scope_prompt"
       cp "$(scope_stdin_of "$scope_engine")" "$scope_copy-default"
       check "scope default ($scope_engine, $scope_mode): the run line records scope full" "$(jq -r '.scope' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "full"
@@ -3054,7 +3418,7 @@ run_selftest() {
   check "scope delta: a Doer-shaped one-line CHANGES prompt passes and records round 3" "$scope_rc $(jq -r '"\(.round) \(.scope)"' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "0 3 delta"
   scope_run codex research "$doer_prompt"
   check "a first line ROUND: 3. Audit x records round 3" "$(jq -r '"\(.round) \(.scope)"' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "3 full"
-  for scope_engine in codex claude; do
+  for scope_engine in codex claude gemini; do
     scope_run "$scope_engine" plan-review "$noprefix_prompt" --scope delta
     scope_rc=$?
     check "scope delta ($scope_engine): no line starting with CHANGES SINCE LAST ROUND exits 2, engine never invoked" "$scope_rc/$([ -s "$(scope_stdin_of "$scope_engine")" ] && echo invoked || echo none)" "2/none"
@@ -3066,7 +3430,7 @@ run_selftest() {
   #     at the first match, so a piped printf can die of SIGPIPE under pipefail).
   local big_prompt="$tmp_home/big-prompt.md"
   { printf 'ROUND: 2\n\nCHANGES SINCE LAST ROUND:\nreworded a step\n\nPROPOSED PLAN:\n'; head -c 300000 /dev/zero | tr '\0' 'a'; printf '\n'; } >"$big_prompt"
-  for scope_engine in codex claude; do
+  for scope_engine in codex claude gemini; do
     scope_run "$scope_engine" plan-review "$big_prompt" --scope delta
     scope_rc=$?
     check "scope delta ($scope_engine): a 300 KB prompt with the CHANGES line first still passes the guard" "$scope_rc/$([ -s "$(scope_stdin_of "$scope_engine")" ] && echo invoked || echo none)" "0/invoked"
@@ -3105,6 +3469,450 @@ run_selftest() {
   done
   check "SKILL.md passes --scope to --metrics-findings" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -E -- '--metrics-findings.{0,200}--scope' && echo yes || echo no)" "yes"
 
+  # 46. Gemini engine, config: engine sets, the gemini fields, defaults for old
+  #     configs, key order claude/codex/gemini.
+  local gem_cfg_root="$tmp_home/gem-cfg-root" gem_cfg_file="$tmp_home/gem-cfg-root/config.json" gem_cfg_out gem_cfg_rc
+  mkdir -p "$gem_cfg_root"
+  gem_cfg() { CROSSCHECK_STATE_DIR="$gem_cfg_root" HOME="$tmp_home" "$run" --config "$@" </dev/null; }
+  # $1 = engine value, the rest = extra flags (the gemini ones).
+  gem_cfg_set() {
+    local engine_value="$1"; shift
+    gem_cfg set --engine "$engine_value" --codex-model gpt-a --claude-model opus-x --codex-effort medium --claude-effort medium "$@" 2>&1
+  }
+  gem_cfg_out="$(gem_cfg_set claude,codex,gemini --gemini-model gemini-x-test --gemini-effort xhigh)"
+  gem_cfg_rc=$?
+  check "gemini config: set with all three engines exits 0" "$gem_cfg_rc" "0"
+  check "gemini config: engine list is written as given" "$(jq -r '.engine' "$gem_cfg_file" 2>/dev/null)" "claude,codex,gemini"
+  check "gemini config: gemini_model and gemini_effort are written" "$(jq -r '"\(.gemini_model)/\(.gemini_effort)"' "$gem_cfg_file" 2>/dev/null)" "gemini-x-test/xhigh"
+  gem_cfg_out="$(gem_cfg get)"
+  check "gemini config: get reports the engines array in canonical order" "$(printf '%s' "$gem_cfg_out" | jq -c '.engines' 2>/dev/null)" '["claude","codex","gemini"]'
+  check "gemini config: get reports gemini effort and its source" "$(printf '%s' "$gem_cfg_out" | jq -r '"\(.gemini_model)/\(.gemini_effort)/\(.gemini_effort_source)"' 2>/dev/null)" "gemini-x-test/xhigh/config"
+  gem_cfg_set gemini,claude --gemini-model gemini-4-argon --gemini-effort high >/dev/null
+  check "gemini config: an unordered list is normalized to canonical order" "$(jq -r '.engine' "$gem_cfg_file" 2>/dev/null)" "claude,gemini"
+  gem_cfg_set codex,gemini >/dev/null
+  check "gemini config: codex,gemini is a valid set" "$(jq -r '.engine' "$gem_cfg_file" 2>/dev/null)" "codex,gemini"
+  gem_cfg_set gemini >/dev/null
+  check "gemini config: gemini alone is valid" "$(gem_cfg get | jq -c '.engines' 2>/dev/null)" '["gemini"]'
+  gem_cfg_set both >/dev/null
+  check "gemini config: the legacy both stays as typed" "$(jq -r '.engine' "$gem_cfg_file" 2>/dev/null)" "both"
+  check "gemini config: both expands to claude and codex in get" "$(gem_cfg get | jq -c '.engines' 2>/dev/null)" '["claude","codex"]'
+  gem_cfg_set claude,codex,gemini --gemini-model gemini-4-argon --gemini-effort high >/dev/null
+  local bad_engine_value
+  for bad_engine_value in "claude,claude" "claude,bogus" "claude," ",claude" "claude,,gemini" "gemini,codex,gemini" "both,gemini" "gemini,"; do
+    gem_cfg_out="$(gem_cfg_set "$bad_engine_value")"
+    gem_cfg_rc=$?
+    check "gemini config: engine '$bad_engine_value' is rejected, config untouched" "$([ "$gem_cfg_rc" -ne 0 ] && echo rejected || echo accepted)/$(jq -r '.engine' "$gem_cfg_file" 2>/dev/null)" "rejected/claude,codex,gemini"
+  done
+  for bad_engine_value in '-evil' 'a;b' 'with space' '$(x)'; do
+    gem_cfg_out="$(gem_cfg_set claude,codex,gemini --gemini-model "$bad_engine_value" --gemini-effort high)"
+    gem_cfg_rc=$?
+    check "gemini config: gemini-model '$bad_engine_value' is rejected" "$([ "$gem_cfg_rc" -ne 0 ] && echo rejected || echo accepted)/$(jq -r '.gemini_model' "$gem_cfg_file" 2>/dev/null)" "rejected/gemini-4-argon"
+  done
+  gem_cfg_out="$(gem_cfg_set claude,codex,gemini --gemini-model gemini-4-argon --gemini-effort nope)"
+  gem_cfg_rc=$?
+  check "gemini config: a bad gemini-effort is rejected" "$([ "$gem_cfg_rc" -ne 0 ] && echo rejected || echo accepted)/$(jq -r '.gemini_effort' "$gem_cfg_file" 2>/dev/null)" "rejected/high"
+  local gem_effort_value
+  for gem_effort_value in low medium high xhigh max; do
+    gem_cfg_set gemini --gemini-model gemini-4-argon --gemini-effort "$gem_effort_value" >/dev/null
+    check "gemini config: gemini-effort $gem_effort_value is accepted" "$(jq -r '.gemini_effort' "$gem_cfg_file" 2>/dev/null)" "$gem_effort_value"
+  done
+  #     Existing calls without the gemini flags keep working and get defaults.
+  rm -f "$gem_cfg_file"
+  gem_cfg_set codex >/dev/null
+  gem_cfg_rc=$?
+  check "gemini config: set without the gemini flags still exits 0" "$gem_cfg_rc" "0"
+  check "gemini config: the gemini fields fall back to their defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)"' 2>/dev/null)" "gemini-4-argon/high"
+  printf '{"engine":"codex","codex_model":"gpt-a","claude_model":"fable","codex_effort":"medium","claude_effort":"medium"}' >"$gem_cfg_file"
+  check "gemini config: an old config without gemini fields resolves defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)/\(.gemini_effort_source)"' 2>/dev/null)" "gemini-4-argon/high/default"
+  check "gemini config: an old config keeps its single engine in engines" "$(gem_cfg get | jq -c '.engines' 2>/dev/null)" '["codex"]'
+  #     Key order: claude before codex before gemini, in get, in the file and in the error text.
+  gem_cfg_set claude,codex,gemini --gemini-model gemini-4-argon --gemini-effort high >/dev/null
+  local key_order_get key_order_file
+  key_order_get="$(gem_cfg get | jq -r 'keys_unsorted | [index("claude_model"), index("codex_model"), index("gemini_model")] | if all(. != null) and .[0] < .[1] and .[1] < .[2] then "ordered" else "unordered" end' 2>/dev/null)"
+  key_order_file="$(jq -r 'keys_unsorted | [index("claude_model"), index("codex_model"), index("gemini_model")] | if all(. != null) and .[0] < .[1] and .[1] < .[2] then "ordered" else "unordered" end' "$gem_cfg_file" 2>/dev/null)"
+  check "gemini config: get lists claude before codex before gemini" "$key_order_get" "ordered"
+  check "gemini config: config.json lists claude before codex before gemini" "$key_order_file" "ordered"
+  gem_cfg_out="$(gem_cfg set --engine codex 2>&1)"
+  check "gemini config: the required-flags error lists claude before codex" "$(printf '%s' "$gem_cfg_out" | awk '{a = index($0, "--claude-model"); b = index($0, "--codex-model"); print (a > 0 && b > a) ? "ordered" : "unordered"}' | head -1)" "ordered"
+  check "gemini config: the gemini flags are optional in the required-flags error" "$(printf '%s' "$gem_cfg_out" | grep -c -e '--gemini-model')" "1"
+
+  # 47. Gemini engine, invocation and success path. Shared helpers for the
+  #     sections below: a `timeout` shim that accepts `-k N` and records the
+  #     budget, the state root, and small readers for state and run lines.
+  local timeout_k_dir="$tmp_home/timeoutshim-k" budget_k_log="$tmp_home/budget-k.log"
+  mkdir -p "$timeout_k_dir"
+  cat >"$timeout_k_dir/timeout" <<TIMEOUT_K_EOF
+#!/usr/bin/env bash
+if [ "\$1" = "-k" ]; then shift 2; fi
+printf '%s\n' "\$1" >>"$budget_k_log"
+shift
+exec "\$@"
+TIMEOUT_K_EOF
+  chmod +x "$timeout_k_dir/timeout"
+  local gem_root="$tmp_home/gem-root" gem_prompt="$tmp_home/gem-prompt.md" gem_err="$tmp_home/gem.err" gem_out gem_rc
+  mkdir -p "$gem_root"
+  printf 'ROUND: 1\n\nORIGINAL REQUEST:\ngemrequest\n\nPROPOSED PLAN:\ngemplan-secret-marker\n' >"$gem_prompt"
+  CROSSCHECK_STATE_DIR="$gem_root" HOME="$tmp_home" "$run" --config set --engine claude,codex,gemini --codex-model gpt-a --claude-model opus-x \
+    --codex-effort medium --claude-effort medium --gemini-model gemini-4-argon --gemini-effort high >/dev/null 2>&1 </dev/null
+  agy_mode() { printf '%s' "$1" >"$agy_dir/mode"; }
+  # One `--run --engine gemini`. GEM_PATH, GEM_TIMEOUT, GEM_PROMPT and GEM_STDIN
+  # are per-call overrides given as prefix assignments.
+  gem_run() {
+    : >"$agy_dir/args.log"
+    env HOME="$tmp_home" CROSSCHECK_STATE_DIR="$gem_root" AGY_STUB_DIR="$agy_dir" PATH="${GEM_PATH:-$timeout_k_dir:$agy_dir:$PATH}" \
+      ${GEM_TIMEOUT:+CROSSCHECK_TIMEOUT=$GEM_TIMEOUT} \
+      "$run" --run --engine gemini --mode plan-review --prompt-file "${GEM_PROMPT:-$gem_prompt}" "$@" <"${GEM_STDIN:-/dev/null}"
+  }
+  gem_state() { if [ -s "$gem_root/state/plan-$1.state" ]; then jq -r '.status' "$gem_root/state/plan-$1.state" 2>/dev/null; else echo none; fi; }
+  gem_last() { jq -r "select(.type == \"run\") | $1" "$gem_root/metrics.jsonl" 2>/dev/null | tail -1; }
+  gem_report_count() { ls "$gem_root/state/reports" 2>/dev/null | wc -l | tr -d ' '; }
+  local gem_argv_flat gem_task_path
+  agy_mode ok
+  : >"$budget_k_log"
+  gem_out="$(gem_run --hash 9e1a0001 2>"$gem_err")"
+  gem_rc=$?
+  gem_argv_flat="$(tr '\n' ' ' <"$agy_dir/argv.last" 2>/dev/null)"
+  gem_task_path="$(cat "$agy_dir/task.path" 2>/dev/null)"
+  check "gemini run: exits 0" "$gem_rc" "0"
+  check "gemini run: the report is inlined without the READ-CHECK line" "$(printf '%s' "$gem_out" | grep -c 'gemini stub finding')/$(printf '%s' "$gem_out" | grep -c 'READ-CHECK')" "1/0"
+  check "gemini run: the hash is reviewed" "$(gem_state 9e1a0001)" "reviewed"
+  check "gemini run: the report artifact holds the finding" "$(grep -c 'gemini stub finding' "$(jq -r '.artifact' "$gem_root/state/plan-9e1a0001.state" 2>/dev/null)" 2>/dev/null)" "1"
+  check "gemini run: the run line has engine, model, effort and status" "$(gem_last '"\(.engine)/\(.model)/\(.effort)/\(.status)"')" "gemini/gemini-4-argon/high/success"
+  check "gemini run: the run line has tokens from usage and a null cost" "$(gem_last '"\(.input_tokens)/\(.output_tokens)/\(.cached_tokens)/\(.cost_usd)"')" "100/40/0/null"
+  check "gemini argv: --mode plan" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--mode plan ')" "1"
+  check "gemini argv: --sandbox" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--sandbox ')" "1"
+  check "gemini argv: --model and --effort from the config" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--model gemini-4-argon ' | tr -d ' ')/$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--effort high ')" "1/1"
+  check "gemini argv: --output-format json" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--output-format json ')" "1"
+  check "gemini argv: --disable-slash-commands" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--disable-slash-commands')" "1"
+  check "gemini argv: --print-timeout 1170s for the 1200s high budget" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--print-timeout 1170s ')" "1"
+  check "gemini argv: --add-dir names the directory of the task file" "$(cat "$agy_dir/add_dir.last" 2>/dev/null)" "$(dirname "$gem_task_path")"
+  check "gemini argv: never --dangerously-skip-permissions" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e 'dangerously-skip-permissions')" "0"
+  check "gemini argv: no plan text and no request text" "$(grep -c -e 'gemplan-secret-marker' -e 'PROPOSED PLAN' -e 'gemrequest' "$agy_dir/argv.last" 2>/dev/null)" "0"
+  check "gemini argv: the prompt names the task file path" "$(grep -c -F -- "Read the file $gem_task_path" "$agy_dir/argv.last" 2>/dev/null)" "1"
+  check "gemini task file: it lives under the state tmp dir in a gemini.* directory" "$(case "$gem_task_path" in "$gem_root/state/tmp/gemini."*/task.md) echo yes ;; *) echo "no:$gem_task_path" ;; esac)" "yes"
+  check "gemini task file: the stub saw the assembled task with the plan" "$(grep -c 'gemplan-secret-marker' "$agy_dir/task.copy" 2>/dev/null)" "1"
+  check "gemini task file: mode 0600 and its directory 0700" "$(cat "$agy_dir/file.mode" 2>/dev/null)/$(cat "$agy_dir/dir.mode" 2>/dev/null)" "600/700"
+  check "gemini task file: the last line is the READ-CHECK nonce, after the closing ---" "$(tail -n 2 "$agy_dir/task.copy" | sed -E 's/READ-CHECK: [0-9a-f]{32}/READ-CHECK: NONCE/' | paste -sd'|' -)" "---|READ-CHECK: NONCE"
+  check "gemini task file: the nonce is not in argv" "$(grep -c -E '[0-9a-f]{32}' "$agy_dir/argv.last" 2>/dev/null)" "0"
+  check "gemini task file: removed after the run, with its directory" "$([ -e "$gem_task_path" ] || [ -d "$(dirname "$gem_task_path")" ] && echo left || echo gone)" "gone"
+  check "gemini task file: no gemini.* directory is left behind" "$(find "$gem_root/state/tmp" -mindepth 1 -maxdepth 1 -name 'gemini.*' 2>/dev/null | wc -l | tr -d ' ')" "0"
+  check "gemini run: the budget handed to timeout is 1200" "$(head -1 "$budget_k_log" 2>/dev/null)" "1200"
+  check "gemini run: the Gemini instructions ask for the READ-CHECK first line" "$(tr -s '[:space:]' ' ' <"$agy_dir/task.copy" | grep -c -F 'begin your reply with exactly that line')" "1"
+
+  #     Usage normalization: the three cases of the documented rule.
+  gem_usage_case() {
+    local label="$1" usage_numbers="$2" want="$3" case_hash="$4"
+    printf '%s' "$usage_numbers" >"$agy_dir/usage"
+    gem_run --hash "$case_hash" >/dev/null 2>&1
+    check "gemini usage ($label): input/output/cached on the run line" "$(gem_last '"\(.input_tokens)/\(.output_tokens)/\(.cached_tokens)"')" "$want"
+  }
+  gem_usage_case "no cache reads" "100 40 10 0 140" "100/40/0" 9e1a0011
+  gem_usage_case "cache reads counted apart: input plus cache" "100 40 10 30 170" "130/40/30" 9e1a0012
+  gem_usage_case "cache reads already inside the total" "100 40 10 30 140" "100/40/30" 9e1a0013
+  # Real agy 1.5.6 line (gemini-4-argon): total is input + output and the cache
+  # reads exceed the input, so they cannot be a part of it.
+  gem_usage_case "cache reads larger than the input are counted apart" "76495 1116 0 194827 77611" "271322/1116/194827" 9e1a0014
+  printf '100 40 10 0 140' >"$agy_dir/usage"
+
+  # 48. Read proof: a reply that is not a review never publishes.
+  # $1 description, $2 stub mode, $3 hash, $4 reason fragment.
+  gem_expect_fail() {
+    local desc="$1" mode="$2" case_hash="$3" want_status="$4" want_reason="$5" reports_before reports_after case_rc
+    agy_mode "$mode"
+    reports_before="$(gem_report_count)"
+    gem_run --hash "$case_hash" >/dev/null 2>"$gem_err"
+    case_rc=$?
+    reports_after="$(gem_report_count)"
+    check "$desc: exits 1" "$case_rc" "1"
+    check "$desc: leaves a $want_status run line for gemini" "$(gem_last '"\(.status) \(.engine) \(.hash)"')" "$want_status gemini $case_hash"
+    check "$desc: the hash is not marked reviewed" "$(gem_state "$case_hash")" "none"
+    check "$desc: no report artifact is written" "$reports_after" "$reports_before"
+    check "$desc: the reason is on stderr" "$(grep -c -i -F -- "$want_reason" "$gem_err")" "1"
+  }
+  gem_expect_fail "read proof: a reply without the READ-CHECK line" noread 9e1a0021 failed "did not read the whole task file"
+  gem_expect_fail "read proof: a partial read that cannot echo the nonce" partial 9e1a0022 failed "did not read the whole task file"
+  gem_expect_fail "read proof: only the READ-CHECK line and blanks" only_nonce 9e1a0023 failed "empty response after read check"
+  gem_expect_fail "read proof: a wrong nonce" wrong 9e1a0024 failed "did not read the whole task file"
+  gem_expect_fail "read proof: the nonce only on a later line" late 9e1a0025 failed "did not read the whole task file"
+  local proof_mode proof_case_hash=9e1a0030 proof_artifact
+  for proof_mode in ok messy bold tick; do
+    agy_mode "$proof_mode"
+    proof_case_hash="$(printf '%x' $((0x$proof_case_hash + 1)))"
+    gem_out="$(gem_run --hash "$proof_case_hash" 2>"$gem_err")"
+    gem_rc=$?
+    proof_artifact="$(jq -r '.artifact' "$gem_root/state/plan-$proof_case_hash.state" 2>/dev/null)"
+    check "read proof ($proof_mode): publishes with exit 0 and state reviewed" "$gem_rc/$(gem_state "$proof_case_hash")" "0/reviewed"
+    check "read proof ($proof_mode): neither the report nor stdout carries a READ-CHECK line" "$(printf '%s' "$gem_out" | grep -c 'READ-CHECK')/$(grep -c 'READ-CHECK' "$proof_artifact" 2>/dev/null)" "0/0"
+    check "read proof ($proof_mode): the body after the line is kept" "$(grep -c -E 'finding|body' "$proof_artifact" 2>/dev/null)" "1"
+  done
+  #     A correct first line followed by a 100 KB body publishes, body intact
+  #     (a pipe that exits early would die of SIGPIPE under pipefail).
+  agy_mode big
+  gem_out="$(gem_run --hash 9e1a0040 2>"$gem_err")"
+  gem_rc=$?
+  proof_artifact="$(jq -r '.artifact' "$gem_root/state/plan-9e1a0040.state" 2>/dev/null)"
+  check "read proof (100 KB reply): exits 0 and the hash is reviewed" "$gem_rc/$(gem_state 9e1a0040)" "0/reviewed"
+  check "read proof (100 KB reply): the artifact keeps the whole body and has no READ-CHECK line" "$([ "$(wc -c <"$proof_artifact" 2>/dev/null | tr -d ' ')" -ge 110000 ] && echo big || echo small)/$(grep -c 'READ-CHECK' "$proof_artifact" 2>/dev/null)" "big/0"
+  agy_mode ok
+
+  # 49. Binary mapping, timeouts, pruning, hang safety and setup failures.
+  local path_no_agy="$PATH" strip_round
+  for strip_round in 1 2 3 4 5; do path_no_agy="$(strip_cmd_dir agy "$path_no_agy")"; done
+  local gemini_only_dir="$tmp_home/geminionly" gemini_only_log="$tmp_home/geminionly.log"
+  mkdir -p "$gemini_only_dir"
+  : >"$gemini_only_log"
+  { echo '#!/usr/bin/env bash'; printf 'echo called >>%q\n' "$gemini_only_log"; echo 'exit 0'; } >"$gemini_only_dir/gemini"
+  chmod +x "$gemini_only_dir/gemini"
+  local have_tools_without_agy=no
+  if PATH="$path_no_agy" command -v jq >/dev/null 2>&1 && { PATH="$path_no_agy" command -v timeout >/dev/null 2>&1 || PATH="$path_no_agy" command -v gtimeout >/dev/null 2>&1; }; then
+    have_tools_without_agy=yes
+    GEM_PATH="$gemini_only_dir:$path_no_agy" gem_run --hash 9e1a0050 >/dev/null 2>"$gem_err"
+    gem_rc=$?
+    check "gemini binary: a stray gemini binary does not stand in for agy (exit 1)" "$gem_rc" "1"
+    check "gemini binary: the message says agy was not found on PATH" "$(grep -c 'agy not found on PATH' "$gem_err")" "1"
+    check "gemini binary: the stray gemini binary was never invoked" "$([ -s "$gemini_only_log" ] && echo invoked || echo none)" "none"
+    check "gemini binary: the hash is not reviewed" "$(gem_state 9e1a0050)" "none"
+    GEM_PATH="$path_no_agy" gem_run --hash 9e1a0051 >/dev/null 2>"$gem_err"
+    check "agy absent: exits 1 with agy not found" "$?/$(grep -c 'agy not found' "$gem_err")" "1/1"
+    check "agy absent: the hash is not reviewed" "$(gem_state 9e1a0051)" "none"
+  else
+    echo "  skip  agy-absent checks (jq or timeout share a PATH directory with agy)"
+  fi
+  #     Print timeout rule and the verbatim budget.
+  : >"$budget_k_log"
+  GEM_TIMEOUT=77 gem_run --hash 9e1a0052 >/dev/null 2>&1
+  check "gemini timeout: CROSSCHECK_TIMEOUT=77 gives the shim a 77 budget" "$(head -1 "$budget_k_log" 2>/dev/null)" "77"
+  check "gemini timeout: the print timeout is 47s for a 77 budget" "$(tr '\n' ' ' <"$agy_dir/argv.last" | grep -c -F -e '--print-timeout 47s ')" "1"
+  : >"$budget_k_log"
+  GEM_TIMEOUT=20m gem_run --hash 9e1a0053 >/dev/null 2>"$gem_err"
+  gem_rc=$?
+  check "gemini timeout: CROSSCHECK_TIMEOUT=20m succeeds" "$gem_rc/$(gem_state 9e1a0053)" "0/reviewed"
+  check "gemini timeout: the shim sees 20m verbatim" "$(head -1 "$budget_k_log" 2>/dev/null)" "20m"
+  check "gemini timeout: no --print-timeout for a non-integer budget" "$(grep -c -F -e '--print-timeout' "$agy_dir/argv.last")" "0"
+  #     Old gemini task directories are pruned by the hook, fresh ones stay.
+  mkdir -p "$gem_root/state/tmp/gemini.OLDDIR" "$gem_root/state/tmp/gemini.NEWDIR"
+  printf 'old task' >"$gem_root/state/tmp/gemini.OLDDIR/task.md"
+  printf 'new task' >"$gem_root/state/tmp/gemini.NEWDIR/task.md"
+  touch -t 200001010000 "$gem_root/state/tmp/gemini.OLDDIR"
+  jq -n --arg cwd "$tmp_home" '{hook_event_name:"PreToolUse", tool_name:"ExitPlanMode", tool_input:{plan:""}, cwd:$cwd}' | HOME="$tmp_home" CROSSCHECK_STATE_DIR="$gem_root" "$run" >/dev/null 2>&1
+  check "gemini prune: an old gemini.* directory is removed by the hook" "$([ -d "$gem_root/state/tmp/gemini.OLDDIR" ] && echo kept || echo gone)" "gone"
+  check "gemini prune: a fresh gemini.* directory stays" "$([ -d "$gem_root/state/tmp/gemini.NEWDIR" ] && echo kept || echo gone)" "kept"
+  rm -rf "$gem_root/state/tmp/gemini.NEWDIR"
+  #     stderr never lands in the persistent log (a task excerpt could be in it).
+  local gem_stderr_log="$gem_root/logs/crosscheck.stderr.log" gem_log_lines_before
+  agy_mode stderr_ok
+  gem_run --hash 9e1a0054 >/dev/null 2>&1
+  check "gemini stderr: the marker is not in the persistent stderr log after a success" "$(grep -c 'GEMSTDERRMARKER9f3a' "$gem_stderr_log" 2>/dev/null)" "0"
+  agy_mode stderr_fail
+  gem_log_lines_before="$(wc -l <"$gem_stderr_log" 2>/dev/null | tr -d ' ')"
+  gem_run --hash 9e1a0055 >/dev/null 2>&1
+  check "gemini stderr: the marker is not in the persistent stderr log after a failure" "$(grep -c 'GEMSTDERRMARKER9f3a' "$gem_stderr_log" 2>/dev/null)" "0"
+  check "gemini stderr: a failure adds at most one capped line to the persistent log" "$([ "$(( $(wc -l <"$gem_stderr_log" 2>/dev/null | tr -d ' ') - ${gem_log_lines_before:-0} ))" -le 2 ] && awk 'length($0) > 400 {bad = 1} END {print bad ? "long" : "capped"}' "$gem_stderr_log" || echo grew)" "capped"
+  agy_mode ok
+  #     Hang safety: an open, never-closed stdin pipe must not hang the run
+  #     (agy has no stdin mode; the run gives it a closed stdin).
+  local open_fifo="$tmp_home/open-stdin.fifo" hang_out="$tmp_home/hang.out" hang_rc_file="$tmp_home/hang.rc" hang_pid hang_tick
+  mkfifo "$open_fifo"
+  exec 9<>"$open_fifo"
+  rm -f "$hang_rc_file"
+  agy_mode drain
+  ( GEM_PATH="$agy_dir:$PATH" GEM_STDIN="$open_fifo" gem_run --hash 9e1a0056 >"$hang_out" 2>&1; echo $? >"$hang_rc_file" ) &
+  hang_pid=$!
+  for hang_tick in $(seq 1 150); do
+    [ -s "$hang_rc_file" ] && break
+    sleep 0.1
+  done
+  check "gemini hang safety: a run with an open stdin pipe finishes promptly" "$([ -s "$hang_rc_file" ] && cat "$hang_rc_file" || echo hung)/$(gem_state 9e1a0056)" "0/reviewed"
+  exec 9>&-
+  wait "$hang_pid" 2>/dev/null
+  agy_mode ok
+  #     Real timeout, ignored SIGTERM: the outer kill ends the run (about 32 s).
+  #     This is the only slow gemini test.
+  if PATH="$PATH" command -v timeout >/dev/null 2>&1; then
+    local slow_start slow_end slow_elapsed
+    agy_mode trapterm
+    slow_start="$(date +%s)"
+    GEM_TIMEOUT=2 GEM_PATH="$agy_dir:$PATH" gem_run --hash 9e1a0057 >/dev/null 2>"$gem_err"
+    gem_rc=$?
+    slow_end="$(date +%s)"
+    slow_elapsed=$((slow_end - slow_start))
+    check "gemini hang safety: an agy that ignores SIGTERM is killed, exit 1" "$gem_rc" "1"
+    check "gemini hang safety: the kill lands after the 30 s grace, not before and not much later" "$([ "$slow_elapsed" -ge 30 ] && [ "$slow_elapsed" -le 50 ] && echo in-range || echo "out:${slow_elapsed}s")" "in-range"
+    check "gemini hang safety: the run line is a timeout for gemini" "$(gem_last '"\(.status) \(.engine)"')" "timeout gemini"
+    check "gemini hang safety: the hash is not reviewed" "$(gem_state 9e1a0057)" "none"
+    agy_mode ok
+  else
+    echo "  skip  SIGTERM-ignoring agy test (no GNU timeout on PATH)"
+  fi
+  #     Setup failures: agy never runs, no gemini run line, hash not reviewed.
+  local setup_root run_lines_before
+  setup_root="$tmp_home/gem-fresh-root"
+  : >"$agy_dir/args.log"
+  CROSSCHECK_STATE_DIR="$setup_root" HOME="$tmp_home" AGY_STUB_DIR="$agy_dir" PATH="$timeout_k_dir:$agy_dir:$PATH" "$run" --run --engine gemini --mode plan-review --prompt-file "$gem_prompt" --hash 9e1a0060 >/dev/null 2>"$gem_err" </dev/null
+  check "gemini setup: a fresh state root with no state/tmp succeeds" "$?/$(jq -r '.status' "$setup_root/state/plan-9e1a0060.state" 2>/dev/null)" "0/reviewed"
+  local real_mktemp mktemp_shim_dir="$tmp_home/mktemp-d-shim"
+  real_mktemp="$(command -v mktemp)"
+  mkdir -p "$mktemp_shim_dir"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'for argument in "$@"; do'
+    echo '  case "$argument" in -d|-*d*) echo "boom" >&2; exit 1 ;; esac'
+    echo 'done'
+    printf 'exec %q "$@"\n' "$real_mktemp"
+  } >"$mktemp_shim_dir/mktemp"
+  chmod +x "$mktemp_shim_dir/mktemp"
+  run_lines_before="$(grep -c '"engine":"gemini"' "$gem_root/metrics.jsonl" 2>/dev/null)"
+  GEM_PATH="$mktemp_shim_dir:$timeout_k_dir:$agy_dir:$PATH" gem_run --hash 9e1a0061 >/dev/null 2>"$gem_err"
+  gem_rc=$?
+  check "gemini setup: a failing mktemp -d exits 1 and agy never runs" "$gem_rc/$([ -s "$agy_dir/args.log" ] && echo invoked || echo none)" "1/none"
+  check "gemini setup: a failing mktemp -d leaves no gemini run line and no reviewed state" "$(grep -c '"engine":"gemini"' "$gem_root/metrics.jsonl" 2>/dev/null)/$(gem_state 9e1a0061)" "$run_lines_before/none"
+  if [ "$(id -u)" != "0" ]; then
+    local unwritable_root="$tmp_home/gem-unwritable-root"
+    HOME="$tmp_home" CROSSCHECK_STATE_DIR="$unwritable_root" "$run" --tmp-dir >/dev/null 2>&1
+    chmod 500 "$unwritable_root/state/tmp"
+    : >"$agy_dir/args.log"
+    CROSSCHECK_STATE_DIR="$unwritable_root" HOME="$tmp_home" AGY_STUB_DIR="$agy_dir" PATH="$timeout_k_dir:$agy_dir:$PATH" "$run" --run --engine gemini --mode plan-review --prompt-file "$gem_prompt" --hash 9e1a0062 >/dev/null 2>"$gem_err" </dev/null
+    gem_rc=$?
+    chmod 700 "$unwritable_root/state/tmp"
+    check "gemini setup: an unwritable state/tmp exits 1 and agy never runs" "$gem_rc/$([ -s "$agy_dir/args.log" ] && echo invoked || echo none)" "1/none"
+    check "gemini setup: an unwritable state/tmp leaves no run line and no reviewed state" "$(cat "$unwritable_root/metrics.jsonl" 2>/dev/null | grep -c '"engine":"gemini"')/$([ -s "$unwritable_root/state/plan-9e1a0062.state" ] && echo state || echo none)" "0/none"
+  else
+    echo "  skip  unwritable state/tmp check (running as root ignores directory permissions)"
+  fi
+
+  # 50. Gemini failures: each leaves a failed or timeout run line with engine
+  #     gemini, no reviewed state, exit 1, and the reason on stderr.
+  gem_expect_fail "gemini ERROR status with a login error" error 9e1a0071 failed "authentication required"
+  gem_expect_fail "gemini SUCCESS with an empty response and a denied command" emptysuccess 9e1a0072 failed "empty"
+  check "gemini empty SUCCESS: the reason names the denied command" "$(grep -c -i -F 'command' "$gem_err")" "1"
+  gem_expect_fail "gemini print_timeout JSON with exit 3" printtimeout 9e1a0073 timeout "timeout"
+  gem_expect_fail "gemini non-JSON output" nonjson 9e1a0074 failed "no JSON"
+  gem_expect_fail "gemini exit 1 with no output" rc1 9e1a0075 failed "exited 1"
+  gem_expect_fail "gemini killed by the outer timeout (exit 124)" rc124 9e1a0076 timeout "timeout"
+  check "gemini failure: the run line keeps the usage tokens when agy printed them" "$(agy_mode printtimeout; gem_run --hash 9e1a0077 >/dev/null 2>&1; gem_last '"\(.input_tokens)/\(.output_tokens)"')" "100/40"
+  check "gemini failure: the run line error is the agy error text, one capped line" "$(agy_mode error; gem_run --hash 9e1a0078 >/dev/null 2>&1; gem_last '.error | select(. != null) | if (length <= 300 and (contains("\n") | not) and contains("authentication required")) then "ok" else "bad" end')" "ok"
+  #     A failed engine never blocks another: a later good run of the same hash publishes.
+  agy_mode ok
+  gem_run --hash 9e1a0078 >/dev/null 2>&1
+  check "gemini failure: a good run after a failed one publishes the same hash" "$(gem_state 9e1a0078)" "reviewed"
+  #     Delta scope failures keep their scope.
+  agy_mode error
+  GEM_PROMPT="$scope_prompt" gem_run --hash 9e1a0079 --scope delta >/dev/null 2>&1
+  check "gemini delta failure: the failed line carries scope delta" "$(gem_last '"\(.status) \(.engine) \(.scope)"')" "failed gemini delta"
+  agy_mode ok
+
+  # 51. Parallel: claude, codex and gemini run concurrently on one hash, one
+  #     process each, and each leaves its own run line.
+  local par_root="$tmp_home/gem-par-root" par_engine par_hash=9e1a0081 par_pids=""
+  mkdir -p "$par_root/state/reports"
+  CROSSCHECK_STATE_DIR="$par_root" HOME="$tmp_home" "$run" --config set --engine claude,codex,gemini --codex-model gpt-a --claude-model opus-x \
+    --codex-effort medium --claude-effort medium --gemini-model gemini-4-argon --gemini-effort high >/dev/null 2>&1 </dev/null
+  agy_mode ok
+  # $1 = codex stub dir (good or failing), $2 = hash.
+  par_launch() {
+    local codex_dir="$1" launch_hash="$2" launch_engine
+    for launch_engine in claude codex gemini; do
+      CROSSCHECK_STATE_DIR="$par_root" HOME="$tmp_home" AGY_STUB_DIR="$agy_dir" PATH="$agy_dir:$claude_stub:$codex_dir:$PATH" \
+        "$run" --run --engine "$launch_engine" --mode plan-review --prompt-file "$gem_prompt" --hash "$launch_hash" \
+        --out "$par_root/state/reports/par-$launch_hash-$launch_engine.md" >"$par_root/out-$launch_hash-$launch_engine.txt" 2>"$par_root/err-$launch_hash-$launch_engine.txt" </dev/null &
+      par_pids="$par_pids $!"
+    done
+    wait $par_pids
+    par_pids=""
+  }
+  par_launch "$stub_bin" "$par_hash"
+  check "parallel: three result files with the three findings" "$(grep -l -e 'stub claude finding' "$par_root/out-$par_hash-claude.txt" | wc -l | tr -d ' ')$(grep -l 'stub finding' "$par_root/out-$par_hash-codex.txt" | wc -l | tr -d ' ')$(grep -l 'gemini stub finding' "$par_root/out-$par_hash-gemini.txt" | wc -l | tr -d ' ')" "111"
+  check "parallel: one run line per engine, all valid JSON" "$(jq -c 'select(.type == "run" and .hash == "'"$par_hash"'") | .engine' "$par_root/metrics.jsonl" 2>/dev/null | sort | tr '\n' ' ')" '"claude" "codex" "gemini" '
+  check "parallel: every metrics line parses" "$(jq -c . "$par_root/metrics.jsonl" >/dev/null 2>&1 && echo valid || echo invalid)" "valid"
+  check "parallel: the hash is reviewed" "$(jq -r '.status' "$par_root/state/plan-$par_hash.state" 2>/dev/null)" "reviewed"
+  par_launch "$fail_stub" 9e1a0082
+  check "parallel with a failing codex: claude and gemini still publish" "$(grep -c 'stub claude finding' "$par_root/out-9e1a0082-claude.txt")/$(grep -c 'gemini stub finding' "$par_root/out-9e1a0082-gemini.txt")" "1/1"
+  check "parallel with a failing codex: codex leaves a failed line, the others succeed" "$(jq -r 'select(.type == "run" and .hash == "9e1a0082") | "\(.engine):\(.status)"' "$par_root/metrics.jsonl" 2>/dev/null | sort | tr '\n' ' ')" "claude:success codex:failed gemini:success "
+  check "parallel with a failing codex: the three run lines parse" "$(jq -c . "$par_root/metrics.jsonl" >/dev/null 2>&1 && echo valid || echo invalid)" "valid"
+
+  # 52. Metrics, stats and next-round with the third engine.
+  mf_last() { jq -c "$1" "$metrics_root/metrics.jsonl" 2>/dev/null | tail -1; }
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc201 --round 1 --engines claude,codex,gemini --finding HIGH:gemini >/dev/null 2>&1
+  check "metrics-findings: a three-engine list is stored in canonical order" "$(mf_last '.engines')" '"claude,codex,gemini"'
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc202 --round 1 --engines gemini,claude >/dev/null 2>&1
+  check "metrics-findings: an unordered list is normalized" "$(mf_last '.engines')" '"claude,gemini"'
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc203 --round 1 --engines claude,codex >/dev/null 2>&1
+  check "metrics-findings: claude,codex is stored as both" "$(mf_last '.engines')" '"both"'
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc204 --round 1 --engines codex,claude >/dev/null 2>&1
+  check "metrics-findings: codex,claude is stored as both" "$(mf_last '.engines')" '"both"'
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc205 --round 1 --engines gemini --finding HIGH:gemini >/dev/null 2>&1
+  check "metrics-findings: a gemini-only round stores gemini and its source" "$(mf_last '"\(.engines) \(.counts)"')" '"gemini {\"gemini\":{\"HIGH\":1}}"'
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash abc206 --round 1 --engines claude,codex,gemini \
+    --finding HIGH:gemini --finding MEDIUM:claude+gemini --finding LOW:claude+codex+gemini --finding HIGH:claude+codex --finding HIGH:ambos >/dev/null 2>&1
+  check "metrics-findings: gemini sources are accepted and claude+codex is stored as ambos" "$(jq -cS 'select(.hash == "abc206") | .counts' "$metrics_root/metrics.jsonl" 2>/dev/null | tail -1)" '{"ambos":{"HIGH":2},"claude+codex+gemini":{"LOW":1},"claude+gemini":{"MEDIUM":1},"gemini":{"HIGH":1}}'
+  metrics_findings_bad "ambos when only claude and gemini took part" --hash abc207 --round 1 --engines claude,gemini --finding HIGH:ambos
+  metrics_findings_bad "a source outside the round's engines" --hash abc207 --round 1 --engines claude,gemini --finding HIGH:codex
+  metrics_findings_bad "a combined source outside the round's engines" --hash abc207 --round 1 --engines claude,gemini --finding HIGH:claude+codex
+  metrics_findings_bad "claude on a gemini-only round" --hash abc207 --round 1 --engines gemini --finding HIGH:claude
+  metrics_findings_bad "a duplicated engine" --hash abc207 --round 1 --engines claude,claude
+  metrics_findings_bad "an unknown engine in a list" --hash abc207 --round 1 --engines claude,bogus
+  metrics_findings_bad "both mixed with another engine" --hash abc207 --round 1 --engines both,gemini
+  metrics_findings_bad "a source with an unknown component" --hash abc207 --round 1 --engines claude,gemini --finding HIGH:claude+bogus
+  metrics_findings_bad "a repeated component in a source" --hash abc207 --round 1 --engines claude,gemini --finding HIGH:gemini+gemini
+  #     --stats over a fixture with gemini rounds.
+  local gem_stats="$tmp_home/gem-stats.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"g1","repo":"r","status":"success","duration_s":60,"input_tokens":10,"output_tokens":5,"cost_usd":0.5}'
+    echo '{"type":"run","ts":2,"mode":"plan-review","engine":"gemini","model":"gemini-4-argon","effort":"high","round":1,"hash":"g1","repo":"r","status":"success","duration_s":30,"input_tokens":100,"output_tokens":40,"cost_usd":null}'
+    echo '{"type":"findings","ts":3,"hash":"g1","round":1,"engines":"claude,gemini","scope":"full","repo":"r","counts":{"claude":{"HIGH":1},"gemini":{"LOW":2},"claude+gemini":{"HIGH":1}},"outcomes":[{"severity":"HIGH","source":"claude","status":"rejected","reason":"wrong"},{"severity":"LOW","source":"gemini","status":"incorporated","reason":null},{"severity":"HIGH","source":"claude+gemini","status":"incorporated","reason":null}]}'
+    echo '{"type":"findings","ts":4,"hash":"g3","round":1,"engines":"gemini","scope":"full","repo":"r","counts":{"gemini":{"HIGH":3}}}'
+    echo '{"type":"run","ts":5,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"g4","repo":"r","status":"success"}'
+    echo '{"type":"run","ts":6,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"g4","repo":"r","status":"success"}'
+    echo '{"type":"findings","ts":7,"hash":"g4","round":1,"engines":"both","scope":"full","repo":"r","counts":{"codex":{"HIGH":1}}}'
+  } >"$gem_stats"
+  out="$("$run" --stats "$gem_stats")"
+  check "stats (gemini): the audits table lists the gemini run with its tokens" "$(stats_section "$out" "Auditorias por motor y modelo:" | grep -c '^  gemini gemini-4-argon: 1 (duracion media 30s, tokens totales 100 entrada / 40 salida)$')" "1"
+  check "stats (gemini): a combined source counts for each of its engines (claude)" "$(printf '%s' "$out" | grep -c '^  claude opus-x: 1 incorporados, 1 rechazados, 0 sin estado (aceptacion 50%)$')" "1"
+  check "stats (gemini): a combined source counts for each of its engines (gemini)" "$(printf '%s' "$out" | grep -c '^  gemini gemini-4-argon: 2 incorporados, 0 rechazados, 0 sin estado (aceptacion 100%)$')" "1"
+  check "stats (gemini): the single-engine block lists gemini" "$(stats_section "$out" "Rondas de un solo motor" | grep -c '^  gemini: CRITICAL 0, HIGH 3, MEDIUM 0, LOW 0 (critical+high: 3)$')" "1"
+  check "stats (gemini): a claude,gemini round does not leak into the single-engine claude line" "$(stats_section "$out" "Rondas de un solo motor" | grep -c '^  claude: CRITICAL 0, HIGH 0, MEDIUM 0, LOW 0 (critical+high: 0)$')" "1"
+  check "stats (gemini): the both block names the pair claude first" "$(stats_section "$out" "Rondas con ambos motores" | grep -c '^  claude opus-x + codex gpt-a (1 rondas):$')" "1"
+  check "stats (gemini): the gemini block header exists" "$(printf '%s' "$out" | grep -c '^Rondas con Gemini y otros motores')" "1"
+  check "stats (gemini): the gemini block names the models per engine" "$(stats_section "$out" "Rondas con Gemini y otros motores" | grep -c '^  claude opus-x + gemini gemini-4-argon (1 rondas):$')" "1"
+  check "stats (gemini): the gemini block has a line per source present" "$(stats_section "$out" "Rondas con Gemini y otros motores" | grep -c -e '^    solo claude: CRITICAL 0, HIGH 1, MEDIUM 0, LOW 0 (critical+high: 1)$' -e '^    solo gemini: CRITICAL 0, HIGH 0, MEDIUM 0, LOW 2 (critical+high: 0)$' -e '^    claude+gemini: CRITICAL 0, HIGH 1, MEDIUM 0, LOW 0 (critical+high: 1)$')" "3"
+  #     --next-round launch lists, claude first, gemini last.
+  local next_config
+  for next_config in claude,codex,gemini claude,gemini codex,gemini gemini; do
+    CROSSCHECK_STATE_DIR="$next_root/$next_config" "$run" --config set --engine "$next_config" --codex-model gpt-a \
+      --claude-model opus-x --codex-effort medium --claude-effort medium >/dev/null 2>&1 </dev/null
+  done
+  check "next-round: full with claude,codex,gemini launches claude, codex, gemini in that order" "$(next_round claude,codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine claude","--engine codex","--engine gemini"]]'
+  check "next-round: full with codex,gemini launches codex then gemini" "$(next_round codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine codex","--engine gemini"]]'
+  check "next-round: full with gemini alone launches gemini" "$(next_round gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine gemini"]]'
+  check "next-round: scoped with claude,codex,gemini uses codex alone" "$(next_round claude,codex,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: scoped with codex,gemini uses codex alone" "$(next_round codex,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: scoped with claude,gemini uses claude alone" "$(next_round claude,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine claude --scope delta"]]'
+  check "next-round: scoped with gemini alone uses gemini" "$(next_round gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine gemini --scope delta"]]'
+  check "next-round: show after a scoped round still holds with gemini configured" "$(next_round claude,codex,gemini --round 3 --scoped-streak 1 --item HIGH:process:incorporated)" "$show_none"
+  check "next-round: the legacy both still launches claude then codex" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
+
+  # 53. Docs and skills carry the Gemini decisions as literal text.
+  local setup_skill_md readme_md changelog_md plugin_json
+  setup_skill_md="$(dirname "$run")/../skills/crosscheck-setup/SKILL.md"
+  readme_md="$(dirname "$run")/../README.md"
+  changelog_md="$(dirname "$run")/../CHANGELOG.md"
+  plugin_json="$(dirname "$run")/../.claude-plugin/plugin.json"
+  for phrase in "Gemini" "Claude, Codex, Gemini" "--config get | jq .engines" "claude+gemini" "gemini:<model>" "some engines failed" "agy"; do
+    check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  for phrase in "Which engines?" "Gemini" "--gemini-model" "--gemini-effort" "gemini-4-argon" "command -v agy" "agy models" "authentication required"; do
+    check "setup SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$setup_skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "README names the Antigravity CLI binary agy" "$(grep -c -F 'agy' "$readme_md" 2>/dev/null | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+  check "README says the Gemini engine is not isolated" "$(tr -s '[:space:]' ' ' <"$readme_md" 2>/dev/null | grep -q -i -F 'not isolated' && echo yes || echo no)" "yes"
+  check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+  check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
+  check "the CHANGELOG top entry is 3.10.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.10.0"
+
+  # 54. Hygiene: the sentinel agy was never called, so no test above reached
+  #     a real or unstubbed Antigravity CLI.
+  check "selftest never reached an unstubbed agy" "$([ -s "$agy_sentinel_log" ] && cat "$agy_sentinel_log" || echo empty)" "empty"
+
   rm -rf "$tmp_home"
   echo
   if [ "$failures" -eq 0 ]; then
@@ -3130,6 +3938,9 @@ hook_main() {
   # the README promises everything under state/ is pruned after
   # STATE_MAX_AGE_DAYS, but until now this loop never actually walked TMP_DIR.
   find "$TMP_DIR" -maxdepth 1 -type f -mtime "+${STATE_MAX_AGE_DAYS}" -delete 2>/dev/null
+  # Gemini task folders normally die with their run (EXIT trap); a SIGKILL
+  # leaves them behind, and they hold the same plan text.
+  find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -name 'gemini.*' -mtime "+${STATE_MAX_AGE_DAYS}" -exec rm -rf {} + 2>/dev/null
 
   [ -f "$DISABLED_SENTINEL" ] && exit 0
 

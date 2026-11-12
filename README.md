@@ -2,7 +2,8 @@
 
 **Get an independent second opinion on a finished Plan Mode plan, or on
 whatever's being discussed right now, from [Codex CLI](https://github.com/openai/codex)
-(the default), from a Claude model such as Fable, or from both in parallel.**
+(the default), from a Claude model such as Fable, from Gemini through the
+Antigravity CLI (`agy`), or from several of them in parallel.**
 
 Two ways to trigger it:
 
@@ -24,15 +25,17 @@ model version ships:
 
 | Engine | What runs | Notes |
 |---|---|---|
-| `codex` (default) | `codex exec`, read-only sandbox, separate process | Default model `gpt-6-astra`; `gpt-5.6-sol` is the alternative. |
 | `claude` | A nested, read-only `claude -p --safe-mode` (`fable` by default; any alias or full model ID such as `claude-fable-5-1`) at the effort you pick | Launched by `crosscheck --run --engine claude`. |
-| `both` | The two above in parallel | Claude reads both reports and keeps one deduplicated list, each finding labeled `codex`, `claude:<model>` or `ambos`. |
+| `codex` (default) | `codex exec`, read-only sandbox, separate process | Default model `gpt-6-astra`; `gpt-5.6-sol` is the alternative. |
+| `gemini` | The Antigravity CLI (`agy`) in read-only `--mode plan --sandbox` (default model `gemini-4-argon`, alternative `gemini-3.8-flash`) at the effort you pick | Launched by `crosscheck --run --engine gemini`. See the `agy` notes under [Prerequisites](#prerequisites). |
+| several | Any combination of the above in parallel: `/crosscheck-setup` asks "Which engines?" as a multi-select; saved as a comma list (`claude,codex,gemini`), or the legacy `both` (Claude and Codex) | Claude reads every report and keeps one deduplicated list, each finding labeled `claude:<model>`, `codex`, `gemini:<model>`, a `+` combination such as `claude+gemini`, or `ambos` (Claude and Codex). |
 
-Out of the box nothing changes: Codex `gpt-6-astra` only.
+Engines are always listed in the order Claude, Codex, Gemini. Out of the box
+nothing changes: Codex `gpt-6-astra` only.
 
 **Models are typed, not listed.** `/crosscheck-setup` offers a few shortcuts
 (full IDs such as `claude-fable-5-1`, so each one pins a version) but "Other"
-takes any exact model ID, for Codex and for Claude, so a new model needs no
+takes any exact model ID, for Claude, Codex and Gemini, so a new model needs no
 plugin update. A Claude alias (`fable`, `opus`) typed there means whatever
 version Claude Code maps it to today (for example
 `ANTHROPIC_DEFAULT_OPUS_MODEL`); a full ID pins the version.
@@ -60,8 +63,27 @@ actually worth researching turned out to be a better deal.
 
 - [Codex CLI](https://github.com/openai/codex) installed and on your `PATH`,
   logged in with a ChatGPT account (`codex login status` should print
-  `Logged in using ChatGPT`). Only required if your engine is `codex` or
-  `both`.
+  `Logged in using ChatGPT`). Only required if your engines include `codex`.
+- The Claude CLI (`claude`) on your `PATH` if your engines include `claude`.
+- The Antigravity CLI (`agy`), only if your engines include `gemini`:
+  install the CLI, run `agy` once interactively and sign in with the Google AI
+  Pro account, then check with `agy models` (it lists the model ids). Notes:
+  - Over ssh `agy` can fail with "authentication required" even when you are
+    logged in, because its credentials live in the macOS keychain. Run it in a
+    local session, or in a tmux started from the GUI. That case is reported as
+    a failed run with `agy`'s own message.
+  - The plugin calls it read-only (`--mode plan --sandbox`). `agy` has no stdin
+    mode for the prompt, so the task goes through a `0600` file the run
+    deletes afterwards, and the task ends with a read-proof line that the reply
+    must open with: a reply that does not echo it is a failed run, not a
+    review.
+  - **The Gemini engine is not isolated like `claude -p --safe-mode`.** `agy`
+    (1.5.6) has no flag to turn off MCP servers, extensions, hooks or
+    workspace rule files, so those load as they would in your own `agy`
+    session. The plugin uses every restriction that exists (`--mode plan
+    --sandbox --disable-slash-commands`).
+  - Failures (not signed in, quota, unknown model, timeout, empty answer) are
+    reported with their reason, never as an empty review.
 - `jq` installed (used for all JSON parsing).
 - A `timeout` command on your `PATH`, GNU coreutils' `timeout` or its
   `gtimeout` alias. Stock macOS ships neither; `brew install coreutils` gets
@@ -239,8 +261,11 @@ tables and acceptance rates, which keep describing full rounds.
 ## Failure handling
 
 If an engine isn't available (Codex not installed, not logged in, timed out,
-or the subagent returns nothing), the skill tells you which one failed and why.
-With `both`, it carries on with the engine that worked. If every configured
+`agy` missing or not signed in, or the subagent returns nothing), the skill
+tells you which one failed and why (for Gemini, `agy`'s own message). With
+several engines, if some failed and at least one worked, it carries on with
+the ones that worked. An `agy` run that succeeds with an empty answer counts
+as failed, never as a clean review. If every configured
 engine fails, it marks that plan's hash `skipped` so you aren't stuck waiting
 on a broken tool, and continues. A corrupt `config.json` is handled the same
 way (`--skip` never reads the config) and is repaired by re-running
@@ -252,10 +277,15 @@ Engine and models are saved by `/crosscheck-setup` in `config.json`, in the
 state root next to `logs/` and `state/` (it is never pruned). Precedence for
 the Codex model: `CROSSCHECK_MODEL` env var, then `config.json`, then the
 default. You can also manage it directly: `crosscheck --config get` and
-`crosscheck --config set --engine E --codex-model M --claude-model C
---codex-effort F --claude-effort G` (all five required; it replaces the file
-whole, which also repairs a corrupt one). Effort for Claude is `low`,
-`medium`, `high`, `xhigh` or `max` and is saved as `claude_effort`. Model IDs
+`crosscheck --config set --engine E --claude-model C --codex-model M
+--claude-effort G --codex-effort F [--gemini-model N --gemini-effort H]` (the
+first five are required, the Gemini pair is optional and defaults to
+`gemini-4-argon` and `high`; it replaces the file whole, which also repairs a
+corrupt one). `E` is one engine, the legacy `both` (Claude and Codex), or a
+comma list of engines in any order (`claude,gemini`), saved in the order
+Claude, Codex, Gemini. Effort for Claude and Gemini is `low`,
+`medium`, `high`, `xhigh` or `max` and is saved as `claude_effort` and
+`gemini_effort`. Model IDs
 are opaque strings: they may not be empty, start with `-`, or contain
 whitespace or shell metacharacters. If you compose that command by hand,
 single-quote every value.
@@ -289,7 +319,13 @@ PII, so `hooks/crosscheck.sh` treats all of it as sensitive:
 
 - The prompt handed to `codex exec` travels over its stdin, never as a
   process argument, so it isn't visible to `ps`, `/proc`, or other
-  same-user process inspection.
+  same-user process inspection. `agy` has no stdin mode, so for Gemini the
+  assembled task is written to a `0600` file in a per-run `0700` directory
+  under `state/tmp`, and only a fixed sentence naming that file goes in
+  argv. The file is deleted when the run ends and any left over by a killed run
+  is pruned after 7 days. `agy`'s stderr goes to a per-run file that is
+  deleted with it, not to the persistent log (a failed run logs one capped
+  line of its error).
 - Everything the script creates under its own state directory (prompts,
   reports, state files, logs) is created under a `umask 077` the script sets
   for itself: new directories `0700`, new files `0600`. This only applies to
@@ -323,8 +359,10 @@ prompt files before a run. Everything under `state/` is pruned after 7 days.
 
 Every audit leaves numbers behind in `metrics.jsonl`, next to `config.json`
 (never pruned, unlike `state/`): which engine and model ran, the round, and
-how many findings of each severity each engine found. In `both` mode it also
-records which findings only Codex found, only Claude found, or both. It stores
+how many findings of each severity each engine (Claude, Codex, Gemini) found.
+With several engines it also records which findings only one engine found, or
+which engines found together (`claude`, `codex`, `gemini`, `claude+gemini`,
+`ambos` for Claude and Codex, ...). It stores
 counts and short labels only, never finding text, so it is safe to keep and
 share even when the plans were about private repos.
 
@@ -342,7 +380,8 @@ crosscheck --stats ~/.claude/plan-mode-crosscheck/metrics.jsonl \
 
 Each run line also carries when it started and ended, how long it took, whether
 it succeeded, failed or timed out (with the engine's error), and the tokens it
-used (Codex from its event stream, Claude from its JSON result, with cost).
+used (Codex from its event stream, Claude and Gemini from their JSON result,
+Claude with cost, Gemini with cost `null` because `agy` reports none).
 After each round the skill records what it did with every finding (incorporated,
 rejected with a short reason, or not applicable), and `--stats` shows the
 acceptance rate per engine and model. A finding with no reason stores `null`
@@ -375,10 +414,11 @@ Or, from inside a live Claude Code session with the plugin enabled, the bare
 works](#how-it-actually-works)): `crosscheck --selftest`.
 
 Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
-`--run` in both modes against a stubbed Codex binary, `--config`, `--prepare`,
-`--record`, `--skip`, argument
-validation, state-root resolution) with no real API calls and no ChatGPT auth
-needed, finishes in a few seconds. This is the fastest way to confirm the
+`--run` in both modes against stubbed Claude, Codex and Gemini (`agy`) binaries,
+`--config`, `--prepare`, `--record`, `--skip`, argument
+validation, state-root resolution) with no real API calls and no ChatGPT or
+Google auth needed (a sentinel `agy` first on `PATH` fails the run if any test
+reaches the real one), finishes in a few seconds. This is the fastest way to confirm the
 plugin's own logic works after any change. It does not confirm Codex CLI
 itself is installed and authenticated, or that the skill behaves correctly
 inside an actual Claude Code session. For that, try both routes for real

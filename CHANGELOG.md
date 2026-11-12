@@ -2,6 +2,62 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.10.0
+
+Gemini, through the Antigravity CLI (`agy`), as the third audit engine.
+
+- **New engine `gemini`.** `crosscheck --run --engine gemini` runs `agy -p`
+  read-only (`--mode plan --sandbox --disable-slash-commands`, JSON output)
+  with a model and an effort (`gemini_model`, default `gemini-4-argon`, and
+  `gemini_effort`, default `high`). The prompt is not in argv: `agy` has no
+  stdin mode, so the task goes in a `0600` file in a per-run `0700` directory
+  under `state/tmp` (removed at exit, pruned after 7 days if a kill left it)
+  and argv holds a fixed sentence naming it. The task ends with a
+  `READ-CHECK: <nonce>` line the reply must open with; a reply without it, or
+  a success with an empty answer, is a failed run with a reason, never a
+  review. `agy`'s stderr stays out of the persistent log.
+- **Engine sets.** `engine` accepts one engine, the legacy `both` (Claude and
+  Codex, kept as typed) or a comma list in any order, saved in the order
+  Claude, Codex, Gemini. `--config get` adds `engines` (the array to run),
+  `gemini_model` and `gemini_effort`. `--config set` takes `--gemini-model` and
+  `--gemini-effort` as optional flags, so every existing call and every old
+  config file keeps working.
+- **Skills.** `/crosscheck-setup` asks "Which engines?" (multi-select), then
+  model and effort for each chosen engine. `/crosscheck` launches every
+  configured engine in parallel; merged findings carry `Source:` values
+  `claude:<model>`, `codex`, `gemini:<model>` or `+` combinations in that order
+  (`claude+codex` stays `ambos`); if some engines fail and one worked, the
+  round carries on.
+- **Metrics.** `--metrics-findings --engines` takes a comma list
+  (`claude,codex` is stored as `both`) and `+` sources; `--stats` lists Gemini
+  in the engine tables and adds a block for rounds with Gemini and others.
+- **Output order changed.** Claude now comes first (it was Codex) in the
+  `--next-round` launch lists of a full round, in the `--stats` model pairs and
+  in the config keys. Anything that greps that text needs the new order.
+- **Usage rule.** `input_tokens` is all input with cache reads included, and
+  `cached_tokens` the cached part. `agy` may count cache reads apart from
+  `input_tokens`, so it is decided per run: when the cache reads are larger
+  than `input_tokens` (they cannot be part of it; seen with a real run, total
+  = input + output with 194,827 cache reads against 76,495 input), or when
+  `cache_read_tokens > 0` and total = input + output + cache read, the cache
+  reads are added to `input_tokens`; otherwise `input_tokens` is used as
+  reported. Thinking tokens are already inside `output_tokens`. `agy` reports no
+  cost, so `cost_usd` is `null`.
+- **Isolation caveat.** The Gemini engine is not isolated like `claude -p
+  --safe-mode`: `agy` 1.5.6 has no flag to turn off MCP servers, extensions,
+  hooks or workspace rule files, so they load as in your own `agy` session. The
+  invocation uses every restriction that exists. Over ssh `agy` can fail with
+  "authentication required" even when logged in (credentials live in the macOS
+  keychain); run it in a local session or a tmux started from the GUI. That is
+  reported as a failed run with `agy`'s own message.
+
+Measured with `agy` 1.5.6 (probes, not documentation): `-p` needs a value and
+does not read stdin (`-p -` is the literal prompt, `-p ""` fails); a `SUCCESS`
+status with an empty response happens; exit codes seen are 1 for errors and 3
+for `--print-timeout`; a base model plus `--effort` works, while an id that
+already carries an effort suffix (`-low`) with a different `--effort` is
+rejected.
+
 ## 3.9.0
 
 Scoped rounds: a cheaper next step when a round's HIGH findings are about
