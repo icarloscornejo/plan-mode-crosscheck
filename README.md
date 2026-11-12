@@ -3,7 +3,15 @@
 **Get an independent second opinion on a finished Plan Mode plan, or on
 whatever's being discussed right now, from [Codex CLI](https://github.com/openai/codex)
 (the default), from a Claude model such as Fable, from Gemini through the
-Antigravity CLI (`agy`), or from several of them in parallel.**
+Antigravity CLI (`agy`), or from all three at once, in parallel.**
+
+Today that is three engines (Claude, Codex and Gemini) running side by side,
+each in its own process with its own model, and Claude merges their reports
+into one list. If one engine fails (out of quota, not signed in, timed out),
+the others carry on: you get the reports that came back and a note saying
+which engine failed and why. Nothing in the design stops at three: the engine list is a
+plain comma list, so more engines (more models, more CLIs) can join in future
+versions without changing how you use it.
 
 Two ways to trigger it:
 
@@ -296,7 +304,7 @@ The rest are optional environment variables, read by `hooks/crosscheck.sh --run`
 |---|---|---|
 | `CROSSCHECK_MODEL` | from `config.json`, else `gpt-6-astra` | Model passed to `codex exec -m`. Overrides the saved choice. |
 | `CROSSCHECK_EFFORT` | from `config.json`, else `medium` | `model_reasoning_effort` passed to Codex (`low`, `medium`, `high`, `xhigh`). Overrides the saved choice. See below for why `medium` is the default. |
-| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh`/`max` 1800 | Budget, in seconds, for the engine call (Codex or Claude, by that engine's effort). Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if Codex is genuinely stuck. |
+| `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh`/`max` 1800 | Budget, in seconds, for each engine call (Claude, Codex or Gemini, by that engine's effort). Set explicitly, it wins over the effort-based default. Runs in the background via the skill, so this only matters if an engine is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs/state live entirely. |
 
 **About the default model:** `gpt-6-astra` is what the author uses day to day;
@@ -419,11 +427,12 @@ Runs the full state machine (hash-keyed pending/reviewed/skipped transitions,
 validation, state-root resolution) with no real API calls and no ChatGPT or
 Google auth needed (a sentinel `agy` first on `PATH` fails the run if any test
 reaches the real one), finishes in a few seconds. This is the fastest way to confirm the
-plugin's own logic works after any change. It does not confirm Codex CLI
-itself is installed and authenticated, or that the skill behaves correctly
+plugin's own logic works after any change. It does not confirm that the Codex
+CLI or `agy` is installed and signed in, or that the skill behaves correctly
 inside an actual Claude Code session. For that, try both routes for real
 (`/crosscheck`, and a real Plan Mode session through to `ExitPlanMode`) and
-check `logs/crosscheck.log` (lines carry `engine=codex` or `engine=claude`).
+check `logs/crosscheck.log` (lines carry `engine=claude`, `engine=codex` or
+`engine=gemini`).
 
 ## Troubleshooting
 
@@ -439,6 +448,15 @@ attention; `auth=ok` with a timeout means Codex didn't finish within
 `CROSSCHECK_TIMEOUT`, raise it, or lower `CROSSCHECK_EFFORT` to `low` for a
 faster (if shallower) pass.
 
+**`crosscheck --run: agy failed` in the log.** The `reason=` on the same log
+line carries `agy`'s own message. "authentication required" means `agy` is not
+signed in for this session: run `agy` once interactively and check with
+`agy models`. Over ssh it can fail even when you are signed in, because its
+credentials live in the macOS keychain: run it from a local session, or a tmux
+started from the GUI. A timeout means Gemini didn't finish within
+`CROSSCHECK_TIMEOUT`: raise it, or pick a lower Gemini effort in
+`/crosscheck-setup`.
+
 **`ExitPlanMode` keeps getting denied no matter what I answer.** The hash is
 keyed to the exact plan text. If Claude revises the plan after you say yes but
 before the audit finishes, or between reviews, that's a new hash and a fresh
@@ -449,11 +467,14 @@ descriptive label) rather than skipped.
 
 ## How it's different from just asking Claude twice
 
-With the Codex engine, Codex runs as a genuinely separate process, separate model, separate context
-window, with its own read-only view of the repo. It doesn't see Claude's
-reasoning, and Claude doesn't see Codex's reasoning until the skill relays it.
-The plan-review prompt specifically instructs Codex to derive the task's real
-requirements from the repository itself before judging the plan, rather than
-just checking the plan for internal consistency. The goal is catching what the
+Codex and Gemini each run as a genuinely separate process, separate model,
+separate context window, with their own read-only view of the repo, and the
+Claude engine is a fresh `claude -p` with none of this conversation. None of
+them sees the planning session's reasoning, and the planning session doesn't
+see theirs until the skill relays it. Run all three in parallel and you get
+three independent takes in the time of the slowest one, merged into one list
+that marks where they agree. The plan-review prompt instructs every engine to
+derive the task's real requirements from the repository itself before judging
+the plan, rather than just checking the plan for internal consistency. The goal is catching what the
 plan didn't think to mention, not just whether the plan is coherent on its own
 terms.
