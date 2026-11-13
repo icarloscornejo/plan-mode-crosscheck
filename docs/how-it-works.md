@@ -77,7 +77,13 @@ find out; you're never blocked indefinitely.
   would in your own `agy` session. `agy` has no stdin mode for the prompt, so
   the task goes through a `0600` file the run deletes afterwards, and the task
   ends with a read-proof line that the reply must open with: a reply that does
-  not echo it is a failed run, not a review. Failures (not signed in, quota,
+  not echo it is a failed run, not a review. `agy` in print mode cannot ask
+  for approval, so it denies any shell command the model tries (even a plain
+  `ls`) and ends the turn with an empty answer. The task therefore tells the
+  model to use only its file reading and search tools; `agy` denies every
+  shell command, and a run that still ends that way fails with
+  `denied: command`. No allow rules are added: they did not fix it alone and
+  would let the model read paths outside the repo. Failures (not signed in, quota,
   unknown model, timeout, empty answer) are reported with their reason, never
   as an empty review.
 

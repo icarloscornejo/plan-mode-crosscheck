@@ -455,6 +455,12 @@ run_claude() {
 # "only thing allowed" and "no descriptive sections" rules of the review text.
 gemini_read_check_instructions="The last line of the task file you were told to read is 'READ-CHECK: <value>'. When you reply, begin your reply with exactly that line, copied unchanged, then continue with your answer. That line is the one exception to every rule in these instructions about what a reply may contain (the 'only thing allowed besides findings' rule and the 'no descriptive sections' rule): it is not a finding and not a section."
 
+# Also gemini only. agy's print mode cannot ask for approval, so it soft-denies
+# any shell command the model tries (even a plain `ls`) and ends the turn with
+# an empty reply. Allow rules for read-only commands did not fix it alone and
+# let the model read paths outside the repo, so the model is told not to try.
+gemini_no_shell_instructions="Inspect the repository only with your file reading and search tools. Do not run any shell or terminal command at all: in this run every shell command is denied and ends your review with no answer."
+
 # agy's `--output-format json` usage, normalized to the repo contract
 # (`input_tokens` = ALL input, cached part included). agy counts cache reads
 # apart when its total is input + output + cache reads, or when the cache
@@ -989,7 +995,7 @@ cmd_run() {
   # treats text as data. `%` cuts at the last marker, the one closing the template.
   local instructions_head inserted="$kind_instructions"$'\n\n'
   [ "$scope" = "delta" ] && inserted="$inserted$delta_instructions"$'\n\n'
-  [ "$engine" = "gemini" ] && inserted="$inserted$gemini_read_check_instructions"$'\n\n'
+  [ "$engine" = "gemini" ] && inserted="$inserted$gemini_read_check_instructions"$'\n\n'"$gemini_no_shell_instructions"$'\n\n'
   instructions_head="${instructions%"$marker"*}"
   instructions="$instructions_head$inserted${instructions#"$instructions_head"}"
 
@@ -3402,6 +3408,17 @@ AGY_STUB_EOF
       cp "$(scope_stdin_of "$scope_engine")" "$scope_copy-full"
       check "scope full ($scope_engine, $scope_mode): stdin equals the default run" "$(cmp -s "$scope_copy-full" "$scope_copy-default" && echo same || echo differs)" "same"
       check "scope delta ($scope_engine, $scope_mode): the delta block is the only difference from the default run" "$(without_delta "$scope_copy-delta")" "$(flat_text "$scope_copy-default")"
+      # Gemini only: agy print mode cannot ask approval, so a shell command
+      # ends the turn with an empty reply. The ban sits above the marker.
+      for scope_variant in delta default; do
+        shell_at="$(flat_pos "$scope_copy-$scope_variant" "Do not run any shell or terminal command")"
+        marker_at="$(flat_pos "$scope_copy-$scope_variant" "$scope_marker")"
+        if [ "$scope_engine" = gemini ]; then
+          check "no-shell ($scope_variant, gemini, $scope_mode): the instruction is above the marker" "$([ "${shell_at:-0}" -gt 0 ] && [ "$shell_at" -lt "${marker_at:-0}" ] && echo yes || echo "no:$shell_at/$marker_at")" "yes"
+        else
+          check "no-shell ($scope_variant, $scope_engine, $scope_mode): the instruction is absent" "${shell_at:-0}" "0"
+        fi
+      done
     done
   done
   local scope_block
@@ -3586,6 +3603,7 @@ TIMEOUT_K_EOF
   check "gemini argv: --disable-slash-commands" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--disable-slash-commands')" "1"
   check "gemini argv: --print-timeout 1170s for the 1200s high budget" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--print-timeout 1170s ')" "1"
   check "gemini argv: --add-dir names the directory of the task file" "$(cat "$agy_dir/add_dir.last" 2>/dev/null)" "$(dirname "$gem_task_path")"
+  check "gemini argv: no --settings and no permission rules" "$(printf '%s' "$gem_argv_flat" | grep -c -i -e '--settings' -e 'permission')" "0"
   check "gemini argv: never --dangerously-skip-permissions" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e 'dangerously-skip-permissions')" "0"
   check "gemini argv: no plan text and no request text" "$(grep -c -e 'gemplan-secret-marker' -e 'PROPOSED PLAN' -e 'gemrequest' "$agy_dir/argv.last" 2>/dev/null)" "0"
   check "gemini argv: the prompt names the task file path" "$(grep -c -F -- "Read the file $gem_task_path" "$agy_dir/argv.last" 2>/dev/null)" "1"
@@ -3906,8 +3924,9 @@ TIMEOUT_K_EOF
   check "README names the Antigravity CLI binary agy" "$(grep -c -F 'agy' "$readme_md" 2>/dev/null | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "README says the Gemini engine is not isolated" "$(tr -s '[:space:]' ' ' <"$readme_md" 2>/dev/null | grep -q -i -F 'not isolated' && echo yes || echo no)" "yes"
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
+  check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.10.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.10.0"
+  check "the CHANGELOG top entry is 3.10.1" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.10.1"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.

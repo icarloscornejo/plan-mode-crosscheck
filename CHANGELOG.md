@@ -2,6 +2,19 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.10.1
+
+Gemini audits no longer die when the model reaches for a shell.
+
+- **Fix: empty Gemini answers.** `agy` in print mode cannot ask for approval,
+  so any shell command the model tried (even a plain `ls`) was denied and
+  ended the turn with an empty reply, which the plugin reported as a failed
+  run (`empty response (denied: command)`). Every Gemini run, in both modes and
+  both scopes, now carries an instruction above the template marker to use
+  only the file reading and search tools and never run a shell command. Claude
+  and Codex prompts are unchanged, and no `agy` flag or permission rule was
+  added. A run that still ends with a denied action keeps failing cleanly.
+
 ## 3.10.0
 
 Gemini, through the Antigravity CLI (`agy`), as the third audit engine.
