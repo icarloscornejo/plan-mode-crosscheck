@@ -64,8 +64,11 @@
 #      CRITICAL > 0 (the plan text did not change, so nothing was addressed).
 #      A missing or unreadable findings record still fails open.
 #   8. `--next-round --round N [--scoped-streak S] --item SEV:KIND:STATUS...`:
-#      prints which round follows a relayed one (full, scoped or show) and
-#      the `--run` engine arguments to launch. Writes nothing.
+#      prints which round follows a relayed one (scoped or show, never full)
+#      and the `--run` engine arguments to launch. Writes nothing.
+#   9. `--bundle --plan-file PATH [--prior-report PATH]...`: the round's
+#      context bundle (what the plan names, cut to the relevant lines, inside
+#      the git root), printed to stdout for the skill to append to the prompt.
 #
 # There is no thread reuse across calls. Every `--run` is a fresh Codex
 # thread. This is a deliberate downgrade from v2, not an oversight: v2's
@@ -300,7 +303,12 @@ check_instructions="This is a connectivity check, not a review. Reply with the s
 
 The request:"
 
-delta_instructions="SCOPED ROUND. Earlier rounds (see PRIOR ROUNDS) already swept this plan in full, and the findings of the last round were about process. For THIS round the 'only review' rule applies to: (a) every defect in the text listed under CHANGES SINCE LAST ROUND; (b) unchanged text that those changes contradict or make stale; (c) any defect in what the request delivers, anywhere in the plan or in the code it changes, INCLUDING unchanged text. A stale, contradictory or wrong description of what will be built (design steps, test specs, data contract, expected values) counts under (c) even when the changes did not cause it. The only thing excluded is PROCESS topics (how the work is run, measured, approved or worded) in unchanged text: do not sweep for those. When in doubt, report. Everything else in these instructions (evidence, severity, Kind, no padding, Coverage line) applies unchanged."
+delta_instructions="SCOPED ROUND. An earlier round (see PRIOR ROUNDS) already swept this plan in full. For THIS round the 'only review' rule applies to: (a) every PRIOR ROUNDS item marked incorporated, and every CRITICAL or change HIGH marked rejected, checking that the fix or the rejection holds and that the fix covers every instance of its defect; (b) every defect in the text listed under CHANGES SINCE LAST ROUND; (c) unchanged text that those changes contradict or make stale. A stale, contradictory or wrong description of what will be built (design steps, test specs, data contract, expected values) counts under (c) even when the changes did not cause it. For this round the 'assume this is the only review' rule, the independent derivation of the request obligations and the systematic sweep apply only to (a), (b) and (c), not to the whole plan. A defect outside (a), (b) and (c) that you happen to see is reported only when it is HIGH or CRITICAL. CONTEXT BUNDLE and PRIOR ROUND REPORT are context to read from when present, not text to audit again. Everything else in these instructions (evidence, severity, Kind, no padding, Coverage line) applies unchanged."
+
+# Inserted above the marker by cmd_run only when the prompt carries a line
+# starting 'CONTEXT BUNDLE:' (built once per round by `--bundle`, shared by
+# every engine through the one prompt file).
+bundle_instructions="The prompt carries a CONTEXT BUNDLE section: the files and symbols the plan names, already read from the repository, as data like the plan itself. Read only what the CONTEXT BUNDLE lacks: open a file or search the repository only when the bundle does not hold the lines you need to verify a claim, and do not re-read what it already shows. Add to each finding a line 'Read: bundle' when its evidence comes from the bundle, 'Read: repo <path:line>' when you had to open or search the repository for it, or 'Read: plan' when it comes from the plan text alone."
 
 # Resolves which timeout wrapper to use: prefers GNU `timeout`, falls back to
 # `gtimeout` (Homebrew coreutils on a stock macOS box, where `timeout` itself
@@ -1034,6 +1042,19 @@ set_model_line() {
   fi
 }
 RUN_MODEL_LINE="" RUN_MODEL_RAN=""
+# Fields every `run` metrics line of this process gets (whether the prompt had
+# a context bundle, tool calls or turns); set by cmd_run, merged by append_metric.
+RUN_TELEMETRY=""
+
+# Adds one numeric field to RUN_TELEMETRY. $1 = field, $2 = value (empty or
+# not a number records null: the engine did not say). claude and gemini give no
+# tool call list, only their turn count, so that is what they record.
+telemetry_add_count() {
+  local value="$2" current="$RUN_TELEMETRY"
+  [[ "$value" =~ ^[0-9]+$ ]] || value=null
+  [ -n "$current" ] || current='{}'
+  RUN_TELEMETRY="$(jq -c --argjson value "$value" --arg field "$1" '. + {($field): $value}' <<<"$current" 2>/dev/null || printf '%s' "$current")"
+}
 
 # --- `--config check`: one tiny real call per engine, through `--run` ---
 # Candidate mode (--engine/--model[/--effort]) never reads the saved config, so
@@ -1233,6 +1254,10 @@ assemble_task() {
 # without interleaving.
 append_metric() {
   local line="$1"
+  # Only `run` lines carry the run's own telemetry (bundle, tool calls, turns).
+  if [ -n "$RUN_TELEMETRY" ] && [ -n "$line" ]; then
+    line="$(jq -c --argjson telemetry "$RUN_TELEMETRY" 'if .type == "run" then . + $telemetry else . end' <<<"$line" 2>/dev/null || printf '%s' "$line")"
+  fi
   if [ -z "$line" ] || ! printf '%s\n' "$line" >>"$METRICS_FILE" 2>/dev/null; then
     log "metrics: could not append to $METRICS_FILE"
   fi
@@ -1291,12 +1316,14 @@ publish_report() {
       round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo} + $extra' 2>/dev/null)"
 
   [ -z "$RUN_MODEL_LINE" ] || printf '%s\n' "$RUN_MODEL_LINE"
+  # The skill hands this path to the next round's `--bundle --prior-report`.
+  printf 'crosscheck-report: %s\n' "$artifact_file"
   local body_bytes
   body_bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if [ "$body_bytes" -le "$STDOUT_INLINE_MAX_BYTES" ]; then
     printf '%s\n' "$body"
   else
-    printf 'crosscheck: report is %s bytes, too large to inline safely. Full report written to:\n%s\n\nRead that file directly before summarizing.\n' "$body_bytes" "$artifact_file"
+    printf 'crosscheck: report is %s bytes, too large to inline safely. Full report written to the path on the crosscheck-report line above.\n\nRead that file directly before summarizing.\n' "$body_bytes"
   fi
   return 0
 }
@@ -1377,6 +1404,16 @@ cmd_run() {
   if ! prompt_body="$(cat "$prompt_file" 2>>"$STDERR_LOG_FILE")" || [ -z "$prompt_body" ]; then
     echo "crosscheck --run: could not read --prompt-file $prompt_file. See $STDERR_LOG_FILE." >&2
     return 1
+  fi
+
+  # A prompt with a context bundle gets the instruction to read only what the
+  # bundle lacks, above the marker like every other inserted instruction, and
+  # its run line says so. `check` prompts never carry a bundle.
+  RUN_TELEMETRY='{"bundle":false}'
+  if [ "$mode" != "check" ] && grep -q '^CONTEXT BUNDLE:' <<<"$prompt_body"; then
+    local instructions_before_marker="${instructions%"$marker"*}"
+    instructions="$instructions_before_marker$bundle_instructions"$'\n\n'"${instructions#"$instructions_before_marker"}"
+    RUN_TELEMETRY='{"bundle":true}'
   fi
 
   # A scoped round is anchored on the changes; without them it would review
@@ -1492,6 +1529,7 @@ cmd_run() {
       gemini_error="$(jq -r '(.error // "") | tostring' <<<"$gemini_result" 2>/dev/null)"
       gemini_usage="$(gemini_usage_json "$gemini_result")"
     fi
+    telemetry_add_count turns "$(jq -r '.num_turns // empty' <<<"${gemini_result:-null}" 2>/dev/null)"
     local gemini_body="" gemini_proof="no" gemini_timed_out=0 gemini_has_response="false" gemini_timeout_reason gemini_denied_text
     gemini_denied_text="$(gemini_denied_note "$gemini_result")"
     [ -z "$gemini_result" ] || gemini_has_response="$(jq -r '(.response // "") | test("\\S")' <<<"$gemini_result" 2>/dev/null)"
@@ -1609,6 +1647,7 @@ cmd_run() {
     fi
     local claude_result claude_output claude_usage="null" claude_is_error
     claude_result="$(claude_result_json "$json_file")"
+    telemetry_add_count turns "$(jq -r '.num_turns // empty' <<<"${claude_result:-null}" 2>/dev/null)"
     if [ -n "$claude_result" ]; then
       claude_output="$(printf '%s' "$claude_result" | jq -r '.result // ""' 2>/dev/null)"
       claude_usage="$(claude_usage_json "$claude_result")"
@@ -1695,6 +1734,7 @@ cmd_run() {
   codex_usage="$(codex_usage_json "$json_file")"
   local tool_verdict
   tool_verdict="$(tool_call_verdict "$tool_failed" "$tool_total")"
+  telemetry_add_count tool_calls "$tool_total"
   if [ "$tool_verdict" = "failed" ]; then
     local tool_reason="every tool call failed ($tool_failed of $tool_total): $tool_error"
     log "run ($mode) engine=codex could not read the repo: $tool_reason"
@@ -1969,14 +2009,27 @@ normalize_finding_source() {
 
 cmd_metrics_findings() {
   local hash="" round="" engines="" scope="full" finding severity source counts finding_status finding_reason
-  local -a findings=()
+  local -a findings=() finding_reads=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --hash) hash="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --round) round="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --engines) engines="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
       --scope) scope="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
-      --finding) findings+=("${2:-}"); shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --finding) findings+=("${2:-}"); finding_reads+=(""); shift $(( $# >= 2 ? 2 : 1 )) ;;
+      # Binds to the --finding right before it: which read (the context bundle,
+      # the repo or the plan text alone) produced that finding.
+      --finding-read)
+        local last_finding=$(( ${#findings[@]} - 1 ))
+        if [ "$last_finding" -lt 0 ] || [ -n "${finding_reads[$last_finding]}" ]; then
+          echo "crosscheck --metrics-findings: --finding-read must follow a --finding that has none yet" >&2
+          return 2
+        fi
+        case "${2:-}" in
+          bundle|repo|plan) finding_reads[last_finding]="$2" ;;
+          *) echo "crosscheck --metrics-findings: --finding-read must be bundle, repo or plan" >&2; return 2 ;;
+        esac
+        shift $(( $# >= 2 ? 2 : 1 )) ;;
       *) shift ;;
     esac
   done
@@ -2058,10 +2111,13 @@ cmd_metrics_findings() {
   # accepted or rejected. Reasons are short labels, capped.
   local outcomes="[]"
   if [ ${#findings[@]} -gt 0 ]; then
-    outcomes="$(printf '%s\n' "${findings[@]}" | tr '\r' ' ' | jq -R -s -c '
-      split("\n") | map(select(length > 0) | split(":")
+    local reads_json
+    reads_json="$(printf '%s\n' "${finding_reads[@]}" | jq -R -s -c 'split("\n")[:-1] | map(if . == "" then "unknown" else . end)')"
+    outcomes="$(printf '%s\n' "${findings[@]}" | tr '\r' ' ' | jq -R -s -c --argjson reads "$reads_json" '
+      split("\n") | map(select(length > 0)) | to_entries | map(.key as $index | .value | split(":")
         | {severity: .[0], source: .[1], status: (if (.[2] // "") == "" then "unknown" else .[2] end),
-           reason: ((.[3:] | join(":") | .[0:80]) as $reason | if ($reason | test("^\\s*$")) then null else $reason end)})')" \
+           reason: ((.[3:] | join(":") | .[0:80]) as $reason | if ($reason | test("^\\s*$")) then null else $reason end),
+           read: ($reads[$index] // "unknown")})')" \
       || { echo "crosscheck --metrics-findings: could not build outcomes" >&2; return 1; }
   fi
 
@@ -2115,22 +2171,26 @@ cmd_next_round() {
   }
   configured_engines="$(printf '%s' "$resolved_config" | jq -c '.engines')"
 
-  local next reason
+  # From round 2 on a round only re-audits what was flagged and what changed
+  # (the scoped, `--scope delta` round): `full` is never answered. A CRITICAL or
+  # change HIGH (whatever its status) is re-checked by every configured engine;
+  # incorporated process HIGHs get one scoped round on one engine, and the
+  # skill passes --scoped-streak 0 after any round launched for the former, so
+  # only consecutive process-only scoped rounds count toward the streak.
+  local next reason fanout="0"
   if [ "$needs_full" -eq 1 ]; then
-    next="full"; reason="a CRITICAL, or a HIGH whose kind is change or unknown, was relayed"
-  elif [ "$process_incorporated" -eq 1 ] && [ "$round" -lt 2 ]; then
-    next="full"; reason="incorporated process HIGHs on the first completed round: no scoped round yet"
+    next="scoped"; fanout="1"; reason="a CRITICAL, or a HIGH whose kind is change or unknown, was relayed: its fix or rejection is re-checked by every engine, scoped to the flagged points and the changes"
   elif [ "$process_incorporated" -eq 1 ] && [ "$streak" -eq 0 ]; then
-    next="scoped"; reason="only incorporated process HIGHs, after an earlier completed round, and no scoped round yet"
+    next="scoped"; reason="only incorporated process HIGHs and no process-only scoped round yet"
   elif [ "$process_incorporated" -eq 1 ]; then
     next="show"; reason="the scoped round just relayed found only process HIGHs"
   else
     next="show"; reason="no CRITICAL and no HIGH left to verify (none, or only rejected or not-applicable process ones)"
   fi
-  # A scoped round runs ONE engine: codex if configured, else claude, else gemini.
-  jq -cn --arg next "$next" --argjson engines "$configured_engines" --arg reason "$reason" '
+  # A process-only scoped round runs ONE engine: codex if configured, else claude, else gemini.
+  jq -cn --arg next "$next" --arg fanout "$fanout" --argjson engines "$configured_engines" --arg reason "$reason" '
     {next: $next,
-       launch: (if $next == "full" then $engines | map("--engine " + .)
+       launch: (if $next == "scoped" and $fanout == "1" then $engines | map("--engine " + . + " --scope delta")
                 elif $next == "scoped" then ["--engine " + (if ($engines | index("codex")) != null then "codex" elif ($engines | index("claude")) != null then "claude" else "gemini" end) + " --scope delta"]
                 else [] end),
        reason: $reason}'
@@ -2210,13 +2270,17 @@ map(if .type == "findings" then normalize_outcomes else . end)
 | (map(select((.type == "run" or .type == "findings") and .scope == "delta"))) as $delta_lines
 | ($delta_lines | map(select(.type == "run"))) as $delta_runs
 | ($delta_lines | map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $delta_rounds
+# Scoped rounds (every round from the second on) still count as rounds, and
+# their findings and models are looked up here, before the delta lines go.
+| (map(select(.type == "run"))) as $every_run
+| (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
+| (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $plan_rounds
 | map(select(.scope != "delta"))
 | (map(select(.type == "run"))) as $all_runs
 | ($all_runs | map(select(.mode == "plan-review" and (.model // "") != ""))) as $audit_runs
 | ($audit_runs | map(select((.status // "success") | IN("success", "degraded")))) as $runs
 | ($all_runs | map(select(((.status // "success") | IN("success", "degraded")) | not))) as $failed_runs
 | ($all_runs | map(select((.mode != "plan-review" or (.model // "") == "") and ((.status // "success") | IN("success", "degraded"))))) as $other_runs
-| (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
 | (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
 | ($rounds | map(select(((.engines // "") | contains(",") | not) and .engines != "both"))) as $single_rounds
 | ($rounds | map(select(.engines == "both"))) as $both_rounds
@@ -2224,7 +2288,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
 | ($rounds | map(select(((.engines // "") | contains(",")) and ((.engines // "") | contains("gemini"))))) as $gemini_rounds
 | [
     "Planes auditados: \($rounds | map(select(.round == 1)) | length)",
-    "Planes con mas de una ronda: \($rounds | map(select(.round == 2)) | length)",
+    "Planes con mas de una ronda: \($plan_rounds | map(select(.round == 2)) | length)",
     "Auditorias por motor y modelo:",
     ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length)\(averages)"),
     "Auditorias degradadas: \($runs | map(select(.status == "degraded")) | length)",
@@ -2236,7 +2300,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
     "Aceptacion de hallazgos por motor y modelo (incorporados / rechazados):",
     ([ $round_records[] | . as $record | ($record.outcomes // [])[]
        | (if .source == "ambos" then ["claude", "codex"] else (.source | split("+")) end)[] as $engine
-       | {engine: $engine, model: engine_model_of($all_runs; $record.hash; $record.round; $engine), status: .status} ]
+       | {engine: $engine, model: engine_model_of($every_run; $record.hash; $record.round; $engine), status: .status} ]
       | if length == 0 then ["  sin hallazgos con estado todavia"][]
         else (group_by([.engine, .model]) | .[]
           | ([.[] | select(.status == "incorporated")] | length) as $accepted
@@ -2271,7 +2335,20 @@ map(if .type == "findings" then normalize_outcomes else . end)
     ($delta_runs | group_by([.engine, .model]) | .[]
       | (map(select((.status // "success") | IN("success", "degraded")))) as $succeeded
       | "  \(.[0].engine) \(.[0].model): \($succeeded | length) corridas, \(length - ($succeeded | length)) fallidas\($succeeded | averages)"),
-    ($delta_rounds | count_rows as $rows | "  hallazgos: \(severity_line($rows)) (critical+high: \(critical_high($rows)))")
+    ($delta_rounds | count_rows as $rows | "  hallazgos: \(severity_line($rows)) (critical+high: \(critical_high($rows)))"),
+    # What an audit costs, split by scope and by whether the prompt had a
+    # context bundle, so the bundle is judged on its own and never mixed with
+    # the cheaper scoped rounds. Codex counts tool calls; claude and gemini
+    # only their turns.
+    "Llamadas y tokens por auditoria (motor, ronda y bundle):",
+    ($every_run | map(select(.mode == "plan-review" and ((.status // "success") | IN("success", "degraded"))))
+      | group_by([.engine, (.scope // "full"), (.bundle // false)]) | .[]
+      | . as $group
+      | ([$group[] | (.tool_calls // .turns) | numbers]) as $calls
+      | ([$group[].input_tokens | numbers]) as $tokens
+      | "  \($group[0].engine) \($group[0].scope // "full") \(if ($group[0].bundle // false) then "con" else "sin" end) bundle: \($group | length) auditorias, \(if ($calls | length) > 0 then "\(($calls | add / ($calls | length)) | round) llamadas" else "llamadas sin dato" end), \(if ($tokens | length) > 0 then "\(($tokens | add / ($tokens | length)) | round) tokens de entrada" else "tokens sin dato" end)"),
+    ([$round_records[] | (.outcomes // [])[] | (.read // "unknown")]) as $reads
+    | "Lectura que produjo cada hallazgo: bundle \($reads | map(select(. == "bundle")) | length), repo \($reads | map(select(. == "repo")) | length), plan \($reads | map(select(. == "plan")) | length), sin dato \($reads | map(select(IN("bundle", "repo", "plan") | not)) | length)"
   ] | .[]
 '
 
@@ -2322,6 +2399,150 @@ cmd_stats() {
   fi
   printf '%s\n' "$valid_lines" | jq -r -s "$normalize_outcomes_def $stats_program"
   return 0
+}
+
+# --- `--bundle`: the context bundle of a round. An auditor's every tool call
+# resends its whole context, so what the plan names is read once here (files and
+# symbols, cut to the relevant lines) and put in the prompt, and the auditor only
+# reads what is missing. Prints to stdout, writes nothing, and prints NOTHING
+# when there is nothing to ship. The skill appends it to the round's one prompt
+# file, so every engine of the round shares the same bundle.
+#
+# Everything shipped stays inside the git root and goes through bundle_path_ok:
+# tracked, not a symlink, no dot component, no secret-looking name, text. agy
+# sends what it reads to Google, so a path the plan names is never trusted.
+BUNDLE_FILE_BYTES=6000
+BUNDLE_TOTAL_BYTES=40000
+BUNDLE_MAX_FILES=12
+BUNDLE_REPORT_BYTES=12000
+BUNDLE_ROOT=""
+BUNDLE_TRACKED=""
+
+# $1 = path relative to BUNDLE_ROOT.
+bundle_path_ok() {
+  local rel="$1" lower mode dir
+  case "$rel" in ''|/*|..|../*|*/..|*/../*) return 1 ;; esac
+  case "/$rel" in */.*) return 1 ;; esac
+  lower="$(printf '%s' "${rel##*/}" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in *.pem|*.key|*.p12|*.pfx|*credential*|*secret*|*keychain*|id_rsa*) return 1 ;; esac
+  # mode 120000 is a symlink: refused, so a link to an untracked file or a dotfile cannot get in.
+  mode="$(printf '%s\n' "$BUNDLE_TRACKED" | awk -F'\t' -v path="$rel" '$2 == path { split($1, fields, " "); print fields[1]; exit }')"
+  case "$mode" in 100644|100755) : ;; *) return 1 ;; esac
+  [ -f "$BUNDLE_ROOT/$rel" ] && [ ! -L "$BUNDLE_ROOT/$rel" ] || return 1
+  dir="$(cd "$BUNDLE_ROOT/$(dirname -- "$rel")" 2>/dev/null && pwd -P)" || return 1
+  case "$dir/" in "$BUNDLE_ROOT/"*) : ;; *) return 1 ;; esac
+  grep -Iq . "$BUNDLE_ROOT/$rel" 2>/dev/null
+}
+
+# A report is only accepted straight out of the reports directory (physical
+# paths, so a symlinked state root still works). Creates nothing.
+bundle_report_ok() {
+  local report="$1" reports_physical report_dir
+  [ -f "$report" ] && [ ! -L "$report" ] || return 1
+  reports_physical="$(cd "$REPORTS_DIR" 2>/dev/null && pwd -P)" || return 1
+  report_dir="$(cd "$(dirname -- "$report")" 2>/dev/null && pwd -P)" || return 1
+  [ "$report_dir" = "$reports_physical" ]
+}
+
+cmd_bundle() {
+  local plan_file="" report report_text="" report_room="$BUNDLE_REPORT_BYTES" top
+  local -a reports=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan-file) plan_file="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+      --prior-report) reports+=("${2:-}"); shift $(( $# >= 2 ? 2 : 1 )) ;;
+      *) echo "crosscheck --bundle: unknown argument '$1'" >&2; return 2 ;;
+    esac
+  done
+  [ -n "$plan_file" ] && [ -r "$plan_file" ] || { echo "crosscheck --bundle: --plan-file must be a readable file" >&2; return 2; }
+
+  # Bytes, not characters: the caps below count bytes. The plan is read once,
+  # before anything is printed, so `>>"$plan_file"` cannot feed back into it.
+  local LC_ALL=C plan_text
+  plan_text="$(cat -- "$plan_file")"
+
+  if [ "${#reports[@]}" -gt 0 ]; then
+    for report in "${reports[@]}"; do
+      if ! bundle_report_ok "$report"; then
+        echo "crosscheck --bundle: skipped --prior-report $report (not a regular file directly in $REPORTS_DIR)" >&2
+        continue
+      fi
+      [ "$report_room" -gt 0 ] || break
+      local report_body
+      report_body="$(head -c "$report_room" -- "$report")"
+      report_room=$(( report_room - ${#report_body} ))
+      report_text="$report_text"$'\n'"PRIOR ROUND REPORT ($(basename -- "$report")):"$'\n'"$report_body"
+    done
+  fi
+
+  local sections="" left_out="" section_count=0 total_bytes=0
+  if command -v git >/dev/null 2>&1 && top="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$top" ] \
+    && BUNDLE_ROOT="$(cd "$top" 2>/dev/null && pwd -P)" && BUNDLE_TRACKED="$(GIT_LITERAL_PATHSPECS=1 git -C "$BUNDLE_ROOT" ls-files -s 2>/dev/null)"; then
+    local -a symbols=()
+    local token rel symbol symbol_list section hit_lines found grep_line grep_path considered=0
+    while IFS= read -r symbol; do symbols+=("$symbol"); done < <(printf '%s\n' "$plan_text" | grep -o '`[A-Za-z_][A-Za-z0-9_]\{2,\}`' | tr -d '`' | awk '!seen[$0]++')
+    symbol_list="$(printf '%s\n' "${symbols[@]+"${symbols[@]}"}")"
+
+    # Paths: every token with a slash or a file extension, normalised first.
+    while IFS= read -r token; do
+      considered=$(( considered + 1 )); [ "$considered" -le 300 ] || break
+      rel="$(printf '%s' "$token" | sed -E 's/:[0-9]+(-[0-9]+)?$//; s/[.:]+$//; s#^\./##')"
+      case "$rel" in "$BUNDLE_ROOT"/*) rel="${rel#"$BUNDLE_ROOT"/}" ;; esac
+      [[ "$rel" =~ ^[A-Za-z0-9_./-]+$ ]] || continue
+      [[ "$rel" == */* || "$rel" =~ \.[A-Za-z0-9]{1,5}$ ]] || continue
+      bundle_path_ok "$rel" || continue
+      case $'\n'"$left_out$sections" in *$'\n'"=== $rel ==="*|*$'\n'"- $rel"$'\n'*) continue ;; esac
+      if [ "$section_count" -ge "$BUNDLE_MAX_FILES" ]; then left_out="$left_out- $rel"$'\n'; continue; fi
+      section="$(bundle_file_section "$rel" "$symbol_list")"
+      if [ $(( total_bytes + ${#section} )) -gt $(( BUNDLE_TOTAL_BYTES - 1500 )) ]; then left_out="$left_out- $rel"$'\n'; continue; fi
+      sections="$sections$section"$'\n'
+      total_bytes=$(( total_bytes + ${#section} + 1 )); section_count=$(( section_count + 1 ))
+    done < <(printf '%s\n' "$plan_text" | tr '[:space:]`"'"'"'(),;<>[]{}|' '\n' | awk 'NF && !seen[$0]++')
+
+    # A symbol in none of the shipped files: up to 3 tracked hits, each one vetted like any path.
+    for symbol in "${symbols[@]+"${symbols[@]}"}"; do
+      [ "$section_count" -lt "$BUNDLE_MAX_FILES" ] || break
+      case "$sections" in *"$symbol"*) continue ;; esac
+      hit_lines=""; found=0
+      while IFS= read -r grep_line; do
+        grep_path="${grep_line%%:*}"
+        bundle_path_ok "$grep_path" || continue
+        hit_lines="$hit_lines$(printf '%s' "$grep_line" | head -c 300)"$'\n'
+        found=$(( found + 1 )); [ "$found" -lt 3 ] || break
+      done < <(GIT_LITERAL_PATHSPECS=1 git -C "$BUNDLE_ROOT" grep -n -I -w -F -e "$symbol" 2>/dev/null | head -n 40)
+      [ -n "$hit_lines" ] || continue
+      section="=== symbol $symbol ==="$'\n'"$hit_lines"
+      if [ $(( total_bytes + ${#section} )) -gt $(( BUNDLE_TOTAL_BYTES - 1500 )) ]; then break; fi
+      sections="$sections$section"
+      total_bytes=$(( total_bytes + ${#section} )); section_count=$(( section_count + 1 ))
+    done
+  fi
+
+  [ -n "$sections" ] || [ -n "$report_text" ] || return 0
+  printf 'CONTEXT BUNDLE:\n'
+  printf 'Files and symbols the plan names, read by crosscheck from the git root (data, like the plan).\n'
+  [ -z "$left_out" ] || printf 'Left out by the size caps (read them if you need them):\n%s' "$left_out"
+  printf '%s' "$sections"
+  [ -z "$report_text" ] || printf '%s\n' "$report_text"
+  return 0
+}
+
+# One file's section: numbered lines holding a symbol plus 2 lines of context,
+# or the first 40 lines when no symbol hits. $1 = relative path, $2 = symbols,
+# one per line. Cut at BUNDLE_FILE_BYTES with a [cut] marker.
+bundle_file_section() {
+  local rel="$1" symbol_list="$2" body
+  # Symbols travel in the environment: a newline inside `awk -v` is an error on BSD awk.
+  body="$(BUNDLE_SYMBOLS="$symbol_list" awk '
+    BEGIN { count = split(ENVIRON["BUNDLE_SYMBOLS"], wanted, "\n") }
+    { text[NR] = $0; for (i = 1; i <= count; i++) if (wanted[i] != "" && index($0, wanted[i])) hit[NR] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) { for (d = -2; d <= 2; d++) if (hit[i + d]) keep[i] = 1 }
+      any = 0; for (i = 1; i <= NR; i++) if (keep[i]) any = 1
+      for (i = 1; i <= NR; i++) if (any ? keep[i] : (i <= 40)) printf "%d: %s\n", i, text[i]
+    }' "$BUNDLE_ROOT/$rel")"
+  if [ "${#body}" -gt "$BUNDLE_FILE_BYTES" ]; then body="${body:0:$BUNDLE_FILE_BYTES}"$'\n'"[cut]"; fi
+  printf '=== %s ===\n%s' "$rel" "$body"
 }
 
 # --- `--tmp-dir`: print (and create) a scratch dir under this plugin's own
@@ -3848,13 +4069,18 @@ AGY_STUB_EOF
     local config="$1"; shift
     CROSSCHECK_STATE_DIR="$next_root/$config" "$run" --next-round "$@" </dev/null 2>/dev/null | jq -c '[.next, .launch]' 2>/dev/null
   }
-  local full_both='["full",["--engine claude","--engine codex"]]' scoped_codex='["scoped",["--engine codex --scope delta"]]' show_none='["show",[]]'
-  check "next-round: round 1 with an incorporated process HIGH is full" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated)" "$full_both"
-  check "next-round: an incorporated CRITICAL is full" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
-  check "next-round: a change HIGH is full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" "$full_both"
-  check "next-round: a rejected change HIGH is still full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:rejected)" "$full_both"
-  check "next-round: process and change HIGHs mixed is full" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:change:incorporated)" "$full_both"
-  check "next-round: a HIGH with kind unknown counts as change (full)" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:unknown:incorporated)" "$full_both"
+  # From round 2 on a round only re-audits what was flagged: `full` is never answered.
+  local scoped_all_both='["scoped",["--engine claude --scope delta","--engine codex --scope delta"]]' scoped_codex='["scoped",["--engine codex --scope delta"]]' show_none='["show",[]]'
+  check "next-round: round 1 with an incorporated process HIGH is scoped with codex only" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: an incorporated CRITICAL is scoped with every engine" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$scoped_all_both"
+  check "next-round: a change HIGH is scoped with every engine" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" "$scoped_all_both"
+  check "next-round: a rejected change HIGH still gets a scoped round" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:change:rejected)" "$scoped_all_both"
+  check "next-round: a rejected CRITICAL still gets a scoped round" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:change:rejected)" "$scoped_all_both"
+  check "next-round: process and change HIGHs mixed is scoped with every engine" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:change:incorporated)" "$scoped_all_both"
+  check "next-round: a HIGH with kind unknown counts as change (every engine)" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:unknown:incorporated)" "$scoped_all_both"
+  check "next-round: a change HIGH after a scoped round is scoped again, the streak does not stop it" "$(next_round both --round 3 --scoped-streak 1 --item HIGH:change:incorporated)" "$scoped_all_both"
+  check "next-round: process HIGHs after a CRITICAL-driven scoped round (streak reset to 0) are scoped" "$(next_round both --round 3 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
+  check "next-round: full is never answered" "$(for item_set in "HIGH:change:incorporated" "CRITICAL:change:incorporated" "HIGH:process:incorporated"; do next_round both --round 2 --scoped-streak 0 --item "$item_set"; done | grep -c '"full"')" "0"
   check "next-round: config both, round 2, incorporated process HIGH, streak 0 is scoped with codex only" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
   check "next-round: config codex gives the same scoped codex launch" "$(next_round codex --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
   check "next-round: config claude scopes the claude engine" "$(next_round claude --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine claude --scope delta"]]'
@@ -3862,8 +4088,8 @@ AGY_STUB_EOF
     check "next-round: config $next_engine, streak 1 (the scoped round just relayed) is show" "$(next_round "$next_engine" --round 3 --scoped-streak 1 --item HIGH:process:incorporated)" "$show_none"
   done
   check "next-round: a process-only round after a full round (streak 0) is scoped again" "$(next_round both --round 3 --scoped-streak 0 --item HIGH:process:incorporated --item MEDIUM:change:incorporated)" "$scoped_codex"
-  check "next-round: full launch for config codex is codex alone" "$(next_round codex --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine codex"]]'
-  check "next-round: full launch for config claude is claude alone" "$(next_round claude --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine claude"]]'
+  check "next-round: change HIGH launch for config codex is codex alone" "$(next_round codex --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["scoped",["--engine codex --scope delta"]]'
+  check "next-round: change HIGH launch for config claude is claude alone" "$(next_round claude --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["scoped",["--engine claude --scope delta"]]'
   check "next-round: a rejected process HIGH is show" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:rejected)" "$show_none"
   check "next-round: a not-applicable process HIGH is show" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:not-applicable)" "$show_none"
   check "next-round: MEDIUM only is show" "$(next_round both --round 2 --scoped-streak 0 --item MEDIUM:change:incorporated)" "$show_none"
@@ -3872,7 +4098,7 @@ AGY_STUB_EOF
   check "next-round: answers and writes no metrics line" "$(next_round both --round 2 --item LOW:change:incorporated)/$([ -e "$next_root/both/metrics.jsonl" ] && echo written || echo none)" "$show_none/none"
   #     A first completed round after an attempt that failed in every engine is
   #     still round 1 (the skill passes completed rounds), so it is full.
-  check "next-round: the first completed round after an all-engines-failed attempt is full" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:process:incorporated)" "$full_both"
+  check "next-round: the first completed round after an all-engines-failed attempt is scoped too" "$(next_round both --round 1 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:process:incorporated)" "$scoped_codex"
   check "next-round: the second completed round with the same findings is scoped" "$(next_round both --round 2 --scoped-streak 0 --item HIGH:process:incorporated --item HIGH:process:incorporated)" "$scoped_codex"
   next_round_bad() {
     local desc="$1" want_rc="$2" config="$3"; shift 3
@@ -3918,7 +4144,7 @@ AGY_STUB_EOF
   check "stats: delta rounds get their own block" "$(printf '%s' "$out" | grep -c '^Rondas acotadas (delta)')" "1"
   check "stats: the delta block lists the delta round and its codex run" "$(stats_section "$out" "Rondas acotadas (delta)" | grep -q codex && echo yes || echo no)" "yes"
   check "stats: the audits table counts full rounds only" "$(stats_section "$out" "Auditorias por motor y modelo:" | grep -c '^  codex gpt-a: 1 (duracion media 100s)$')" "1"
-  check "stats: acceptance is computed over full rounds only" "$(stats_section "$out" "Aceptacion de hallazgos por motor y modelo" | grep -c '^  codex gpt-a: 1 incorporados, 1 rechazados, 0 sin estado (aceptacion 50%)$')" "1"
+  check "stats: acceptance counts the outcomes of delta rounds too, under their model" "$(stats_section "$out" "Aceptacion de hallazgos por motor y modelo" | grep -c '^  codex gpt-a: 2 incorporados, 1 rechazados, 0 sin estado (aceptacion 67%)$')" "1"
   check "stats: a delta codex round of a both config is not a single-engine round" "$(stats_section "$out" "Rondas de un solo motor" | grep -c '^  codex: CRITICAL 0, HIGH 0, MEDIUM 0, LOW 0 (critical+high: 0)$')" "1"
 
   # 44. `--run --scope delta`, both engines and both modes: the Kind sentence
@@ -3990,9 +4216,11 @@ AGY_STUB_EOF
   done
   local scope_block
   scope_block="$(delta_block "$tmp_home/scope-stdin-codex-plan-review-delta")"
-  check "delta text reports changes anywhere, INCLUDING unchanged text" "$(printf '%s' "$scope_block" | grep -c -F 'INCLUDING unchanged text')" "1"
+  check "delta text suspends the full derivation and sweep outside (a), (b) and (c)" "$(printf '%s' "$scope_block" | grep -c -F 'the independent derivation of the request obligations and the systematic sweep apply only to (a), (b) and (c)')" "1"
+  check "delta text covers incorporated and rejected CRITICAL or change HIGH items of PRIOR ROUNDS" "$(printf '%s' "$scope_block" | grep -c -F 'marked incorporated, and every CRITICAL or change HIGH marked rejected')" "1"
+  check "delta text reports a defect outside the scope only at HIGH or above" "$(printf '%s' "$scope_block" | grep -c -F 'only when it is HIGH or CRITICAL')" "1"
+  check "delta text treats the bundle and the prior report as context" "$(printf '%s' "$scope_block" | grep -c -F 'CONTEXT BUNDLE and PRIOR ROUND REPORT are context')" "1"
   check "delta text carries the stale-spec clause" "$(printf '%s' "$scope_block" | grep -c -F 'counts under (c) even when the changes did not cause it')" "1"
-  check "delta text has no files-touched limit and does not exclude wording generally" "$([ -n "$scope_block" ] && ! printf '%s' "$scope_block" | grep -q -i -e 'files those edits touch' -e 'wording' && echo yes || echo no)" "yes"
   check "Kind sentence names the process label" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-plan-review-default" "or 'Kind: process' when it is only about how the work is run")" -gt 0 ] && echo yes || echo no)" "yes"
   check "Kind sentence defines a stale description of what will be built as change" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-plan-review-default" "A stale, contradictory or wrong DESCRIPTION of what will be built")" -gt 0 ] && echo yes || echo no)" "yes"
   check "Kind sentence ends with when in doubt, change" "$([ "$(flat_pos "$tmp_home/scope-stdin-codex-research-default" "When in doubt, change.")" -gt 0 ] && echo yes || echo no)" "yes"
@@ -4046,7 +4274,7 @@ AGY_STUB_EOF
   skill_md="$(dirname "$run")/../skills/crosscheck/SKILL.md"
   check "SKILL.md is found next to the hook" "$([ -r "$skill_md" ] && echo yes || echo no)" "yes"
   for phrase in "--next-round" "--item SEV:KIND:STATUS" "--scoped-streak" "including the round just relayed" "launched verbatim" \
-    "--engine codex --scope delta" "--mode research --scope delta" "even when nothing was incorporated" "(a')" "(b)" "(c)" \
+    "every entry of \`launch\`" "--mode research --prompt-file" "even when nothing was incorporated" "(a')" "(b)" "(c)" \
     "stale, contradictory or wrong description of what will be built" "completed audit rounds" \
     "next-round unavailable, recommending a full round" "scoped run fails" "never lower" "Kind: change|process"; do
     check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -i -F -- "$phrase" && echo yes || echo no)" "yes"
@@ -4560,15 +4788,15 @@ TIMEOUT_K_EOF
     CROSSCHECK_STATE_DIR="$next_root/$next_config" "$run" --config set --engine "$next_config" --codex-model gpt-a \
       --claude-model opus-x --codex-effort medium --claude-effort medium >/dev/null 2>&1 </dev/null
   done
-  check "next-round: full with claude,codex,gemini launches claude, codex, gemini in that order" "$(next_round claude,codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine claude","--engine codex","--engine gemini"]]'
-  check "next-round: full with codex,gemini launches codex then gemini" "$(next_round codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine codex","--engine gemini"]]'
-  check "next-round: full with gemini alone launches gemini" "$(next_round gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["full",["--engine gemini"]]'
+  check "next-round: scoped change HIGH with claude,codex,gemini launches claude, codex, gemini in that order" "$(next_round claude,codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["scoped",["--engine claude --scope delta","--engine codex --scope delta","--engine gemini --scope delta"]]'
+  check "next-round: scoped change HIGH with codex,gemini launches codex then gemini" "$(next_round codex,gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["scoped",["--engine codex --scope delta","--engine gemini --scope delta"]]'
+  check "next-round: scoped change HIGH with gemini alone launches gemini" "$(next_round gemini --round 2 --scoped-streak 0 --item HIGH:change:incorporated)" '["scoped",["--engine gemini --scope delta"]]'
   check "next-round: scoped with claude,codex,gemini uses codex alone" "$(next_round claude,codex,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
   check "next-round: scoped with codex,gemini uses codex alone" "$(next_round codex,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" "$scoped_codex"
   check "next-round: scoped with claude,gemini uses claude alone" "$(next_round claude,gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine claude --scope delta"]]'
   check "next-round: scoped with gemini alone uses gemini" "$(next_round gemini --round 2 --scoped-streak 0 --item HIGH:process:incorporated)" '["scoped",["--engine gemini --scope delta"]]'
   check "next-round: show after a scoped round still holds with gemini configured" "$(next_round claude,codex,gemini --round 3 --scoped-streak 1 --item HIGH:process:incorporated)" "$show_none"
-  check "next-round: the legacy both still launches claude then codex" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
+  check "next-round: the legacy both still launches claude then codex" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$scoped_all_both"
 
   # 52b. Model ids that are listed live, validated by a real call before they
   #      are saved, and reported cleanly when an account cannot use them. Every
@@ -4853,8 +5081,144 @@ MM_CLAUDE_EOF
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.13.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.13.0"
-  check "the README badge says 3.13.0" "$(grep -c -F 'badge/version-3.13.0-' "$readme_md" 2>/dev/null)" "1"
+  check "the CHANGELOG top entry is 3.14.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.14.0"
+  check "the README badge says 3.14.0" "$(grep -c -F 'badge/version-3.14.0-' "$readme_md" 2>/dev/null)" "1"
+  # 55. Context bundle (`--bundle`): the files and symbols a plan names, cut to
+  #     the relevant lines, inside the git root and nothing else.
+  local bundle_state="$tmp_home/bundle-state" bundle_repo="$tmp_home/bundle-repo" bundle_plan="$tmp_home/bundle-plan.md" bundle_out bundle_index
+  mkdir -p "$bundle_state/state/reports" "$bundle_repo/src" "$bundle_repo/docs" "$bundle_repo/config" "$bundle_repo/.hidden" "$tmp_home/nogit"
+  printf 'one\ntwo\ncompute_total() { echo KEEPMARK; }\nfour\nfive\nsix\nseven\neight\n' >"$bundle_repo/src/app.sh"
+  printf 'ENVMARK\n' >"$bundle_repo/.env"
+  printf 'HIDDENMARK compute_total\n' >"$bundle_repo/.hidden/h.txt"
+  printf 'CREDMARK only_in_secret\n' >"$bundle_repo/config/credentials.yml"
+  printf 'SECRETSMARK only_in_secret\n' >"$bundle_repo/config/Secrets.yml"
+  printf 'UPPERPEMMARK\n' >"$bundle_repo/config/server.PEM"
+  printf 'PNGMARK\0\0\0\n' >"$bundle_repo/docs/pic.png"
+  printf 'UNTRACKEDMARK\n' >"$bundle_repo/docs/untracked.txt"
+  printf 'OUTSIDEMARK\n' >"$tmp_home/outside.txt"
+  ln -s untracked.txt "$bundle_repo/docs/link-untracked.txt"
+  ln -s ../.env "$bundle_repo/docs/link-dot.txt"
+  ln -s "$tmp_home/outside.txt" "$bundle_repo/docs/link-out.txt"
+  for bundle_index in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    awk -v n="$bundle_index" 'BEGIN { printf "many_sym first line of file %d\n", n; for (i = 1; i < 400; i++) printf "plain padding line %d of file %d padding padding\n", i, n }' >"$bundle_repo/src/many$bundle_index.sh"
+  done
+  awk 'BEGIN { for (i = 0; i < 500; i++) printf "big_sym compute_total line %d padding padding padding\n", i }' >"$bundle_repo/src/big.sh"
+  (cd "$bundle_repo" && git init -q . && git add -A -f . && git reset -q docs/untracked.txt && git -c user.email=t@t -c user.name=t commit -q -m init) >/dev/null 2>&1
+  {
+    printf 'Change `compute_total` in `src/app.sh:3`, then docs/pic.png, .env, ../outside.txt, %s/outside.txt,\n' "$tmp_home"
+    printf 'docs/untracked.txt, docs/link-untracked.txt, docs/link-dot.txt, docs/link-out.txt, .hidden/h.txt,\n'
+    printf 'config/credentials.yml, config/Secrets.yml, config/server.PEM, src/big.sh and `only_in_secret`.\n'
+    for bundle_index in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do printf 'src/many%s.sh with `many_sym`\n' "$bundle_index"; done
+  } >"$bundle_plan"
+  # The hook is run from inside other directories below, so by absolute path.
+  local bundle_run_path
+  bundle_run_path="$(cd "$(dirname "$run")" && pwd -P)/$(basename "$run")"
+  bundle_run() { (cd "${BUNDLE_CWD:-$bundle_repo}" && HOME="$tmp_home" CROSSCHECK_STATE_DIR="$bundle_state" "$bundle_run_path" --bundle "$@" </dev/null 2>/dev/null); }
+  bundle_out="$(bundle_run --plan-file "$bundle_plan")"
+  check "bundle: starts with the CONTEXT BUNDLE line" "$(printf '%s\n' "$bundle_out" | head -n 1)" "CONTEXT BUNDLE:"
+  check "bundle: a named file with a file:line suffix is in, cut to the symbol line" "$(printf '%s' "$bundle_out" | grep -c 'KEEPMARK')" "1"
+  check "bundle: the symbol context lines carry line numbers" "$(printf '%s' "$bundle_out" | grep -c -E '^3: compute_total\(\) ')" "1"
+  for bundle_index in ENVMARK HIDDENMARK CREDMARK SECRETSMARK UPPERPEMMARK PNGMARK UNTRACKEDMARK OUTSIDEMARK; do
+    check "bundle: $bundle_index never reaches the bundle" "$(printf '%s' "$bundle_out" | grep -c "$bundle_index")" "0"
+  done
+  check "bundle: at most 12 files" "$(printf '%s\n' "$bundle_out" | grep -c '^=== ')" "12"
+  check "bundle: total size is capped at 40000 bytes" "$([ "$(printf '%s' "$bundle_out" | wc -c | tr -d ' ')" -le 40000 ] && echo ok || echo big)" "ok"
+  check "bundle: a file section is capped at 6000 bytes plus its header" "$(printf '%s\n' "$bundle_out" | awk '/^=== /{if (n > m) m = n; n = 0; next} {n += length($0) + 1} END {if (n > m) m = n; print (m <= 6100) ? "ok" : "big " m}')" "ok"
+  check "bundle: a cut file and the files left out are marked" "$(printf '%s' "$bundle_out" | grep -q '^\[cut\]$' && printf '%s' "$bundle_out" | grep -q '^Left out by the size caps' && echo yes || echo no)" "yes"
+  check "bundle: the output goes to stdout only, nothing is written to the state dir" "$(find "$bundle_state" -type f | wc -l | tr -d ' ')" "0"
+  check "bundle: outside a git repo prints nothing" "$(BUNDLE_CWD="$tmp_home/nogit" bundle_run --plan-file "$bundle_plan" | wc -c | tr -d ' ')" "0"
+  printf 'nothing to see here, just words\n' >"$tmp_home/bundle-empty-plan.md"
+  check "bundle: a plan with no candidates prints nothing at all, not even a header" "$(bundle_run --plan-file "$tmp_home/bundle-empty-plan.md" | wc -c | tr -d ' ')" "0"
+  cp "$bundle_plan" "$tmp_home/bundle-plan-self.md"
+  bundle_size="$(wc -c <"$tmp_home/bundle-plan-self.md" | tr -d ' ')"
+  bundle_run --plan-file "$tmp_home/bundle-plan-self.md" >>"$tmp_home/bundle-plan-self.md"
+  check "bundle: appending to its own plan file gives the same bytes as writing to another file" "$(tail -c +$((bundle_size + 1)) "$tmp_home/bundle-plan-self.md" | cmp -s - <(bundle_run --plan-file "$bundle_plan") && echo same || echo differs)" "same"
+  #     Prior reports: only regular files directly in the reports directory.
+  printf 'REPORTONE finding\n' >"$bundle_state/state/reports/r1.md"
+  printf 'REPORTTWO finding\n' >"$bundle_state/state/reports/r2.md"
+  printf 'LOGMARK\n' >"$bundle_state/state/other.md"
+  ln -s ../other.md "$bundle_state/state/reports/link.md"
+  bundle_out="$(bundle_run --plan-file "$bundle_plan" --prior-report "$bundle_state/state/reports/r1.md" --prior-report "$bundle_state/state/reports/r2.md" --prior-report "$bundle_state/state/other.md" --prior-report "$bundle_state/state/reports/link.md" --prior-report "$bundle_state/state/newdir/x.md")"
+  check "bundle: two prior reports both appear under PRIOR ROUND REPORT" "$(printf '%s' "$bundle_out" | grep -c -E 'REPORTONE|REPORTTWO')" "2"
+  check "bundle: a file under the state root outside reports/ and a symlink are skipped" "$(printf '%s' "$bundle_out" | grep -c 'LOGMARK')" "0"
+  check "bundle: a rejected prior-report path creates no directory" "$([ -e "$bundle_state/state/newdir" ] && echo created || echo none)" "none"
+  bundle_out="$(bundle_run --plan-file "$tmp_home/bundle-empty-plan.md" --prior-report "$bundle_state/state/reports/r1.md")"
+  check "bundle: a prior report is context even when the plan names no file" "$(printf '%s' "$bundle_out" | grep -c 'REPORTONE')" "1"
+  #     The state root behind a symlink (macOS /var -> /private/var) still accepts its own reports.
+  ln -s "$bundle_state" "$tmp_home/bundle-state-link"
+  bundle_out="$(cd "$bundle_repo" && HOME="$tmp_home" CROSSCHECK_STATE_DIR="$tmp_home/bundle-state-link" "$bundle_run_path" --bundle --plan-file "$bundle_plan" --prior-report "$tmp_home/bundle-state-link/state/reports/r1.md" </dev/null 2>/dev/null)"
+  check "bundle: a symlinked state root still accepts its reports" "$(printf '%s' "$bundle_out" | grep -c 'REPORTONE')" "1"
+
+  # 56. `--run` with a bundle: the instruction sits above the marker and only
+  #     when the prompt carries a CONTEXT BUNDLE line; the run line records it,
+  #     and the report path is always printed on its own line.
+  local bundle_prompt="$tmp_home/bundle-prompt.md" nobundle_prompt="$tmp_home/nobundle-prompt.md" bundle_at read_marker_at
+  printf 'ROUND: 1\n\nORIGINAL REQUEST:\nbundlebody\n\nPROPOSED PLAN:\nbundlebody plan\n\nCONTEXT BUNDLE:\n=== src/app.sh ===\n3: compute_total\n' >"$bundle_prompt"
+  printf 'ROUND: 1\n\nORIGINAL REQUEST:\nbundlebody\n\nPROPOSED PLAN:\nbundlebody plan\n' >"$nobundle_prompt"
+  for scope_engine in codex claude gemini; do
+    for scope_mode in plan-review research; do
+      if [ "$scope_mode" = research ]; then scope_marker="The request to research: ---"; else scope_marker="Original request and proposed plan follow: ---"; fi
+      scope_run "$scope_engine" "$scope_mode" "$bundle_prompt"
+      cp "$(scope_stdin_of "$scope_engine")" "$tmp_home/bundle-stdin-with"
+      bundle_at="$(flat_pos "$tmp_home/bundle-stdin-with" "Read only what the CONTEXT BUNDLE lacks")"; marker_at="$(flat_pos "$tmp_home/bundle-stdin-with" "$scope_marker")"
+      check "bundle run ($scope_engine, $scope_mode): the bundle instruction is above the marker" "$([ "${bundle_at:-0}" -gt 0 ] && [ "$bundle_at" -lt "${marker_at:-0}" ] && echo yes || echo "no:$bundle_at/$marker_at")" "yes"
+      check "bundle run ($scope_engine, $scope_mode): the instruction asks for a Read line per finding" "$([ "$(flat_pos "$tmp_home/bundle-stdin-with" "Read: bundle")" -gt 0 ] && echo yes || echo no)" "yes"
+      check "bundle run ($scope_engine, $scope_mode): the run line says bundle true" "$(jq -r '.bundle' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "true"
+      scope_run "$scope_engine" "$scope_mode" "$nobundle_prompt"
+      cp "$(scope_stdin_of "$scope_engine")" "$tmp_home/bundle-stdin-without"
+      check "bundle run ($scope_engine, $scope_mode): no CONTEXT BUNDLE line, no bundle instruction" "$(flat_pos "$tmp_home/bundle-stdin-without" "Read only what the CONTEXT BUNDLE lacks")" "0"
+      check "bundle run ($scope_engine, $scope_mode): the run line says bundle false" "$(jq -r '.bundle' "$scope_root/metrics.jsonl" 2>/dev/null | tail -1)" "false"
+    done
+  done
+  check "bundle run: the stub codex run line carries tool_calls as a number or null" "$(jq -s -r '[.[] | select(.engine == "codex" and .type == "run")] | last | (has("tool_calls") and ((.tool_calls | type) == "number" or .tool_calls == null))' "$scope_root/metrics.jsonl" 2>/dev/null)" "true"
+  check "bundle run: the stub claude run line carries turns" "$(jq -s -r '[.[] | select(.engine == "claude" and .type == "run")] | last | has("turns")' "$scope_root/metrics.jsonl" 2>/dev/null)" "true"
+  check "bundle run: the stub gemini run line carries turns" "$(jq -s -r '[.[] | select(.engine == "gemini" and .type == "run")] | last | has("turns")' "$scope_root/metrics.jsonl" 2>/dev/null)" "true"
+  local report_out
+  report_out="$(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$scope_root" PATH="$agy_dir:$claude_stub:$stub_bin:$PATH" "$run" --run --engine codex --mode plan-review --prompt-file "$nobundle_prompt" </dev/null 2>/dev/null)"
+  check "bundle run: a small inlined report is preceded by a crosscheck-report path line" "$(printf '%s\n' "$report_out" | grep -c '^crosscheck-report: /.*\.md$')" "1"
+  check "bundle run: that path is a file in the reports directory" "$([ -f "$(printf '%s\n' "$report_out" | sed -n 's/^crosscheck-report: //p')" ] && echo yes || echo no)" "yes"
+
+  # 57. `--metrics-findings --finding-read` and the `--stats` block.
+  local read_root="$tmp_home/read-root"
+  mkdir -p "$read_root"
+  CROSSCHECK_STATE_DIR="$read_root" "$run" --metrics-findings --hash e0e0 --round 1 --engines codex --finding HIGH:codex:incorporated --finding MEDIUM:codex:incorporated --finding-read repo >/dev/null 2>&1
+  check "finding-read: bound to the finding before it, the one without stays unknown" "$(jq -c '[.outcomes[].read]' "$read_root/metrics.jsonl" 2>/dev/null | tail -1)" '["unknown","repo"]'
+  CROSSCHECK_STATE_DIR="$read_root" "$run" --metrics-findings --hash e0e1 --round 1 --engines codex --finding-read repo >/dev/null 2>&1
+  check "finding-read: one with no finding before it exits 2" "$?" "2"
+  CROSSCHECK_STATE_DIR="$read_root" "$run" --metrics-findings --hash e0e2 --round 1 --engines codex --finding HIGH:codex:incorporated --finding-read repo --finding-read plan >/dev/null 2>&1
+  check "finding-read: two in a row exit 2" "$?" "2"
+  CROSSCHECK_STATE_DIR="$read_root" "$run" --metrics-findings --hash e0e3 --round 1 --engines codex --finding HIGH:codex:incorporated --finding-read shell >/dev/null 2>&1
+  check "finding-read: an unknown label exits 2" "$?" "2"
+  check "finding-read: refused calls wrote nothing" "$(wc -l <"$read_root/metrics.jsonl" | tr -d ' ')" "1"
+  local read_stats="$tmp_home/read-stats.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s1","repo":"r","status":"success","duration_s":100,"scope":"full","tool_calls":12,"bundle":false,"input_tokens":1000,"output_tokens":10}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"s2","repo":"r","status":"success","duration_s":100,"scope":"full","tool_calls":4,"bundle":true,"input_tokens":400,"output_tokens":10}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"medium","round":1,"hash":"s2","repo":"r","status":"success","duration_s":100,"scope":"full","turns":6,"bundle":true,"input_tokens":600,"output_tokens":10}'
+    echo '{"type":"findings","ts":2,"hash":"s1","round":1,"engines":"codex","scope":"full","repo":"r","counts":{"codex":{"HIGH":1}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null,"read":"repo"},{"severity":"MEDIUM","source":"codex","status":"incorporated","reason":null,"read":"bundle"}]}'
+    echo '{"type":"findings","ts":2,"hash":"s2","round":1,"engines":"codex","scope":"full","repo":"r","counts":{"codex":{"LOW":1}},"outcomes":[{"severity":"LOW","source":"codex","status":"rejected","reason":"x"}]}'
+    echo '{"type":"run","ts":3,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":2,"hash":"s2","repo":"r","status":"success","duration_s":40,"scope":"delta","tool_calls":2,"bundle":true,"input_tokens":100,"output_tokens":5}'
+    echo '{"type":"findings","ts":4,"hash":"s2","round":2,"engines":"codex","scope":"delta","repo":"r","counts":{"codex":{"HIGH":1}},"outcomes":[{"severity":"HIGH","source":"codex","status":"incorporated","reason":null,"read":"repo"}]}'
+  } >"$read_stats"
+  out="$("$run" --stats "$read_stats")"
+  check "stats: a round 2 of scope delta counts for plans with more than one round" "$(printf '%s' "$out" | grep -c '^Planes con mas de una ronda: 1$')" "1"
+  check "stats: a delta round outcome is in the acceptance table under its model, not ?" "$(stats_section "$out" "Aceptacion de hallazgos por motor y modelo" | grep -c '^  codex gpt-a: 3 incorporados, 1 rechazados')" "1"
+  check "stats: tool calls per audit, codex full without bundle" "$(stats_section "$out" "Llamadas y tokens por auditoria" | grep -c '^  codex full sin bundle: 1 auditorias, 12 llamadas, 1000 tokens de entrada$')" "1"
+  check "stats: tool calls per audit, codex full with bundle" "$(stats_section "$out" "Llamadas y tokens por auditoria" | grep -c '^  codex full con bundle: 1 auditorias, 4 llamadas, 400 tokens de entrada$')" "1"
+  check "stats: tool calls per audit, codex delta with bundle is its own row" "$(stats_section "$out" "Llamadas y tokens por auditoria" | grep -c '^  codex delta con bundle: 1 auditorias, 2 llamadas, 100 tokens de entrada$')" "1"
+  check "stats: claude turns stand in for tool calls" "$(stats_section "$out" "Llamadas y tokens por auditoria" | grep -c '^  claude full con bundle: 1 auditorias, 6 llamadas, 600 tokens de entrada$')" "1"
+  check "stats: which read produced each finding" "$(printf '%s' "$out" | grep -c '^Lectura que produjo cada hallazgo: bundle 1, repo 2, plan 0, sin dato 1$')" "1"
+  out="$("$run" --stats "$scope_stats")"
+  check "stats: old run lines without the new fields still print the block and the read line" "$(printf '%s' "$out" | grep -c -e '^Llamadas y tokens por auditoria' -e '^Lectura que produjo cada hallazgo: bundle 0, repo 0, plan 0, sin dato')" "2"
+
+  # 58. Skill text for the bundle, the read label and scoped rounds.
+  for phrase in 'crosscheck --bundle --plan-file "$pf"' '>>"$pf"' "CONTEXT BUNDLE:" "--prior-report" "PRIOR ROUND REPORT" "crosscheck-report:" \
+    "--finding-read" "repo beats bundle beats plan" "Read: bundle" "never answers full" "every entry of \`launch\`" \
+    "process-only scoped rounds" "carry on with the survivors"; do
+    check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "SKILL.md no longer says a scoped run is a single engine" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -c -F -e 'it is a single engine' -e 'one scoped round with codex')" "0"
+  check "how-it-works describes the context bundle" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -c -F 'context bundle')" "1"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.
@@ -5033,6 +5397,11 @@ case "${1:-}" in
     ;;
   --tmp-dir)
     cmd_tmp_dir
+    exit $?
+    ;;
+  --bundle)
+    shift
+    cmd_bundle "$@"
     exit $?
     ;;
   --metrics-findings)

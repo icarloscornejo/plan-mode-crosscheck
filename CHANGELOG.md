@@ -2,6 +2,40 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.14.0
+
+Fewer tokens per audit. Every tool call of an auditor resends its whole context
+and an audit made 6 to 19 of them (220k to 1.47M input tokens), so the lever is
+fewer reads.
+
+- **Context bundle.** `crosscheck --bundle --plan-file PLAN` reads once what the
+  plan names (paths, and backticked symbols cut to their lines plus two lines of
+  context) and prints a `CONTEXT BUNDLE:` section that the skill appends to the
+  round's one prompt file, so it is built once and every engine shares it. When
+  the prompt has it, `--run` tells the auditor to read only what the bundle
+  lacks and to label each finding `Read: bundle`, `Read: repo <path:line>` or
+  `Read: plan`. Only tracked, regular, text files inside the git root: no
+  symlink, no dot directory or file, no secret-looking name (case-insensitive),
+  also for symbol hits. Caps: 6000 bytes a file, 12 files, 40000 bytes. Nothing
+  to ship prints nothing.
+- **Scoped rounds from round 2.** `--next-round` never answers `full` any more:
+  after a CRITICAL or change HIGH (rejected or not) it answers `scoped` with
+  every configured engine, after incorporated process HIGHs `scoped` with one
+  engine. The scoped prompt audits the flagged points and what the plan changed
+  to fix them, and says that the independent derivation and the sweep apply only
+  to those; a defect elsewhere is reported only at HIGH or above. The prior
+  round's reports (`--prior-report`, regular files straight in the reports
+  directory) and the bundle are the context. `--scoped-streak` counts only
+  process-only scoped rounds. "Otra ronda" still offers a full round.
+- **Telemetry.** Every `run` line in `metrics.jsonl` carries `bundle` and
+  `tool_calls` (Codex) or `turns` (Claude, Gemini, which do not list tool calls).
+  `--metrics-findings` takes `--finding-read bundle|repo|plan` after a
+  `--finding`. `--stats` adds audits, calls and input tokens per engine, round
+  kind and bundle, and which read produced each finding. Scoped rounds now
+  count in "Planes con mas de una ronda" and in the acceptance table.
+- `--run` prints a `crosscheck-report: <path>` line before every report.
+- Old plans are not replayed to compare quality.
+
 ## 3.13.0
 
 Gemini audits that were failing for avoidable reasons now work, or skip cleanly.

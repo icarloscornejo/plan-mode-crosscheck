@@ -163,22 +163,52 @@ including a stale or contradictory description of what will be built) or
 change. The labels are the auditors', never the orchestrator's, which can only
 raise a finding to `change`. `crosscheck --next-round --round N
 [--scoped-streak S] --item SEV:KIND:STATUS ...` is a pure function (it writes
-nothing) that turns the round's findings into `full`, `scoped` or `show` plus
-the exact `--run` arguments to launch:
+nothing) that turns the round's findings into `scoped` or `show` plus the
+exact `--run` arguments to launch. Since 3.14.0 it never answers `full`: from
+round 2 on a round only audits again the flagged points and what the plan
+changed to fix them, with the bundle and the prior reports as context:
 
 - any CRITICAL, or any HIGH that is `change` or has no valid Kind (rejected or
-  not): `full`, the usual round with the configured engines.
-- only incorporated `process` HIGHs after an earlier completed round: `scoped`,
-  one round with one engine (Codex when configured) launched with
-  `--run --scope delta`. The prompt anchors on `CHANGES SINCE LAST ROUND` but
-  still asks for any defect in what the request delivers, anywhere, including
-  unchanged text.
-- a `process`-only round right after a scoped one, no HIGH at all, or only
-  rejected `process` findings: `show` (a recommendation; "Otra ronda" still
-  gives a full round).
+  not): `scoped`, every configured engine launched with `--run --scope delta`.
+- only incorporated `process` HIGHs: `scoped`, one round with one engine
+  (Codex when configured). `--scoped-streak` counts only these process-only
+  rounds, so the skill passes 0 after a round launched for a CRITICAL or
+  change HIGH.
+- a `process`-only round right after a process-only scoped one, no HIGH at
+  all, or only rejected `process` findings: `show` (a recommendation; "Otra
+  ronda" still gives a full round).
+
+The scoped prompt says that the independent derivation of the request and the
+systematic sweep apply only to the flagged items (incorporated ones, and
+rejected CRITICAL or change HIGH ones), the changes and the unchanged text they
+contradict; a defect elsewhere is reported only at HIGH or above.
 
 The skill must call the command and follow its answer, ask you before every
-round as before, and offer a full round if a scoped run fails.
+round as before, and offer a full round if a scoped run fails in every engine.
+
+### Context bundle (3.14.0)
+
+Every tool call of an auditor resends its whole context, and an audit made 6
+to 19 of them (220k to 1.47M input tokens). `crosscheck --bundle --plan-file
+PLAN [--prior-report REPORT ...]` builds the context bundle: it reads once what the plan names (paths, and
+backticked symbols cut to the lines that hold them plus two lines of context)
+and prints a `CONTEXT BUNDLE:` section that the skill appends to the round's
+one prompt file, so every engine reads the same bundle and it is built once per
+round. The auditor is told to read only what the bundle lacks and to label each
+finding `Read: bundle`, `Read: repo <path:line>` or `Read: plan`.
+
+What may enter the bundle: only tracked, regular, text files inside the git
+root, with no dot directory or file in the path and no secret-looking name
+(`*.pem`, `*.key`, `*credential*`, `*secret*`, ...), never a symlink. Caps: 6000
+bytes per file, 12 files and 40000 bytes in all, 12000 more for prior reports,
+which must be regular files directly in the reports directory. A bundle with
+nothing to ship prints nothing.
+
+`--stats` shows the effect: audits, tool calls (Codex) or turns (Claude,
+Gemini) and input tokens per engine, round kind and bundle (with or without),
+plus which read produced each finding, so a cap can be set later with data.
+Both are recorded in the existing `metrics.jsonl`; old plans are not replayed
+to compare quality.
 
 What the measurements showed, stated plainly (replay of one saved ticket,
 Codex gpt-6-luna high, 9 full against 9 scoped rounds on the same input, plus

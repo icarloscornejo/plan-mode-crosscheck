@@ -192,12 +192,33 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
       old always-on background research is that a one-line raw prompt is not
       a research target. Take the extra sentence to write a real request.
 
+      **The context bundle.** Right after the heredoc, in the same `Bash`
+      call, append the files and symbols the plan names to the prompt file:
+
+      ```
+      crosscheck --bundle --plan-file "$pf" >>"$pf"
+      ```
+
+      It reads the plan once, then prints a `CONTEXT BUNDLE:` section (the named
+      files cut to the lines that hold the named symbols, inside the git root,
+      size capped; nothing at all when there is nothing to ship) straight into
+      the file, so it never passes through your own context. Every engine of
+      the round reads that one prompt file, so the bundle is built once per
+      round and shared; never build one per engine. From round 2 on add one
+      `--prior-report <path>` per report of the round just relayed (the path on
+      the `crosscheck-report:` line each `--run` printed), so the scoped round
+      has what was already read as context: they land in the same section as
+      `PRIOR ROUND REPORT`. With the bundle in the prompt, `--run` tells the
+      auditor to read only what the bundle lacks and to label each finding
+      `Read: bundle`, `Read: repo <path:line>` or `Read: plan`.
+
    c. Launch by engine. Every `Bash` call that writes a prompt or report file
       starts with its own `umask 077` (each call is a separate shell and does
       not inherit the previous one's umask).
 
       **One engine** (`claude`, `codex` or `gemini`): append to the same `Bash`
-      call from 3.b:
+      call from 3.b (bundle step included, so it sits inside the one
+      backgrounded call):
       ```
       crosscheck --run --engine <claude|codex|gemini> --mode plan-review --prompt-file "$pf" --hash <hash>
       ```
@@ -210,7 +231,7 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
 
       **Several engines** (`engines` from `crosscheck --config get`, field
       `engines`, has two or three entries): first ONE foreground `Bash` call
-      that does the 3.b work and ends with `printf '%s\n' "$pf"`, so the
+      that does the 3.b work (the bundle step included) and ends with `printf '%s\n' "$pf"`, so the
       prompt file exists (and its path is known) before any engine starts:
       `--run` exits 2 if `--prompt-file` is missing or empty, so backgrounded
       calls that raced the write would fail intermittently. Then, **in the
@@ -361,8 +382,16 @@ never `research`), run one foreground `Bash` call:
 
 ```
 crosscheck --metrics-findings --hash <hash> --round N --engines <claude|codex|gemini|both|comma list> --scope <full|delta> \
-  --finding HIGH:codex:incorporated --finding MEDIUM:ambos:rejected:out of scope ...
+  --finding HIGH:codex:incorporated --finding-read repo --finding MEDIUM:ambos:rejected:out of scope --finding-read bundle ...
 ```
+
+`--finding-read bundle|repo|plan` goes right after the `--finding` it belongs to
+and says which read produced that finding, copied from the auditor's own
+`Read:` line (`Read: bundle` is `bundle`, `Read: repo <path:line>` is `repo`,
+`Read: plan` is `plan`). Leave it out when the report has no `Read:` line (no
+bundle in the prompt, or an engine that skipped it): it is stored as unknown.
+When two engines labeled one merged finding differently, repo beats bundle
+beats plan. The label is a fixed word, never the path or any text.
 
 `--scope` is `delta` when the round just relayed was a scoped round (its
 `--run` carried `--scope delta`), `full` otherwise; `--stats` keeps scoped
@@ -413,15 +442,20 @@ crosscheck --next-round --round <completed> --scoped-streak <S> \
 - `--round` is the number of completed audit rounds on this request,
   including the one just relayed. An attempt that failed in every engine does
   not count, unlike `N` in the prompt, which counts attempts.
-- `--scoped-streak S` is the number of consecutive scoped rounds that end with
-  the round just relayed, including the round just relayed: 0 after a full
-  round, previous + 1 after each scoped round (so 1 right after the first
-  scoped round). Keep it yourself, like `N`.
+- `--scoped-streak S` is the number of consecutive process-only scoped rounds
+  (the single-engine kind) that end with the round just relayed, including the
+  round just relayed: 0 after round 1 and after any scoped round launched for
+  a CRITICAL or change HIGH (every engine), previous + 1 after each
+  process-only scoped round. Keep it yourself, like `N`.
 
-It prints one JSON line `{"next":"full|scoped|show","launch":[...],"reason":"..."}`
-and writes nothing. State it in chat right after the list: `full` -> **"I
-recommend one more round"**, `scoped` -> **"I recommend one scoped round
-with codex"** (the scoped engine is codex if configured, else claude, else gemini),
+`--next-round` never answers full: from round 2 on a round only re-audits the
+flagged points and what the plan changed to fix them (the scoped round, with
+the bundle and the prior reports as context). It prints one JSON line
+`{"next":"scoped|show","launch":[...],"reason":"..."}`
+and writes nothing. State it in chat right after the list: `scoped` -> **"I
+recommend one scoped round"** naming the engines in `launch` (every configured
+engine after a CRITICAL or change HIGH, one engine, codex if configured, else
+claude, else gemini, after incorporated process HIGHs),
 `show` -> **"I recommend showing the plan now"**, with the reason and the
 findings that drive it, cited by number or title, never by count.
 
@@ -429,20 +463,23 @@ Each entry of `launch` is the engine part of one `--run` call (for example
 `--engine codex` or `--engine codex --scope delta`). When the user picks that
 round, every entry is launched verbatim as one backgrounded `--run`, with
 `--mode`, `--prompt-file` and (Entry A only) `--hash` added by you; several
-entries go in the same message, like several engines in A.3.c (a full round
-lists them in the order Claude, Codex, Gemini). Never pick the engine or
+entries go in the same message, like several engines in A.3.c (they are
+listed in the order Claude, Codex, Gemini). Never pick the engine or
 the scope yourself. The scoped round uses the same prompt file shape
 (`ROUND`, `ORIGINAL REQUEST`, `PROPOSED PLAN`, `PRIOR ROUNDS`, `CHANGES SINCE
-LAST ROUND`), so in Entry A it is `crosscheck --run --engine codex --scope
-delta --mode plan-review --prompt-file "$pf" --hash <hash>`. `--run --scope
-delta` exits 2 without a line starting with `CHANGES SINCE LAST ROUND:`.
+LAST ROUND`) plus the bundle step of A.3.b with `--prior-report` for every
+report of the round just relayed (the path each `--run` printed on its
+`crosscheck-report:` line), so in Entry A it is every entry of `launch`, as
+`crosscheck --run <entry> --mode plan-review --prompt-file "$pf" --hash
+<hash>`. `--run --scope delta` exits 2 without a line starting with `CHANGES
+SINCE LAST ROUND:`.
 
 Only two of the old rules still apply, and only in one direction each:
 
 - The auditor's closing `Coverage:` line lists every part it examined. A part
   of the plan that changed this round and does not appear there was not
-  reviewed: that raises the answer to `full`, never lowers it.
-- A `full` answer driven only by non-CRITICAL, non-change findings that
+  reviewed: that raises a `show` answer to `scoped`, never lowers it.
+- A `scoped` answer driven only by non-CRITICAL, non-change findings that
   repeat findings already rejected in an earlier round, with no new evidence,
   may be lowered to `show`; say so in the relay. Nothing else lowers the
   answer.
@@ -452,7 +489,7 @@ Only two of the old rules still apply, and only in one direction each:
 - (a) Entry A, plan edited (new hash): the usual denial question below, with
   the recommended option first.
 - (a') Entry A, nothing incorporated (same hash, already `reviewed`, so the
-  hook would allow `ExitPlanMode` at once): when the answer is `full` or
+  hook would allow `ExitPlanMode` at once): when the answer is
   `scoped`, ask BEFORE calling `ExitPlanMode`, with `AskUserQuestion`,
   "another round on the same plan" or "show the plan", recommended option
   first; on "Otra ronda" run that round on the same hash.
@@ -465,11 +502,12 @@ Only two of the old rules still apply, and only in one direction each:
   option, which launches that same full set.
 
 **Failures.** If `--next-round` exits nonzero or prints empty or invalid
-output, treat the answer as `full` with the engines as configured and say
-"next-round unavailable, recommending a full round". When a scoped run fails
-(it is a single engine), tell the user why and offer a full round; the
-"some engines failed" and "every engine failed" branches of A.3.f describe
-multi-engine rounds and do not apply to it.
+output, treat the answer as a full round with the engines as configured (one
+plain `--run` per engine, no `--scope`) and say "next-round unavailable,
+recommending a full round". When a scoped run fails, the "some engines failed"
+branch of A.3.f applies to it: carry on with the survivors and say which failed
+and why. When every engine of it failed, tell the user why and offer a full
+round.
 
 There is no round limit: the user decides when to stop, and never gets an
 extra round without saying "Otra ronda".
@@ -515,7 +553,10 @@ first.
    CROSSCHECK_REQUEST_<random-token>
    ```
    `<random-token>` is one fixed string you pick (not `$$`, which differs per
-   shell). End the call with `printf '%s\n' "$pf"` when several engines are
+   shell). When the request names files or backticked symbols (always for a
+   plan-audit round), add the bundle step of A.3.b right after the heredoc:
+   `crosscheck --bundle --plan-file "$pf" >>"$pf"`, plus `--prior-report` for a
+   scoped round. End the call with `printf '%s\n' "$pf"` when several engines are
    configured. Then launch by engine exactly as in A.3.c, with `--mode research` and
    **no `--hash` on any command**: this mode never touches plan state. Every
    `--run --engine <claude|codex|gemini>` goes in the background.
@@ -540,9 +581,9 @@ first.
    (findings by severity, `Kind:` line included; severity from the auditor,
    status from what you did with each finding), then run the same
    `--next-round` call with the same streak (see "Recommending"), following
-   decision step (b). A scoped round there is `crosscheck --run --engine
-   codex --mode research --scope delta --prompt-file "$pf"` (the entry
-   `launch` gives, plus `--mode research --prompt-file`, still no `--hash`),
+   decision step (b). A scoped round there is every entry of `launch`, each
+   as `crosscheck --run <entry> --mode research --prompt-file "$pf"` (the
+   entry already carries `--scope delta`; still no `--hash`),
    and the prompt needs a line starting with `CHANGES SINCE LAST ROUND:`. A
    plan round whose reports carry no severities is not a plan-audit round:
    keep the behavior above, no `--next-round`.
