@@ -794,6 +794,13 @@ CONFIG_CLAUDE_EFFORTS="low medium high xhigh max"
 CONFIG_GEMINI_EFFORTS="low medium high xhigh max"
 # Canonical order everywhere engines are listed, written or launched.
 ENGINE_ORDER="claude codex gemini"
+# Several Claude advisors: advisor 1 is `claude`, advisors 2 to 4 are `claude2`
+# to `claude4`. The id is the advisor's label in runs, finding sources and stats.
+# Saved configs never list an id (their `engine` keeps ENGINE_ORDER); only a
+# round's engines and finding sources use this order.
+ROUND_ENGINE_ORDER="claude claude2 claude3 claude4 codex gemini"
+MAX_CLAUDE_ADVISORS=4
+ADVISOR_LABEL_PATTERN='^[A-Za-z0-9 ._-]{0,30}$'
 # `default` is a reserved model value, not an id: the engine is started WITHOUT
 # its model flag and uses whatever its own CLI picks. Built-in fallbacks use it
 # so no hand-kept id can go stale.
@@ -806,18 +813,18 @@ GEMINI_DEFAULT_EFFORT="high"
 # Returns 1 for anything else (unknown, empty or duplicated token, a stray
 # comma, `both` inside a list), printing nothing.
 engine_list() {
-  local value="$1" token seen=" " canonical="" engine
+  local value="$1" order="${2:-$ENGINE_ORDER}" token seen=" " canonical="" engine
   local -a tokens
   if [ "$value" = "both" ]; then printf 'claude codex'; return 0; fi
   # read -a drops a trailing empty field, so stray commas are rejected up front.
-  [[ "$value" =~ ^[a-z]+(,[a-z]+)*$ ]] || return 1
+  [[ "$value" =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] || return 1
   IFS=, read -r -a tokens <<<"$value"
   for token in "${tokens[@]}"; do
-    case " $ENGINE_ORDER " in *" $token "*) : ;; *) return 1 ;; esac
+    case " $order " in *" $token "*) : ;; *) return 1 ;; esac
     case "$seen" in *" $token "*) return 1 ;; esac
     seen="$seen$token "
   done
-  for engine in $ENGINE_ORDER; do
+  for engine in $order; do
     case "$seen" in *" $engine "*) canonical="${canonical:+$canonical }$engine" ;; esac
   done
   printf '%s' "$canonical"
@@ -826,9 +833,9 @@ engine_list() {
 # The engine value as stored: `both` stays as typed, lists are comma joined in
 # canonical order.
 engine_normalized() {
-  local value="$1" list
+  local value="$1" order="${2:-$ENGINE_ORDER}" list
   [ "$value" = "both" ] && { printf 'both'; return 0; }
-  list="$(engine_list "$value")" || return 1
+  list="$(engine_list "$value" "$order")" || return 1
   printf '%s' "${list// /,}"
 }
 
@@ -880,6 +887,7 @@ resolve_config() {
   local engine="codex" codex_model="$MODEL_DEFAULT" claude_model="fable" codex_effort="medium"
   local codex_effort_source="default" claude_effort="medium" claude_effort_source="default"
   local gemini_model="$GEMINI_DEFAULT_MODEL" gemini_effort="$GEMINI_DEFAULT_EFFORT" gemini_effort_source="default"
+  local saved_advisors=""
   if [ -s "$CONFIG_FILE" ]; then
     local cfg
     cfg="$(cat "$CONFIG_FILE" 2>/dev/null)" || return 1
@@ -902,6 +910,22 @@ resolve_config() {
     if [ -n "$saved_claude_effort" ]; then
       valid_claude_effort "$saved_claude_effort" || return 1
       claude_effort="$saved_claude_effort"
+      claude_effort_source="config"
+    fi
+    # `claude_advisors` (1 to 4 objects) wins over claude_model/claude_effort,
+    # which then report advisor 1. A config without it is a list of one.
+    saved_advisors="$(printf '%s' "$cfg" | jq -c '.claude_advisors // empty' 2>/dev/null)"
+    if [ -n "$saved_advisors" ]; then
+      printf '%s' "$saved_advisors" | jq -e --argjson max "$MAX_CLAUDE_ADVISORS" \
+        'type == "array" and length >= 1 and length <= $max and all(.[]; type == "object")' >/dev/null 2>&1 || return 1
+      local advisor_model advisor_effort advisor_label
+      while IFS=$'\t' read -r advisor_model advisor_effort advisor_label; do
+        valid_model_id "$advisor_model" || return 1
+        valid_claude_effort "$advisor_effort" || return 1
+        [[ "$advisor_label" =~ $ADVISOR_LABEL_PATTERN ]] || return 1
+      done < <(printf '%s' "$saved_advisors" | jq -r '.[] | [(.model // ""), (.effort // ""), (.label // "")] | @tsv')
+      claude_model="$(printf '%s' "$saved_advisors" | jq -r '.[0].model')"
+      claude_effort="$(printf '%s' "$saved_advisors" | jq -r '.[0].effort')"
       claude_effort_source="config"
     fi
     # Configs saved before the Gemini engine existed have neither field.
@@ -930,7 +954,20 @@ resolve_config() {
     codex_model="$CROSSCHECK_MODEL"
     codex_model_source="env"
   fi
+  local advisors_json
+  if [ -n "$saved_advisors" ]; then
+    advisors_json="$saved_advisors"
+  else
+    advisors_json="$(jq -cn --arg model "$claude_model" --arg effort "$claude_effort" '[{model:$model, effort:$effort}]')"
+  fi
+  # Each advisor gets its id; run_engines is `engines` with claude expanded into
+  # its advisors, and advisors 2 to 4 get flat claudeN_model/claudeN_effort so
+  # --run reads every engine's model the same way.
+  advisors_json="$(printf '%s' "$advisors_json" | jq -c '
+    to_entries | map({id: (if .key == 0 then "claude" else "claude\(.key + 1)" end),
+                      model: .value.model, effort: .value.effort, label: (.value.label // "")})')"
   jq -n --arg engine "$engine" --arg engines "$(engine_list "$engine")" --arg codex_model "$codex_model" \
+    --argjson advisors "$advisors_json" \
     --arg claude_model "$claude_model" --arg codex_model_source "$codex_model_source" \
     --arg codex_effort "$codex_effort" --arg codex_effort_source "$codex_effort_source" \
     --arg claude_effort "$claude_effort" --arg claude_effort_source "$claude_effort_source" \
@@ -938,7 +975,10 @@ resolve_config() {
     '{engine:$engine, engines:($engines | split(" ")), claude_model:$claude_model, codex_model:$codex_model, gemini_model:$gemini_model,
       claude_effort:$claude_effort, codex_effort:$codex_effort, gemini_effort:$gemini_effort,
       codex_model_source:$codex_model_source, claude_effort_source:$claude_effort_source,
-      codex_effort_source:$codex_effort_source, gemini_effort_source:$gemini_effort_source}'
+      codex_effort_source:$codex_effort_source, gemini_effort_source:$gemini_effort_source,
+      claude_advisors:$advisors,
+      run_engines:(($engines | split(" ")) | map(if . == "claude" then ($advisors | map(.id))[] else . end))}
+    + ([$advisors[1:][] | {"\(.id)_model": .model, "\(.id)_effort": .effort}] | add // {})'
 }
 
 # --- Model ids: listing, concrete model, audit-time message ---
@@ -1077,7 +1117,10 @@ cmd_check() {
   [[ "$budget" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --config check: CROSSCHECK_CHECK_TIMEOUT must be a positive integer" >&2; return 2; }
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --config check: jq not found on PATH" >&2; return 1; }
 
-  local -a engines=()
+  # `engines` is what runs (advisor ids included); `config_engines` is what the
+  # throwaway config saves as `engine` (advisor ids are not valid there).
+  local -a engines=() config_engines=()
+  local resolved="" check_advisors="[]"
   local claude_model="fable" codex_model="$MODEL_DEFAULT" gemini_model="$GEMINI_DEFAULT_MODEL"
   local claude_effort="medium" codex_effort="medium" gemini_effort="$GEMINI_DEFAULT_EFFORT"
   if [ -n "$candidate_engine" ] || [ -n "$candidate_model" ] || [ -n "$candidate_effort" ]; then
@@ -1095,10 +1138,13 @@ cmd_check() {
               gemini_model="$candidate_model"; gemini_effort="${candidate_effort:-$gemini_effort}" ;;
     esac
     engines=("$candidate_engine")
+    config_engines=("$candidate_engine")
   else
-    local resolved engine_name
+    local engine_name
     resolved="$(resolve_config)" || { echo "config corrupt, run /crosscheck-setup"; return 1; }
-    while IFS= read -r engine_name; do engines+=("$engine_name"); done < <(printf '%s' "$resolved" | jq -r '.engines[]')
+    while IFS= read -r engine_name; do engines+=("$engine_name"); done < <(printf '%s' "$resolved" | jq -r '.run_engines[]')
+    while IFS= read -r engine_name; do config_engines+=("$engine_name"); done < <(printf '%s' "$resolved" | jq -r '.engines[]')
+    check_advisors="$(printf '%s' "$resolved" | jq -c '.claude_advisors | map(del(.id))')"
     claude_model="$(printf '%s' "$resolved" | jq -r '.claude_model')"; claude_effort="$(printf '%s' "$resolved" | jq -r '.claude_effort')"
     codex_model="$(printf '%s' "$resolved" | jq -r '.codex_model')"; codex_effort="$(printf '%s' "$resolved" | jq -r '.codex_effort')"
     gemini_model="$(printf '%s' "$resolved" | jq -r '.gemini_model')"; gemini_effort="$(printf '%s' "$resolved" | jq -r '.gemini_effort')"
@@ -1124,9 +1170,10 @@ cmd_check() {
   trap 'check_cleanup; exit 143' TERM INT
   trap 'check_cleanup' EXIT
 
-  jq -n --arg engine "$(IFS=,; printf '%s' "${engines[*]}")" --arg cm "$claude_model" --arg xm "$codex_model" --arg gm "$gemini_model" \
-    --arg ce "$claude_effort" --arg xe "$codex_effort" --arg ge "$gemini_effort" \
-    '{engine:$engine, claude_model:$cm, codex_model:$xm, gemini_model:$gm, claude_effort:$ce, codex_effort:$xe, gemini_effort:$ge}' >"$check_dir/config.json"
+  jq -n --arg engine "$(IFS=,; printf '%s' "${config_engines[*]}")" --arg cm "$claude_model" --arg xm "$codex_model" --arg gm "$gemini_model" \
+    --arg ce "$claude_effort" --arg xe "$codex_effort" --arg ge "$gemini_effort" --argjson advisors "$check_advisors" \
+    '{engine:$engine, claude_model:$cm, codex_model:$xm, gemini_model:$gm, claude_effort:$ce, codex_effort:$xe, gemini_effort:$ge}
+     + (if ($advisors | length) > 0 then {claude_advisors:$advisors} else {} end)' >"$check_dir/config.json"
   printf 'ROUND: 1\n\nConnectivity check.\n' >"$check_dir/prompt.md"
 
   local engine_name
@@ -1145,13 +1192,18 @@ cmd_check() {
     pid="${check_pids[$index]}"
     index=$((index + 1))
     wait "$pid"
-    case "$engine_name" in claude) model="$claude_model" ;; codex) model="$codex_model" ;; *) model="$gemini_model" ;; esac
+    case "$engine_name" in
+      claude) model="$claude_model" ;;
+      claude[234]) model="$(printf '%s' "$resolved" | jq -r ".${engine_name}_model")" ;;
+      codex) model="$codex_model" ;;
+      *) model="$gemini_model" ;;
+    esac
     run_line="$(jq -c --arg e "$engine_name" 'select(.type == "run" and .engine == $e)' "$check_dir/metrics.jsonl" 2>/dev/null | tail -n 1)"
     status="$(printf '%s' "$run_line" | jq -r '.status // empty' 2>/dev/null)"
     if [ "$status" = "success" ] || [ "$status" = "degraded" ]; then
       first_line="$(head -n 1 "$check_dir/$engine_name.out" 2>/dev/null)"
       ran=""
-      if [[ "$first_line" =~ ^crosscheck-model:\ [a-z]+\ ran\ ([^\ ]+)\ \( ]] && [ "${BASH_REMATCH[1]}" != "unknown" ]; then
+      if [[ "$first_line" =~ ^crosscheck-model:\ [a-z0-9]+\ ran\ ([^\ ]+)\ \( ]] && [ "${BASH_REMATCH[1]}" != "unknown" ]; then
         ran=" (ran ${BASH_REMATCH[1]})"
       fi
       printf '%s: ok %s%s\n' "$engine_name" "$model" "$ran"
@@ -1186,6 +1238,7 @@ cmd_config() {
     set)
       local engine="" codex_model="" claude_model="" codex_effort="" claude_effort=""
       local gemini_model="$GEMINI_DEFAULT_MODEL" gemini_effort="$GEMINI_DEFAULT_EFFORT"
+      local -a advisor_specs=()
       while [ $# -gt 0 ]; do
         case "$1" in
           --engine) engine="${2:-}"; shift 2 ;;
@@ -1195,6 +1248,8 @@ cmd_config() {
           --claude-effort) claude_effort="${2:-}"; shift 2 ;;
           --gemini-model) gemini_model="${2:-}"; shift 2 ;;
           --gemini-effort) gemini_effort="${2:-}"; shift 2 ;;
+          # MODEL|EFFORT[|LABEL]: `|` never occurs in a valid model id.
+          --claude-advisor) advisor_specs+=("${2:-}"); shift 2 ;;
           *) shift ;;
         esac
       done
@@ -1210,6 +1265,25 @@ cmd_config() {
       valid_effort "$codex_effort" || { echo "crosscheck --config set: --codex-effort must be one of: $CONFIG_EFFORTS" >&2; return 2; }
       valid_claude_effort "$claude_effort" || { echo "crosscheck --config set: --claude-effort must be one of: $CONFIG_CLAUDE_EFFORTS" >&2; return 2; }
       valid_model_id "$codex_model" || { echo "crosscheck --config set: --codex-model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
+      # Advisors: validated before anything is written. Advisor 1 also becomes
+      # claude_model/claude_effort, so the two never disagree in the file.
+      local advisors_json="[]" advisor_spec advisor_model advisor_effort advisor_label
+      if [ ${#advisor_specs[@]} -gt "$MAX_CLAUDE_ADVISORS" ]; then
+        echo "crosscheck --config set: at most $MAX_CLAUDE_ADVISORS --claude-advisor flags" >&2
+        return 2
+      fi
+      for advisor_spec in ${advisor_specs[@]+"${advisor_specs[@]}"}; do
+        IFS='|' read -r advisor_model advisor_effort advisor_label <<<"$advisor_spec"
+        valid_model_id "$advisor_model" || { echo "crosscheck --config set: --claude-advisor model is invalid in '$advisor_spec'" >&2; return 2; }
+        valid_claude_effort "$advisor_effort" || { echo "crosscheck --config set: --claude-advisor effort must be one of: $CONFIG_CLAUDE_EFFORTS" >&2; return 2; }
+        [[ "$advisor_label" =~ $ADVISOR_LABEL_PATTERN ]] || { echo "crosscheck --config set: --claude-advisor label must match $ADVISOR_LABEL_PATTERN" >&2; return 2; }
+        advisors_json="$(jq -c --arg model "$advisor_model" --arg effort "$advisor_effort" --arg label "$advisor_label" \
+          '. + [{model:$model, effort:$effort} + (if $label == "" then {} else {label:$label} end)]' <<<"$advisors_json")"
+      done
+      if [ ${#advisor_specs[@]} -gt 0 ]; then
+        claude_model="$(jq -r '.[0].model' <<<"$advisors_json")"
+        claude_effort="$(jq -r '.[0].effort' <<<"$advisors_json")"
+      fi
       if ! mkdir -p "$STATE_ROOT" 2>/dev/null; then
         echo "crosscheck --config set: cannot create $STATE_ROOT" >&2
         return 1
@@ -1220,9 +1294,10 @@ cmd_config() {
       local json
       json="$(jq -n --arg engine "$engine" --arg codex_model "$codex_model" --arg claude_model "$claude_model" \
         --arg codex_effort "$codex_effort" --arg claude_effort "$claude_effort" \
-        --arg gemini_model "$gemini_model" --arg gemini_effort "$gemini_effort" \
+        --arg gemini_model "$gemini_model" --arg gemini_effort "$gemini_effort" --argjson advisors "$advisors_json" \
         '{engine:$engine, claude_model:$claude_model, codex_model:$codex_model, gemini_model:$gemini_model,
-          claude_effort:$claude_effort, codex_effort:$codex_effort, gemini_effort:$gemini_effort}')"
+          claude_effort:$claude_effort, codex_effort:$codex_effort, gemini_effort:$gemini_effort}
+         + (if ($advisors | length) > 0 then {claude_advisors:$advisors} else {} end)')"
       atomic_write "$CONFIG_FILE" "$json" || {
         echo "crosscheck --config set: failed to write $CONFIG_FILE" >&2
         return 1
@@ -1353,9 +1428,13 @@ cmd_run() {
 
   # Fails closed like --mode: a typo must not silently run Codex and mark the
   # hash reviewed under the wrong engine label.
+  # claude2 to claude4 are further Claude advisors: the claude code path under
+  # their own id (labels, model and effort), checked against the config below.
+  local engine_kind="$engine"
   case "$engine" in
     codex|claude|gemini) : ;;
-    *) echo "crosscheck --run: unknown --engine '$engine' (want claude|codex|gemini)" >&2; return 2 ;;
+    claude[234]) engine_kind="claude" ;;
+    *) echo "crosscheck --run: unknown --engine '$engine' (want claude|claude2..4|codex|gemini)" >&2; return 2 ;;
   esac
   case "$scope" in
     full|delta) : ;;
@@ -1385,7 +1464,7 @@ cmd_run() {
 
   # The engine name is not always the binary name: Gemini runs through `agy`,
   # so a stray `gemini` binary must neither satisfy nor replace the check.
-  local engine_binary="$engine"
+  local engine_binary="$engine_kind"
   [ "$engine" = "gemini" ] && engine_binary="agy"
   command -v jq >/dev/null 2>&1 || { echo "crosscheck --run: jq not found on PATH" >&2; return 1; }
   command -v "$engine_binary" >/dev/null 2>&1 || { echo "crosscheck --run: $engine_binary not found on PATH" >&2; return 1; }
@@ -1465,6 +1544,13 @@ cmd_run() {
     echo "crosscheck --run: $CONFIG_FILE is corrupt or invalid. Run /crosscheck-setup to fix it." >&2
     return 1
   }
+  # An advisor id the config does not have is a usage error, after the config
+  # itself proved readable (a corrupt one still exits 1 above).
+  if ! printf '%s' "$resolved_config" | jq -e --arg id "$engine" '(.claude_advisors | map(.id)) | index($id) != null' >/dev/null 2>&1 \
+    && [ "$engine_kind" = "claude" ]; then
+    echo "crosscheck --run: no such advisor '$engine' in $CONFIG_FILE (see crosscheck --config get)" >&2
+    return 2
+  fi
   local engine_model engine_effort
   engine_model="$(printf '%s' "$resolved_config" | jq -r ".${engine}_model")"
   engine_effort="$(printf '%s' "$resolved_config" | jq -r ".${engine}_effort")"
@@ -1625,7 +1711,7 @@ cmd_run() {
     [ $rc -eq 0 ] || record_failed_run "$mode" gemini "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$gemini_usage" "$scope"
     return $rc
   fi
-  if [ "$engine" = "claude" ]; then
+  if [ "$engine_kind" = "claude" ]; then
     # `json_file` holds claude's `--output-format json` result (or plain text
     # from a claude that ignores the flag). Its failures never mention Codex
     # or call auth_status.
@@ -1639,9 +1725,9 @@ cmd_run() {
       failed_result="$(claude_result_json "$json_file")"
       failed_message="$(printf '%s' "$failed_result" | jq -r '.result // empty' 2>/dev/null)"
       if failed_clean="$(model_unavailable_line "$engine_model" "$failed_message")"; then failed_message="$failed_clean"; fi
-      log "run ($mode) engine=claude failed rc=$rc${failed_message:+ error=$(printf '%s' "$failed_message" | tr '\n\r' '  ' | head -c 300)}"
+      log "run ($mode) engine=$engine failed rc=$rc${failed_message:+ error=$(printf '%s' "$failed_message" | tr '\n\r' '  ' | head -c 300)}"
       echo "crosscheck --run: claude -p failed (rc=$rc).${failed_message:+ Claude said: $(printf '%s' "$failed_message" | tr '\n\r' '  ' | head -c 300)} See $STDERR_LOG_FILE." >&2
-      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" \
+      record_failed_run "$mode" "$engine" "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" \
         "${failed_message:-claude -p exited $rc}" "$([ -n "$failed_result" ] && claude_usage_json "$failed_result" || printf null)" "$scope"
       return 1
     fi
@@ -1655,21 +1741,21 @@ cmd_run() {
       if [ "$claude_is_error" = "true" ]; then
         local error_clean
         if error_clean="$(model_unavailable_line "$engine_model" "$claude_output")"; then claude_output="$error_clean"; fi
-        log "run ($mode) engine=claude reported an error result: $(printf '%s' "$claude_output" | tr '\n\r' '  ' | head -c 300)"
+        log "run ($mode) engine=$engine reported an error result: $(printf '%s' "$claude_output" | tr '\n\r' '  ' | head -c 300)"
         echo "crosscheck --run: claude reported an error: $(printf '%s' "$claude_output" | head -c 300). See $STDERR_LOG_FILE." >&2
-        record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage" "$scope"
+        record_failed_run "$mode" "$engine" "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage" "$scope"
         return 1
       fi
     else
       claude_output="$(cat "$json_file" 2>/dev/null)"
     fi
     if [ -z "$claude_output" ]; then
-      log "run ($mode) engine=claude produced empty output"
+      log "run ($mode) engine=$engine produced empty output"
       echo "crosscheck --run: claude produced no output. See $STDERR_LOG_FILE." >&2
-      record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage" "$scope"
+      record_failed_run "$mode" "$engine" "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage" "$scope"
       return 1
     fi
-    set_model_line claude "$engine_model" "$([ -n "$claude_result" ] && claude_ran_model "$claude_result")"
+    set_model_line "$engine" "$engine_model" "$([ -n "$claude_result" ] && claude_ran_model "$claude_result")"
     # Tool actions the read-only sandbox denied. claude -p gives no call
     # total, so this can only degrade. Plain-text output has no such list.
     local claude_denied_count=0 claude_extra
@@ -1681,13 +1767,13 @@ cmd_run() {
     if [ "$claude_denied_count" -gt 0 ]; then
       claude_output="$claude_output"$'\n\n'"$(degraded_caveat "$claude_denied_count" "")"
       claude_extra="$(degraded_extra_json "$run_started" "$run_ended" "$claude_usage" "$scope" "$claude_denied_count" "")"
-      log "run ($mode) engine=claude degraded: $claude_denied_count denied tool actions"
+      log "run ($mode) engine=$engine degraded: $claude_denied_count denied tool actions"
     fi
-    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" "$claude_extra"
+    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "$engine" "$round" "$engine_model" "$engine_effort" "$claude_extra"
     rc=$?
     # The engine ran (and was billed) but the report could not be published:
     # still a failed run in the metrics.
-    [ $rc -eq 0 ] || record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$claude_usage" "$scope"
+    [ $rc -eq 0 ] || record_failed_run "$mode" "$engine" "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$claude_usage" "$scope"
     return $rc
   fi
 
@@ -1993,14 +2079,14 @@ normalize_finding_source() {
     case " $round_engines " in *" codex "*) printf 'ambos'; return 0 ;; esac
     return 1
   fi
-  [[ "$source" =~ ^[a-z]+(\+[a-z]+)*$ ]] || return 1
+  [[ "$source" =~ ^[a-z0-9]+(\+[a-z0-9]+)*$ ]] || return 1
   IFS=+ read -r -a parts <<<"$source"
   for part in "${parts[@]}"; do
     case " $round_engines " in *" $part "*) : ;; *) return 1 ;; esac
     case "$seen" in *" $part "*) return 1 ;; esac
     seen="$seen$part "
   done
-  for engine in $ENGINE_ORDER; do
+  for engine in $ROUND_ENGINE_ORDER; do
     case "$seen" in *" $engine "*) canonical="${canonical:+$canonical+}$engine" ;; esac
   done
   [ "$canonical" = "claude+codex" ] && canonical="ambos"
@@ -2038,11 +2124,11 @@ cmd_metrics_findings() {
   [[ "$round" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --metrics-findings: --round is required and must be a positive integer" >&2; return 2; }
   # claude,codex is stored as `both` so old and new rounds group together.
   local round_engines
-  if ! round_engines="$(engine_list "$engines")"; then
-    echo "crosscheck --metrics-findings: --engines must be one engine, both, or a comma list of claude, codex, gemini (no repeats)" >&2
+  if ! round_engines="$(engine_list "$engines" "$ROUND_ENGINE_ORDER")"; then
+    echo "crosscheck --metrics-findings: --engines must be one engine, both, or a comma list of claude, claude2..4, codex, gemini (no repeats)" >&2
     return 2
   fi
-  engines="$(engine_normalized "$engines")"
+  engines="$(engine_normalized "$engines" "$ROUND_ENGINE_ORDER")"
   [ "$engines" = "claude,codex" ] && engines="both"
   case "$scope" in
     full|delta) : ;;
@@ -2169,7 +2255,8 @@ cmd_next_round() {
     echo "crosscheck --next-round: $CONFIG_FILE is corrupt or invalid. Run /crosscheck-setup to fix it." >&2
     return 1
   }
-  configured_engines="$(printf '%s' "$resolved_config" | jq -c '.engines')"
+  # Every advisor is its own engine of the round, so the fanout names each one.
+  configured_engines="$(printf '%s' "$resolved_config" | jq -c '.run_engines')"
 
   # From round 2 on a round only re-audits what was flagged and what changed
   # (the scoped, `--scope delta` round): `full` is never answered. A CRITICAL or
@@ -2285,7 +2372,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
 | ($rounds | map(select(((.engines // "") | contains(",") | not) and .engines != "both"))) as $single_rounds
 | ($rounds | map(select(.engines == "both"))) as $both_rounds
 # Every other engine set has several engines and includes gemini (claude,codex is stored as both).
-| ($rounds | map(select(((.engines // "") | contains(",")) and ((.engines // "") | contains("gemini"))))) as $gemini_rounds
+| ($rounds | map(select((.engines // "") | contains(",")))) as $gemini_rounds
 | [
     "Planes auditados: \($rounds | map(select(.round == 1)) | length)",
     "Planes con mas de una ronda: \($plan_rounds | map(select(.round == 2)) | length)",
@@ -2309,8 +2396,9 @@ map(if .type == "findings" then normalize_outcomes else . end)
           | "  \(.[0].engine) \(.[0].model): \($accepted) incorporados, \($rejected) rechazados, \($unknown) sin estado\(if $accepted + $rejected > 0 then " (aceptacion \(($accepted * 100 / ($accepted + $rejected)) | round)%)" else "" end)") end),
     "Rondas sin registro de hallazgos: \([ .[] | select(.type == "findings-missing") | "\(.hash) \(.round)" ] as $missing | ([ $round_records[] | "\(.hash) \(.round)" ]) as $have | [ $missing[] | select(IN($have[]) | not) ] | unique | length)",
     "Rondas de un solo motor, hallazgos por motor:",
-    ($single_rounds | count_rows as $rows | ["claude", "codex", "gemini"][] as $engine
+    ($single_rounds | count_rows as $rows | ["claude", "claude2", "claude3", "claude4", "codex", "gemini"][] as $engine
       | [$rows[] | select(.engines == $engine)] as $mine
+      | select(($engine | IN("claude", "codex", "gemini")) or ($mine | length) > 0)
       | "  \($engine): \(severity_line($mine)) (critical+high: \(critical_high($mine)))"),
     "Rondas con ambos motores: \($both_rounds | length)",
     ($both_rounds | group_by([model_of($runs; .hash; "claude"), model_of($runs; .hash; "codex")]) | .[]
@@ -2326,7 +2414,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
       | . as $group | count_rows as $rows
       | ($rows | map(.source |= if . == "ambos" then "claude+codex" else . end)) as $named_rows
       | ([$named_rows[].source] | unique) as $present
-      | ((["claude", "codex", "gemini"] | map(select(IN($present[])))) + ($present | map(select(contains("+"))) | sort)) as $sources
+      | ((["claude", "claude2", "claude3", "claude4", "codex", "gemini"] | map(select(IN($present[])))) +($present | map(select(contains("+"))) | sort)) as $sources
       | "  \($group[0].label) (\($group | length) rondas):",
         ($sources[] as $source
           | [$named_rows[] | select(.source == $source)] as $mine
@@ -5081,8 +5169,8 @@ MM_CLAUDE_EOF
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.14.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.14.0"
-  check "the README badge says 3.14.0" "$(grep -c -F 'badge/version-3.14.0-' "$readme_md" 2>/dev/null)" "1"
+  check "the CHANGELOG top entry is 3.15.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.15.0"
+  check "the README badge says 3.15.0" "$(grep -c -F 'badge/version-3.15.0-' "$readme_md" 2>/dev/null)" "1"
   # 55. Context bundle (`--bundle`): the files and symbols a plan names, cut to
   #     the relevant lines, inside the git root and nothing else.
   local bundle_state="$tmp_home/bundle-state" bundle_repo="$tmp_home/bundle-repo" bundle_plan="$tmp_home/bundle-plan.md" bundle_out bundle_index
@@ -5219,6 +5307,113 @@ MM_CLAUDE_EOF
   done
   check "SKILL.md no longer says a scoped run is a single engine" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -c -F -e 'it is a single engine' -e 'one scoped round with codex')" "0"
   check "how-it-works describes the context bundle" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -c -F 'context bundle')" "1"
+
+  # 59. Several Claude advisors: each one is an engine id (claude, claude2..4)
+  #     with its own model and effort, config shape, run, metrics, next-round,
+  #     stats and the skill text. Everything runs in temp dirs with stubs.
+  local adv_root="$tmp_home/adv-root" adv_cfg_file="$tmp_home/adv-root/config.json" adv_stub="$tmp_home/adv-stub" adv_args="$tmp_home/adv-args.log" adv_out adv_rc
+  mkdir -p "$adv_root/state/reports" "$adv_stub"
+  : >"$adv_args"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'printf "%%s\\n" "$*" >>%q\n' "$adv_args"
+    echo 'cat >/dev/null'
+    echo 'case " $* " in *" --model badadv "*) echo "advisor stub failure" >&2; exit 1 ;; esac'
+    echo 'printf "%s\n" "stub claude finding"'
+  } >"$adv_stub/claude"
+  chmod +x "$adv_stub/claude"
+  adv() { CROSSCHECK_STATE_DIR="$adv_root" HOME="$tmp_home" PATH="$adv_stub:$PATH" "$run" "$@" </dev/null; }
+  printf '{"engine":"claude,codex","codex_model":"gpt-a","claude_model":"old-model","claude_effort":"high"}' >"$adv_cfg_file"
+  adv_out="$(adv --config get)"
+  check "advisors: an old config is a list of one" "$(printf '%s' "$adv_out" | jq -c '[.claude_advisors[] | {id, model, effort}]')" '[{"id":"claude","model":"old-model","effort":"high"}]'
+  check "advisors: an old config keeps its engines and run_engines" "$(printf '%s' "$adv_out" | jq -c '[.engines, .run_engines]')" '[["claude","codex"],["claude","codex"]]'
+  adv --config set --engine claude,codex --codex-model gpt-a --claude-model x --claude-effort low --codex-effort medium \
+    --claude-advisor 'op-1|high|deep' --claude-advisor 'son-2|medium' >/dev/null
+  adv_out="$(adv --config get)"
+  check "advisors: set writes the list and advisor 1 wins over --claude-model" "$(printf '%s' "$adv_out" | jq -c '[.claude_model, .claude_effort, [.claude_advisors[] | "\(.id)/\(.model)/\(.effort)/\(.label)"]]')" '["op-1","high",["claude/op-1/high/deep","claude2/son-2/medium/"]]'
+  check "advisors: run_engines expands claude in canonical order" "$(printf '%s' "$adv_out" | jq -c '[.engines, .run_engines, .claude2_model, .claude2_effort]')" '[["claude","codex"],["claude","claude2","codex"],"son-2","medium"]'
+  adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high|deep' --claude-advisor 'son-2|medium' >/dev/null
+  check "advisors: a claude-only config with two advisors has engines [claude] and two run_engines" "$(adv --config get | jq -c '[.engines, .run_engines]')" '[["claude"],["claude","claude2"]]'
+  adv --config set --engine codex --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high|deep' --claude-advisor 'son-2|medium' >/dev/null
+  check "advisors: resending the saved advisors while Claude is not chosen keeps both" "$(adv --config get | jq -c '[.claude_advisors[].id]')" '["claude","claude2"]'
+  local adv_before adv_bad
+  adv_before="$(cat "$adv_cfg_file")"
+  for adv_bad in "a|bogus" "a;b|high" "|high" "a|high|bad;label"; do
+    adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium --claude-advisor "$adv_bad" >/dev/null 2>&1
+    check "advisors: set rejects '$adv_bad' (exit 2, file untouched)" "$?/$([ "$(cat "$adv_cfg_file")" = "$adv_before" ] && echo same || echo changed)" "2/same"
+  done
+  adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'a|high' --claude-advisor 'b|high' --claude-advisor 'c|high' --claude-advisor 'd|high' --claude-advisor 'e|high' >/dev/null 2>&1
+  check "advisors: a fifth advisor is rejected (exit 2, file untouched)" "$?/$([ "$(cat "$adv_cfg_file")" = "$adv_before" ] && echo same || echo changed)" "2/same"
+  adv --config set --engine claude2 --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium >/dev/null 2>&1
+  check "advisors: an advisor id is not a valid saved engine" "$?" "2"
+
+  #     --run: claude2 is its own claude -p with its own model and effort.
+  adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high' --claude-advisor 'son-2|medium|cheap' >/dev/null
+  : >"$adv_args"
+  adv --run --engine claude2 --mode plan-review --prompt-file "$gem_prompt" --hash adc00001 --out "$adv_root/state/reports/adv-claude2.md" >"$adv_root/out2.txt" 2>&1
+  adv_rc=$?
+  check "advisors: --run --engine claude2 succeeds and publishes the report" "$adv_rc/$(grep -c 'stub claude finding' "$adv_root/out2.txt")" "0/1"
+  check "advisors: claude2 ran claude -p with its own model and effort" "$(grep -c -e '--model son-2' "$adv_args")/$(grep -c -e '--effort medium' "$adv_args")" "1/1"
+  check "advisors: the run line is labeled claude2 with its model and effort" "$(jq -r 'select(.type == "run" and .hash == "adc00001") | "\(.engine)/\(.model)/\(.effort)"' "$adv_root/metrics.jsonl")" "claude2/son-2/medium"
+  adv --run --engine claude3 --mode plan-review --prompt-file "$gem_prompt" --hash adc00002 >/dev/null 2>&1
+  check "advisors: an advisor that is not configured exits 2" "$?" "2"
+  adv --run --engine claude1 --mode plan-review --prompt-file "$gem_prompt" --hash adc00002 >/dev/null 2>&1
+  check "advisors: claude1 is not an engine id (exit 2)" "$?" "2"
+  adv --run --engine claude --mode plan-review --prompt-file "$gem_prompt" --hash adc00003 --out "$adv_root/state/reports/adv-p1.md" >/dev/null 2>&1 &
+  adv --run --engine claude2 --mode plan-review --prompt-file "$gem_prompt" --hash adc00003 --out "$adv_root/state/reports/adv-p2.md" >/dev/null 2>&1 &
+  wait
+  check "advisors: two advisors in parallel leave one valid run line each" "$(jq -c 'select(.type == "run" and .hash == "adc00003") | .engine' "$adv_root/metrics.jsonl" | sort | tr '\n' ' ')" '"claude" "claude2" '
+  adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high' --claude-advisor 'badadv|low' >/dev/null
+  adv --run --engine claude --mode plan-review --prompt-file "$gem_prompt" --hash adc00004 --out "$adv_root/state/reports/adv-f1.md" >/dev/null 2>&1
+  adv_rc=$?
+  adv --run --engine claude2 --mode plan-review --prompt-file "$gem_prompt" --hash adc00004 --out "$adv_root/state/reports/adv-f2.md" >/dev/null 2>&1
+  check "advisors: advisor 1 succeeds and advisor 2 fails on its own model" "$adv_rc/$?/$(jq -r 'select(.type == "run" and .hash == "adc00004") | "\(.engine):\(.status)"' "$adv_root/metrics.jsonl" | sort | tr '\n' ' ')" "0/1/claude2:failed claude:success "
+
+  #     --config check in saved mode: one line per advisor id, each with its own model.
+  adv --config set --engine claude --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high' --claude-advisor 'son-2|medium' >/dev/null
+  adv_out="$(adv --config check 2>&1)"
+  check "advisors: saved-mode check reports one line per advisor with its own model" "$(printf '%s\n' "$adv_out" | grep -c -x -e 'claude: ok op-1' -e 'claude2: ok son-2')" "2"
+
+  #     --metrics-findings and --next-round with advisor ids.
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash adc101 --round 1 --engines claude,claude2,codex \
+    --finding HIGH:claude2 --finding MEDIUM:claude+claude2 --finding LOW:claude2+codex --finding HIGH:ambos >/dev/null 2>&1
+  adv_rc=$?
+  check "advisors: findings with advisor sources are accepted" "$adv_rc/$(jq -cS 'select(.hash == "adc101") | [.engines, .counts]' "$metrics_root/metrics.jsonl" | tail -1)" '0/["claude,claude2,codex",{"ambos":{"HIGH":1},"claude+claude2":{"MEDIUM":1},"claude2":{"HIGH":1},"claude2+codex":{"LOW":1}}]'
+  metrics_findings_bad "an advisor that did not take part" --hash adc102 --round 1 --engines claude,codex --finding HIGH:claude2
+  metrics_findings_bad "claude3 on a round of claude and claude2" --hash adc102 --round 1 --engines claude,claude2 --finding HIGH:claude3
+  CROSSCHECK_STATE_DIR="$metrics_root" "$run" --metrics-findings --hash adc103 --round 1 --engines claude2,codex >/dev/null 2>&1
+  check "advisors: a round where advisor 1 failed is valid and never collapses to both" "$(jq -r 'select(.hash == "adc103") | .engines' "$metrics_root/metrics.jsonl" | tail -1)" "claude2,codex"
+  adv --config set --engine claude,codex --codex-model gpt-a --claude-model op-1 --claude-effort high --codex-effort medium \
+    --claude-advisor 'op-1|high' --claude-advisor 'son-2|medium' >/dev/null
+  check "advisors: a CRITICAL fans out to every advisor and engine, scoped" "$(adv --next-round --round 1 --scoped-streak 0 --item CRITICAL:change:incorporated | jq -c '.launch')" '["--engine claude --scope delta","--engine claude2 --scope delta","--engine codex --scope delta"]'
+
+  #     --stats: advisors are separate rows, labeled by id and model.
+  local adv_stats="$tmp_home/adv-stats.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude","model":"opus-x","effort":"high","round":1,"hash":"sa1","repo":"r","status":"success"}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"claude2","model":"sonnet-y","effort":"medium","round":1,"hash":"sa1","repo":"r","status":"success"}'
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"sa1","repo":"r","status":"success"}'
+    echo '{"type":"findings","ts":2,"hash":"sa1","round":1,"engines":"claude,claude2,codex","scope":"full","repo":"r","counts":{"claude2":{"HIGH":1},"claude+claude2":{"LOW":1}},"outcomes":[{"severity":"HIGH","source":"claude2","status":"incorporated","reason":null},{"severity":"LOW","source":"claude+claude2","status":"rejected","reason":"x"}]}'
+  } >"$adv_stats"
+  out="$("$run" --stats "$adv_stats")"
+  check "advisors: stats lists each advisor as its own engine and model" "$(stats_section "$out" "Auditorias por motor y modelo" | grep -c -e '^  claude opus-x: 1' -e '^  claude2 sonnet-y: 1')" "2"
+  check "advisors: stats acceptance is per advisor" "$(stats_section "$out" "Aceptacion de hallazgos por motor y modelo" | grep -c -e '^  claude2 sonnet-y: 1 incorporados, 1 rechazados' -e '^  claude opus-x: 0 incorporados, 1 rechazados')" "2"
+  check "advisors: stats shows a multi-advisor round and a line per source" "$(stats_section "$out" "Rondas con Gemini y otros motores" | grep -c -e '^  claude opus-x + claude2 sonnet-y + codex gpt-a (1 rondas):$' -e '^    solo claude2: CRITICAL 0, HIGH 1, MEDIUM 0, LOW 0' -e '^    claude+claude2: CRITICAL 0, HIGH 0, MEDIUM 0, LOW 1')" "3"
+
+  #     Skill text, docs and version.
+  for phrase in "run_engines" "claude2" "two or more" "claude_advisors"; do
+    check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  for phrase in "--claude-advisor" "how many Claude advisors"; do
+    check "setup SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$setup_skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "configuration docs name claude_advisors" "$(grep -q -F 'claude_advisors' "$(dirname "$run")/../docs/configuration.md" && echo yes || echo no)" "yes"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.

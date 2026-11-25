@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.14.0-0071e3">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.15.0-0071e3">
   <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=anthropic&logoColor=white">
   <img alt="Engines" src="https://img.shields.io/badge/engines-Claude%20%7C%20Codex%20%7C%20Gemini-1d1d1f">
   <img alt="Read-only" src="https://img.shields.io/badge/auditors-read--only-5FA04E">
@@ -50,6 +50,11 @@ stuck waiting on a broken tool.
 **Three today, more tomorrow.** The engine list is a plain list, not three
 hardcoded slots. Today that's Claude, Codex and Gemini; more models and more
 CLIs can join in future versions without changing how you use it.
+
+**Several Claude advisors.** Ask for up to four Claude advisors, each with its
+own model and effort (for example Opus on high and Sonnet on medium). Each runs
+as its own read-only `claude -p`, in parallel with the other engines, and every
+finding in the merged report and in `--stats` says which advisor raised it.
 
 **Any model, no plugin update.** Pick a model from the shortcuts or type any
 exact model ID. When a new model ships, you just pick it.

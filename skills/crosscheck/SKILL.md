@@ -16,6 +16,11 @@ The engines, always listed in the order Claude, Codex, Gemini:
   effort) run as a nested, read-only `claude -p --safe-mode`, launched by
   `crosscheck --run --engine claude`. Fresh context, no MCP, no hooks. It is
   not the `Agent` tool: that tool only accepts model aliases and has no effort.
+- **Several Claude advisors**: `claude` can be configured as 1 to 4 advisors,
+  each its own `claude -p` with its own model and effort. Advisor 1 is
+  `claude`, the others are `claude2`, `claude3` and `claude4`; each id is an
+  engine of the round (`--run --engine claude2`) and the label of its
+  findings. `crosscheck --config get` lists them in `claude_advisors`.
 - **`codex`** (default): a single Codex CLI call (`codex exec`, read-only
   sandbox, a separate model from you), launched by `crosscheck --run`.
 - **`gemini`**: a Gemini model through the Antigravity CLI (`agy`, read-only
@@ -23,8 +28,10 @@ The engines, always listed in the order Claude, Codex, Gemini:
   Not isolated like `claude -p --safe-mode`: `agy` has no flag to turn off
   MCP servers, extensions, hooks or workspace rule files.
 - **Several engines**: the saved `engine` is a comma list (for example
-  `claude,codex,gemini`) or the legacy `both` (= `claude,codex`). They run in
-  parallel, then you merge the reports.
+  `claude,codex,gemini`) or the legacy `both` (= `claude,codex`). Several
+  engines also means two or more entries in `run_engines`, which is what you
+  launch: a Claude-only config with two advisors is several engines. They run
+  in parallel, then you merge the reports.
 
 This skill's job is everything the shell script can't do: deciding what the
 request actually is, assembling it into a self-contained prompt, launching
@@ -42,12 +49,17 @@ crosscheck --config get
 ```
 
 It prints JSON: `engine` (one engine, `both`, or a comma list such as
-`claude,gemini`), `engines` (the array of engines to run, canonical order
-Claude, Codex, Gemini; read this one, it is what you launch), `claude_model`,
+`claude,gemini`), `engines` (the configured engines, canonical order
+Claude, Codex, Gemini), `run_engines` (`engines` with `claude` expanded into
+its advisor ids, order claude, claude2, claude3, claude4, codex, gemini; read
+this one, it is what you launch and count), `claude_advisors` (one
+`{id, model, effort, label}` per advisor; a config saved before advisors
+existed is a list of one), `claude_model`,
 `codex_model`, `gemini_model` (any alias or model ID), `claude_effort`,
 `codex_effort`, `gemini_effort` (`low` | `medium` | `high` | `xhigh` | `max`),
 and `codex_model_source`. To get just the list run `crosscheck --config get`
-and read the field `engines` (`crosscheck --config get | jq .engines`). No
+and read the field `run_engines` (`crosscheck --config get | jq .run_engines`;
+`crosscheck --config get | jq .engines` lists the configured engines). No
 config file just means defaults (`codex`, model `default` for Codex and Gemini
 and `fable` for Claude; efforts `medium`, `high` for Gemini). The model value
 `default` means the engine runs without a model flag, on its own default.
@@ -90,7 +102,9 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
    marker in the question text, see above), one question,
    naming the configured engine(s) and models (for example "auditoria con
    Codex <codex_model>", "con Claude <claude_model>", "con Gemini
-   <gemini_model>" or "con Claude + Codex", using the saved values). No need to over-explain: the deny reason already told you why
+   <gemini_model>" or "con Claude + Codex", using the saved values; with
+   several Claude advisors name each one, for example "con Claude opus high +
+   Claude sonnet medium"). No need to over-explain: the deny reason already told you why
    you're asking.
 
    **Exception: if this denial is on a hash produced by editing the plan to
@@ -216,7 +230,8 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
       starts with its own `umask 077` (each call is a separate shell and does
       not inherit the previous one's umask).
 
-      **One engine** (`claude`, `codex` or `gemini`): append to the same `Bash`
+      **One engine** (`run_engines` has exactly one entry: `claude`, `codex`
+      or `gemini`): append to the same `Bash`
       call from 3.b (bundle step included, so it sits inside the one
       backgrounded call):
       ```
@@ -229,14 +244,17 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
       heredoc write are near-instant; backgrounding the whole script just
       means the slow part (`--run`) doesn't block.
 
-      **Several engines** (`engines` from `crosscheck --config get`, field
-      `engines`, has two or three entries): first ONE foreground `Bash` call
+      **Several engines** (`run_engines` from `crosscheck --config get` has
+      two or more entries, up to six with four Claude advisors, codex and
+      gemini; count `run_engines`, never `engines`): first ONE foreground `Bash` call
       that does the 3.b work (the bundle step included) and ends with `printf '%s\n' "$pf"`, so the
       prompt file exists (and its path is known) before any engine starts:
       `--run` exits 2 if `--prompt-file` is missing or empty, so backgrounded
       calls that raced the write would fail intermittently. Then, **in the
-      same assistant message**, issue one `Bash` call per configured engine
-      with `run_in_background: true`, in the order Claude, Codex, Gemini:
+      same assistant message**, issue one `Bash` call per entry of
+      `run_engines` (each Claude advisor is its own call, `--engine claude2`
+      and so on) with `run_in_background: true`, in the order of `run_engines`
+      (claude, claude2.., codex, gemini):
       `crosscheck --run --engine <engine> --mode plan-review --prompt-file
       <printed path> --hash <hash>`. Paste the printed path literally, it is a
       different shell. `--run` writes the hash's state file for every engine
@@ -369,7 +387,12 @@ and produce a single deduplicated list in the same format and order.
   `gemini:<model>`, or a combination joined with `+` in that order (for
   example `claude+gemini`, `claude+codex+gemini`). `claude+codex` is written
   as `ambos`, its existing spelling, so old and new rounds count in the same
-  stats column.
+  stats column. With several Claude advisors the advisor id is the label:
+  `claude2:<model>` is the second advisor, `claude+claude2` both of them
+  (order claude, claude2, claude3, claude4, codex, gemini; `claude2+codex` is
+  never `ambos`). Start the relay with one line per advisor (`claude2:
+  <model>, <effort>, <label>`) so the ids are readable, and carry the id in
+  every `Source:` and `PRIOR ROUNDS` line.
 - List the report paths in the order Claude, Codex, Gemini.
 - If engines contradict each other, check the claim against the repo
   yourself before relaying and say which one holds up and why.
@@ -408,11 +431,12 @@ whose reason has spaces. If you forget the call altogether, the next
 `ExitPlanMode` hook call records the round as unknown. `--engines` is the engine(s)
 that actually reported this round, not the configured one: with several
 engines, if some failed, pass the ones that survived. It accepts a single
-engine, `both`, or a comma list (`claude,codex,gemini`; `claude,codex` is
+engine, `both`, or a comma list (`claude,codex,gemini`, or with advisors
+`claude,claude2,codex`; `claude,codex` is
 stored as `both`). When a single engine reported, every source is that engine
-(`claude`, `codex` or `gemini`); with several, a source is an engine, a `+`
-combination in the order claude, codex, gemini (the same `Source:` line,
-`claude:<model>` reduced to `claude`, `gemini:<model>` to `gemini`), or
+(`claude`, `claude2`.., `codex` or `gemini`); with several, a source is an engine, a `+`
+combination in the order claude, claude2.., codex, gemini (the same `Source:` line,
+`claude:<model>` reduced to `claude`, `claude2:<model>` to `claude2`, `gemini:<model>` to `gemini`), or
 `ambos` (only when claude and codex both took part); every component must be
 one of the round's engines. No findings is valid: pass none. It records numbers only, never
 text. If it exits nonzero, say so in one line and carry on: metrics never block
@@ -497,7 +521,7 @@ Only two of the old rules still apply, and only in one direction each:
   with `AskUserQuestion` and launch nothing without the user's "Otra ronda".
 - (c) Overrides: when the answer is `show` and the user still says "Otra
   ronda", launch the `full` set for the configured engine(s), one `--run` per
-  configured engine (`--engine claude`, `--engine codex`, `--engine gemini`). When the
+  entry of `run_engines` (`--engine claude`, `--engine claude2`.., `--engine codex`, `--engine gemini`). When the
   answer is `scoped`, the question also offers "a full round" as a third
   option, which launches that same full set.
 
@@ -556,10 +580,10 @@ first.
    shell). When the request names files or backticked symbols (always for a
    plan-audit round), add the bundle step of A.3.b right after the heredoc:
    `crosscheck --bundle --plan-file "$pf" >>"$pf"`, plus `--prior-report` for a
-   scoped round. End the call with `printf '%s\n' "$pf"` when several engines are
-   configured. Then launch by engine exactly as in A.3.c, with `--mode research` and
+   scoped round. End the call with `printf '%s\n' "$pf"` when `run_engines` has
+   two or more entries. Then launch by engine exactly as in A.3.c, with `--mode research` and
    **no `--hash` on any command**: this mode never touches plan state. Every
-   `--run --engine <claude|codex|gemini>` goes in the background.
+   `--run --engine <claude|claude2..4|codex|gemini>` goes in the background.
 
 2. Wait for the results. `research_instructions` (see `hooks/crosscheck.sh`)
    returns structured evidence, current behavior, data flow, a minimal
@@ -616,9 +640,10 @@ first.
   "CRITICAL deny"), run `crosscheck --accept-critical --hash <hash>`;
   otherwise edit the plan.
 - `Bash` calls per audit: one engine is one call (write the
-  prompt, then `--run --engine ...`, backgrounded). Several engines are one foreground
+  prompt, then `--run --engine ...`, backgrounded). Several engines (two or
+  more entries in `run_engines`, each Claude advisor counts) are one foreground
   call (write the prompt, print its path), then one backgrounded `--run`
-  call per engine in the same message. Don't split the tmp-dir lookup and the heredoc
+  call per entry in the same message. Don't split the tmp-dir lookup and the heredoc
   write into separate calls.
 - `crosscheck --prepare` and `--record` are legacy: nothing in this skill uses
   them any more (they served the old `Agent`-based claude engine).

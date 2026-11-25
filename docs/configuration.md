@@ -22,6 +22,17 @@ crosscheck --config set --engine E --claude-model C --codex-model M \
   any order (`claude,gemini`), saved in the order Claude, Codex, Gemini.
 - Effort for Claude and Gemini is `low`, `medium`, `high`, `xhigh` or `max`;
   for Codex `low`, `medium`, `high` or `xhigh`.
+- **Several Claude advisors.** Add one `--claude-advisor 'MODEL|EFFORT[|LABEL]'`
+  per advisor (1 to 4; the label is optional, up to 30 letters, digits, spaces
+  and `. _ -`). They are saved as `claude_advisors` in `config.json`; advisor 1
+  is also `claude_model`/`claude_effort`, which `set` keeps equal to it. Each
+  advisor runs as its own `claude -p` in parallel with the other engines and
+  is called `claude`, `claude2`, `claude3`, `claude4` in reports, finding
+  sources and `--stats`. A config saved without `claude_advisors` is one
+  advisor, with nothing to migrate. `config get` also prints `run_engines`
+  (the engines with every advisor listed), which is what an audit launches.
+  Each advisor has its own timeout budget (from its effort), and each costs a
+  full audit of its own.
 - Model IDs are opaque strings: they may not be empty, start with `-`, or
   contain whitespace or shell metacharacters. If you compose the command by
   hand, single-quote every value.
@@ -52,7 +63,7 @@ crosscheck --config check [--engine E --model M [--effort F]]
 - `check` runs one tiny real call per engine through the same command an audit
   uses (same flags, read-only, same account), in a throwaway state directory,
   so it leaves no report, log or metrics line behind. With no flags it checks
-  every saved engine, one line each: `codex: ok MODEL`, `codex: FAIL MODEL:
+  every saved engine (each Claude advisor by id, `claude2: ok MODEL`), one line each: `codex: ok MODEL`, `codex: FAIL MODEL:
   reason`, or `codex: TIMEOUT MODEL: could not confirm`; exit 0 only when all
   are ok. With `--engine/--model` it checks one candidate and never reads the
   saved config, so a corrupt one cannot block `/crosscheck-setup`.

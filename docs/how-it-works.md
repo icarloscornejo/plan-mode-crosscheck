@@ -103,6 +103,21 @@ find out; you're never blocked indefinitely.
   unknown model, timeout, empty answer) are reported with their reason, never
   as an empty review.
 
+## Several Claude advisors
+
+The Claude engine can be configured as 1 to 4 advisors, each with its own model
+and effort. Internally an advisor is just one more engine id: advisor 1 is
+`claude`, the others `claude2`, `claude3`, `claude4`. `crosscheck --config get`
+prints them in `claude_advisors` and lists what an audit launches in
+`run_engines` (the configured engines with every advisor listed). The skill
+starts one `--run --engine <id>` per entry, in parallel with the other engines,
+and each has its own process, model, effort and timeout budget. The id is the
+advisor's label in the `engine` of its `run` metrics line, in finding sources
+(`claude2`, `claude+claude2`, `claude2+codex`; only exactly claude plus codex is
+`ambos`), in `--engines` and in `--stats`, so every finding names the advisor
+that raised it. A scoped round after a CRITICAL or change HIGH re-checks with
+every advisor. A config saved with a single Claude is read as a list of one.
+
 ## Review rounds
 
 If a finding changes the plan text, that's a new hash, and the cycle above runs

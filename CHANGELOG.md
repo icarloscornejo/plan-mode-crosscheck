@@ -2,6 +2,29 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.15.0
+
+Several Claude advisors, each with its own model and effort.
+
+- **Advisors.** `claude_advisors` in `config.json` lists 1 to 4 Claude advisors
+  (`model`, `effort`, optional `label`). Advisor 1 is `claude`, the others are
+  `claude2` to `claude4`; each runs as its own read-only `claude -p`, in
+  parallel with the other engines, with its own timeout budget. A config saved
+  with one Claude (every older config) is read as a list of one: nothing to
+  migrate. `--config set` takes one `--claude-advisor 'MODEL|EFFORT[|LABEL]'`
+  per advisor and keeps `claude_model`/`claude_effort` equal to advisor 1;
+  `--config get` adds `claude_advisors` and `run_engines`.
+- **Labels.** The advisor id is the label of its run line, of the finding
+  sources (`claude2`, `claude+claude2`, `claude2+codex`), of `--engines` and of
+  the `--stats` rows. `--next-round` re-checks with every advisor after a
+  CRITICAL or change HIGH. `--config check` checks each advisor by id.
+- **Setup and skill.** `/crosscheck-setup` asks how many Claude advisors, then
+  model and effort for each, checks each with a real call and saves them; it
+  resends the saved advisors when Claude is not chosen. The skill launches one
+  `--run` per entry of `run_engines`.
+- **Stats.** The block headed "Rondas con Gemini y otros motores" now also holds
+  rounds with several Claude advisors and no Gemini (the header is unchanged).
+
 ## 3.14.0
 
 Fewer tokens per audit. Every tool call of an auditor resends its whole context
