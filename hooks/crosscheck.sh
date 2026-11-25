@@ -537,6 +537,69 @@ gemini_usage_json() {
          output_tokens: $output, cached_tokens: $cache, cost_usd: null} end' 2>/dev/null || printf 'null'
 }
 
+# agy only sees the caller's cwd and the task dir, and print mode soft-denies
+# every read outside them. When the cwd sits below its git root (a ticket
+# subdirectory), the rest of the repo was unreadable. Prints that root, in
+# physical form, only when it is a real repo root above the cwd: never `/`,
+# never $HOME, and never a repo that also holds the task dir (that would hand
+# agy the whole state directory). Paths a task names outside the root stay
+# denied on purpose: agy sends what it reads to Google. $1 = task dir.
+gemini_cwd_repo_root() {
+  local task_dir_physical cwd_physical home_physical root
+  command -v git >/dev/null 2>&1 || return 1
+  cwd_physical="$(pwd -P)" || return 1
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  root="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
+  task_dir_physical="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  home_physical="$(cd "$HOME" 2>/dev/null && pwd -P)"
+  [ "$root" = "$cwd_physical" ] && return 1
+  case "$root" in /|"$home_physical") return 1 ;; esac
+  case "$task_dir_physical/" in "$root"/*) return 1 ;; esac
+  printf '%s' "$root"
+}
+
+# Denied tool actions of an agy result, for a log line: the actions and the
+# paths agy reported (any absolute path string inside a denied entry, whatever
+# its key), or a plain "agy gave no path". Prints nothing when none were
+# denied. $1 = the result JSON.
+gemini_denied_note() {
+  local actions paths
+  actions="$(jq -r '[.denied_actions[]? | .action? // empty] | unique | join(",")' <<<"$1" 2>/dev/null)"
+  [ -n "$actions" ] || return 0
+  paths="$(jq -r '[.denied_actions[]? | objects | del(.action) | .. | strings | select(startswith("/"))] | unique | join(",")' <<<"$1" 2>/dev/null)"
+  if [ -n "$paths" ]; then printf '%s; paths: %s' "$actions" "$paths"; else printf '%s; agy gave no path' "$actions"; fi
+}
+
+# Quota: agy says "Resets in 1h9m50s". Prints that wait in seconds from the
+# text in $1, or 1800 when the text has no usable time.
+gemini_quota_wait_seconds() {
+  local matched total=0
+  matched="$(grep -o -E -m 1 'Resets in ([0-9]+h)?([0-9]+m)?([0-9]+s)?' <<<"$1")"
+  [[ "$matched" =~ ([0-9]+)h ]] && total=$(( total + 10#${BASH_REMATCH[1]} * 3600 ))
+  [[ "$matched" =~ ([0-9]+)m ]] && total=$(( total + 10#${BASH_REMATCH[1]} * 60 ))
+  [[ "$matched" =~ ([0-9]+)s ]] && total=$(( total + 10#${BASH_REMATCH[1]} ))
+  [ "$total" -gt 0 ] || total=1800
+  printf '%s' "$total"
+}
+
+# HH:MM local time of epoch $1 (BSD date, then GNU).
+clock_of_epoch() {
+  date -r "$1" '+%H:%M' 2>/dev/null || date -d "@$1" '+%H:%M' 2>/dev/null || printf '%s' "$1"
+}
+
+GEMINI_SKIP_FILE="$STATE_DIR/gemini-skip-until"
+
+# Prints the epoch Gemini is skipped until and returns 0 while it is in the
+# future; returns 1 otherwise. A missing, expired or malformed file means "not
+# skipped" and is left alone (the next quota error overwrites it).
+gemini_skip_until() {
+  local until_epoch
+  until_epoch="$(cat "$GEMINI_SKIP_FILE" 2>/dev/null)"
+  [[ "$until_epoch" =~ ^[0-9]{1,10}$ ]] || return 1
+  [ $(( 10#$until_epoch )) -gt "$(date +%s)" ] || return 1
+  printf '%s' "$((10#$until_epoch))"
+}
+
 # Gemini twin of run_claude, but the task cannot travel over stdin or argv:
 # `agy -p` needs a value and ignores stdin, and an argv entry shows up in `ps`.
 # So the task is a 0600 file in a per-run directory (cmd_run wrote it) and the
@@ -550,6 +613,9 @@ gemini_usage_json() {
 # exit code (124 on timeout, 137 after the kill).
 run_gemini() {
   local task_dir="$1" task_path="$2" budget="$3" out_file="$4" timeout_bin="$5" model="$6" effort="$7" rc
+  local -a root_args=()
+  local repo_root
+  if repo_root="$(gemini_cwd_repo_root "$task_dir")"; then root_args=(--add-dir "$repo_root"); fi
   local -a print_timeout_args=()
   if [[ "$budget" =~ ^[0-9]+$ ]] && [ $((10#$budget)) -ge 2 ]; then
     local print_timeout=$(( 10#$budget - 30 ))
@@ -565,7 +631,7 @@ run_gemini() {
     --mode plan \
     --sandbox \
     --add-dir "$task_dir" \
-    --disable-slash-commands \
+    ${root_args[@]+"${root_args[@]}"} \
     ${print_timeout_args[@]+"${print_timeout_args[@]}"} \
     --output-format json \
     </dev/null >"$out_file" 2>"$task_dir/stderr.txt"
@@ -1385,6 +1451,14 @@ cmd_run() {
   # per-run 0700 directory, the nonce and the 0600 task file agy will read.
   local gemini_dir="" gemini_task="" gemini_nonce=""
   if [ "$engine" = "gemini" ]; then
+    # A quota error earlier marked Gemini skipped: no agy call, no run line (a
+    # skip is not a failed audit), the same message every round until then.
+    local skip_epoch
+    if skip_epoch="$(gemini_skip_until)"; then
+      log "run ($mode) engine=gemini skipped until $(clock_of_epoch "$skip_epoch") (quota)"
+      echo "crosscheck --run: gemini skipped until $(clock_of_epoch "$skip_epoch") (quota)" >&2
+      return 1
+    fi
     if ! mkdir -p "$TMP_DIR" 2>/dev/null || ! gemini_dir="$(mktemp -d "$TMP_DIR/gemini.XXXXXX" 2>/dev/null)"; then
       echo "crosscheck --run: could not create a task directory under $TMP_DIR. See $STDERR_LOG_FILE." >&2
       return 1
@@ -1410,25 +1484,32 @@ cmd_run() {
     rc=$?
     run_ended="$(date +%s)"
     # agy prints one JSON object, also on failure; raw stdout is never echoed.
-    local gemini_result gemini_status="" gemini_finished="" gemini_error="" gemini_denied="" gemini_usage="null" gemini_reason=""
+    local gemini_result gemini_status="" gemini_finished="" gemini_error="" gemini_usage="null" gemini_reason=""
     gemini_result="$(jq -c 'select(type == "object")' "$json_file" 2>/dev/null | tail -n 1)"
     if [ -n "$gemini_result" ]; then
       gemini_status="$(jq -r '.status // ""' <<<"$gemini_result" 2>/dev/null)"
       gemini_finished="$(jq -r '.finished_reason // ""' <<<"$gemini_result" 2>/dev/null)"
       gemini_error="$(jq -r '(.error // "") | tostring' <<<"$gemini_result" 2>/dev/null)"
-      gemini_denied="$(jq -r '[.denied_actions[]? | .action? // empty] | unique | join(",")' <<<"$gemini_result" 2>/dev/null)"
       gemini_usage="$(gemini_usage_json "$gemini_result")"
     fi
-    local gemini_body="" gemini_proof="no"
+    local gemini_body="" gemini_proof="no" gemini_timed_out=0 gemini_has_response="false" gemini_timeout_reason gemini_denied_text
+    gemini_denied_text="$(gemini_denied_note "$gemini_result")"
+    [ -z "$gemini_result" ] || gemini_has_response="$(jq -r '(.response // "") | test("\\S")' <<<"$gemini_result" 2>/dev/null)"
+    gemini_timeout_reason="timeout${gemini_error:+: $gemini_error}"
     if [ $rc -eq 124 ] || [ $rc -eq 137 ] || [ "$gemini_finished" = "print_timeout" ]; then
       rc=124
-      gemini_reason="timeout${gemini_error:+: $gemini_error}"
+      gemini_timed_out=1
+    fi
+    # A timeout whose JSON still holds an answer goes through the same read
+    # check below: with proof and a finding it is published as degraded.
+    if [ "$gemini_timed_out" -eq 1 ] && [ "$gemini_has_response" != "true" ]; then
+      gemini_reason="$gemini_timeout_reason"
     elif [ -z "$gemini_result" ]; then
       if [ $rc -ne 0 ]; then gemini_reason="agy exited $rc"; else gemini_reason="no JSON result from agy"; fi
-    elif [ $rc -ne 0 ] || [ "$gemini_status" != "SUCCESS" ]; then
+    elif [ "$gemini_timed_out" -eq 0 ] && { [ $rc -ne 0 ] || [ "$gemini_status" != "SUCCESS" ]; }; then
       gemini_reason="${gemini_error:-agy exited $rc (status ${gemini_status:-none})}"
-    elif [ "$(jq -r '(.response // "") | test("\\S")' <<<"$gemini_result" 2>/dev/null)" != "true" ]; then
-      gemini_reason="empty response${gemini_denied:+ (denied: $gemini_denied)}"
+    elif [ "$gemini_has_response" != "true" ]; then
+      gemini_reason="empty response${gemini_denied_text:+ (denied: $gemini_denied_text)}"
     else
       # Read proof: the first non-blank line of the reply, trimmed and without
       # one surrounding pair of ** or backticks, must be the nonce line. Only
@@ -1448,6 +1529,12 @@ cmd_run() {
       else
         gemini_body="$(jq -r '.body' <<<"$gemini_checked" 2>/dev/null)"
         [[ "$gemini_body" =~ [^[:space:]] ]] || gemini_reason="empty response after read check"
+        # A partial answer is worth publishing only when it already holds a
+        # finding line (severity first, markdown around it tolerated).
+        if [ -z "$gemini_reason" ] && [ "$gemini_timed_out" -eq 1 ] \
+          && ! grep -q -E '^[[:space:]]*[-*#0-9.)[:space:]]*(\*\*)?(CRITICAL|HIGH|MEDIUM|LOW)(\*\*)?(:|[[:space:]]+-[[:space:]])' <<<"$gemini_body"; then
+          gemini_reason="$gemini_timeout_reason (the partial answer has no finding)"
+        fi
       fi
     fi
     if [ -n "$gemini_reason" ]; then
@@ -1457,6 +1544,17 @@ cmd_run() {
       # A model this account cannot use is said once, clearly, instead of agy's wording.
       if gemini_clean="$(model_unavailable_line "$engine_model" "$gemini_reason $gemini_log_line")"; then
         gemini_reason="$gemini_clean"
+        gemini_log_line=""
+      fi
+      # A quota error marks Gemini skipped until agy's own reset time, so the
+      # next rounds do not fail the same way each time. The time comes from the
+      # full error, before the 300-character cap below.
+      if grep -q -E 'RESOURCE_EXHAUSTED|[Qq]uota reached' <<<"$gemini_error $gemini_reason $gemini_log_line"; then
+        local quota_until
+        quota_until=$(( $(date +%s) + $(gemini_quota_wait_seconds "$gemini_error $gemini_reason $gemini_log_line") ))
+        mkdir -p "$STATE_DIR" 2>/dev/null
+        printf '%s\n' "$quota_until" >"$GEMINI_SKIP_FILE" 2>/dev/null
+        gemini_reason="quota reached, gemini skipped until $(clock_of_epoch "$quota_until")"
         gemini_log_line=""
       fi
       gemini_reason="$(printf '%s' "$gemini_reason" | tr '\n\r' '  ' | head -c 300)"
@@ -1477,7 +1575,12 @@ cmd_run() {
     if [ "$gemini_denied_count" -gt 0 ]; then
       gemini_body="$gemini_body"$'\n\n'"$(degraded_caveat "$gemini_denied_count" "")"
       gemini_extra="$(degraded_extra_json "$run_started" "$run_ended" "$gemini_usage" "$scope" "$gemini_denied_count" "")"
-      log "run ($mode) engine=gemini degraded: $gemini_denied_count denied actions"
+      log "run ($mode) engine=gemini degraded: $gemini_denied_count denied actions ($gemini_denied_text)"
+    fi
+    if [ "$gemini_timed_out" -eq 1 ]; then
+      gemini_body="$gemini_body"$'\n\n'"crosscheck: this audit timed out after $(( run_ended - run_started ))s and the answer is partial, findings may be missing."
+      gemini_extra="$(jq -c '. + {status: "degraded", error: "timeout: partial answer"}' <<<"$gemini_extra" 2>/dev/null || printf '%s' "$gemini_extra")"
+      log "run ($mode) engine=gemini degraded: timed out, partial answer published"
     fi
     publish_report "$mode" "$hash" "$artifact_file" "$gemini_body" "gemini" "$round" "$engine_model" "$engine_effort" "$gemini_extra"
     rc=$?
@@ -2336,14 +2439,23 @@ run_selftest() {
 stub_dir="${AGY_STUB_DIR:?}"
 printf '%s\n' "$*" >>"$stub_dir/args.log"
 printf '%s\n' "$@" >"$stub_dir/argv.last"
-prompt_text="" add_dir=""
+prompt_text="" add_dir="" saw_plan="" saw_noslash=""
+: >"$stub_dir/add_dirs.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) prompt_text="${2:-}"; shift 2 ;;
-    --add-dir) add_dir="${2:-}"; shift 2 ;;
+    --add-dir) add_dir="${2:-}"; printf '%s\n' "$add_dir" >>"$stub_dir/add_dirs.log"; shift 2 ;;
+    --mode) [ "${2:-}" = "plan" ] && saw_plan=1; shift 2 ;;
+    --disable-slash-commands) saw_noslash=1; shift ;;
     *) shift ;;
   esac
 done
+# The real agy warns when plan mode is combined with --disable-slash-commands
+# and then runs without plan mode; the selftest must notice that pair.
+if [ -n "$saw_plan" ] && [ -n "$saw_noslash" ]; then
+  echo "warning: --mode plan has no effect while slash command expansion is disabled." >&2
+  : >"$stub_dir/warned"
+fi
 task_path="${prompt_text#Read the file }"
 task_path="${task_path%% and follow*}"
 printf '%s' "$add_dir" >"$stub_dir/add_dir.last"
@@ -2389,6 +2501,17 @@ case "$mode" in
   printtimeout)
     emit_json ERROR "" '{"error":"print timeout reached","finished_reason":"print_timeout"}'
     exit 3 ;;
+  deniedread) emit_json SUCCESS "" '{"denied_actions":[{"action":"read_file","path":"/x/denied.txt"},{"action":"command"}]}' ;;
+  deniednopath) emit_json SUCCESS "" '{"denied_actions":[{"action":"read_file"}]}' ;;
+  quota)
+    echo "error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h9m50s." >&2
+    emit_json ERROR "" '{"finished_reason":"error","error":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h9m50s."}'
+    exit 3 ;;
+  partial_plain) emit_json ERROR "$nonce_line"$'\nHIGH: partial finding' '{"finished_reason":"print_timeout","error":"print timeout after 9m30s with the turn still in progress; the response is partial"}'; exit 3 ;;
+  partial_bold) emit_json ERROR "$nonce_line"$'\n**HIGH**: partial finding' '{"finished_reason":"print_timeout","error":"print timeout after 9m30s with the turn still in progress; the response is partial"}'; exit 3 ;;
+  partial_numbered) emit_json ERROR "$nonce_line"$'\n1. MEDIUM - partial finding' '{"finished_reason":"print_timeout","error":"print timeout after 9m30s with the turn still in progress; the response is partial"}'; exit 3 ;;
+  partial_nofinding) emit_json ERROR "$nonce_line"$'\nStill reading the repo, no findings yet.' '{"finished_reason":"print_timeout","error":"print timeout after 9m30s with the turn still in progress; the response is partial"}'; exit 3 ;;
+  partial_noproof) emit_json ERROR $'HIGH: partial finding without the read check' '{"finished_reason":"print_timeout","error":"print timeout after 9m30s with the turn still in progress; the response is partial"}'; exit 3 ;;
   nonjson) echo "this is not json at all" ;;
   rc1) exit 1 ;;
   rc124) exit 124 ;;
@@ -4044,9 +4167,10 @@ TIMEOUT_K_EOF
   check "gemini argv: --sandbox" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--sandbox ')" "1"
   check "gemini argv: --model and --effort from the config" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--model gemini-4-argon ' | tr -d ' ')/$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--effort high ')" "1/1"
   check "gemini argv: --output-format json" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--output-format json ')" "1"
-  check "gemini argv: --disable-slash-commands" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--disable-slash-commands')" "1"
+  check "gemini argv: no --disable-slash-commands, it cancels --mode plan" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--disable-slash-commands')" "0"
+  check "gemini argv: agy never warned that plan mode has no effect" "$([ -e "$agy_dir/warned" ] && echo warned || echo quiet)" "quiet"
   check "gemini argv: --print-timeout 1170s for the 1200s high budget" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e '--print-timeout 1170s ')" "1"
-  check "gemini argv: --add-dir names the directory of the task file" "$(cat "$agy_dir/add_dir.last" 2>/dev/null)" "$(dirname "$gem_task_path")"
+  check "gemini argv: --add-dir names the directory of the task file" "$(grep -c -x -F -- "$(dirname "$gem_task_path")" "$agy_dir/add_dirs.log" 2>/dev/null)" "1"
   check "gemini argv: no --settings and no permission rules" "$(printf '%s' "$gem_argv_flat" | grep -c -i -e '--settings' -e 'permission')" "0"
   check "gemini argv: never --dangerously-skip-permissions" "$(printf '%s' "$gem_argv_flat" | grep -c -F -e 'dangerously-skip-permissions')" "0"
   check "gemini argv: no plan text and no request text" "$(grep -c -e 'gemplan-secret-marker' -e 'PROPOSED PLAN' -e 'gemrequest' "$agy_dir/argv.last" 2>/dev/null)" "0"
@@ -4267,6 +4391,93 @@ TIMEOUT_K_EOF
   agy_mode error
   GEM_PROMPT="$scope_prompt" gem_run --hash 9e1a0079 --scope delta >/dev/null 2>&1
   check "gemini delta failure: the failed line carries scope delta" "$(gem_last '"\(.status) \(.engine) \(.scope)"')" "failed gemini delta"
+  agy_mode ok
+
+  # 50b. Gemini reliability: readable repos, denied paths, quota skip, partial
+  #      answers on timeout. All with captured agy outputs, never a live agy.
+  #      Readable repos: the git root of the cwd and of each existing path the
+  #      task names is added, never a non-git path and never $HOME itself.
+  if command -v git >/dev/null 2>&1; then
+    local run_absolute repo_a repo_b plain_dir
+    run_absolute="$(cd "$(dirname "$run")" && pwd -P)/$(basename "$run")"
+    repo_a="$tmp_home/repo-a"; repo_b="$tmp_home/repo-b"; plain_dir="$tmp_home/plain-dir"
+    mkdir -p "$repo_a/sub" "$repo_b" "$plain_dir"
+    git init -q "$repo_a" && git init -q "$repo_b" && git init -q "$tmp_home"
+    printf 'x' >"$repo_b/file.txt"; printf 'x' >"$plain_dir/note.txt"
+    repo_a="$(cd "$repo_a" && pwd -P)"; repo_b="$(cd "$repo_b" && pwd -P)"
+    local dirs_prompt="$tmp_home/dirs-prompt.md" home_physical
+    home_physical="$(cd "$tmp_home" && pwd -P)"
+    printf 'ROUND: 1\n\nORIGINAL REQUEST:\nlook at %s and %s and /etc/hosts and %s\n\nPROPOSED PLAN:\nplan\n' \
+      "$repo_b/file.txt" "$plain_dir/note.txt" "$tmp_home/gem-prompt.md" >"$dirs_prompt"
+    agy_mode ok
+    ( cd "$repo_a/sub" && run="$run_absolute" GEM_PROMPT="$dirs_prompt" gem_run --hash 9e1a0101 >/dev/null 2>&1 )
+    check "gemini add-dir: the git root of the cwd is added" "$(grep -c -x -F -- "$repo_a" "$agy_dir/add_dirs.log")" "1"
+    check "gemini add-dir: a named path outside the root (another repo) is never added" "$(grep -c -F -e "$repo_b" -e 'repo-b' "$agy_dir/add_dirs.log")" "0"
+    check "gemini add-dir: the cwd itself is not added when it is not the root" "$(grep -c -x -F -- "$repo_a/sub" "$agy_dir/add_dirs.log")" "0"
+    check "gemini add-dir: a non-git directory and /etc are never added" "$(grep -c -e "plain-dir" -e '^/etc' "$agy_dir/add_dirs.log")" "0"
+    check "gemini add-dir: only the task dir and the cwd root are added" "$(wc -l <"$agy_dir/add_dirs.log" | tr -d ' ')" "2"
+    check "gemini add-dir: still read-only flags" "$(tr '\n' ' ' <"$agy_dir/argv.last" | grep -c -F -e '--mode plan --sandbox')" "1"
+    mkdir -p "$tmp_home/below-home"
+    ( cd "$tmp_home/below-home" && run="$run_absolute" GEM_PROMPT="$dirs_prompt" gem_run --hash 9e1a0108 >/dev/null 2>&1 )
+    check "gemini add-dir: HOME is never added even when it is a git repo" "$(grep -c -x -F -e "$home_physical" -e "$tmp_home" "$agy_dir/add_dirs.log")" "0"
+    ( cd "$repo_a" && run="$run_absolute" GEM_PROMPT="$dirs_prompt" gem_run --hash 9e1a0109 >/dev/null 2>&1 )
+    check "gemini add-dir: a cwd that is already the root adds only the task dir" "$(wc -l <"$agy_dir/add_dirs.log" | tr -d ' ')" "1"
+    rm -rf "$tmp_home/.git"
+  else
+    echo "  skip  gemini add-dir checks (git not found)"
+  fi
+
+  #     Denied reads name their paths in the failure reason and the log.
+  agy_mode deniedread
+  gem_run --hash 9e1a0102 >/dev/null 2>"$gem_err"
+  check "gemini denied read: the reason names the actions and the path" "$(grep -c -F 'denied: command,read_file; paths: /x/denied.txt' "$gem_err")" "1"
+  check "gemini denied read: the log names the path" "$(grep -c -F '/x/denied.txt' "$gem_root/logs/crosscheck.log")" "1"
+  agy_mode deniednopath
+  gem_run --hash 9e1a0103 >/dev/null 2>"$gem_err"
+  check "gemini denied read: no path from agy says so" "$(grep -c -F 'denied: read_file; agy gave no path' "$gem_err")" "1"
+
+  #     Quota: one 429 marks Gemini skipped until HH:MM, later runs do not call agy.
+  local gem_skip_file="$gem_root/state/gemini-skip-until" gem_runs_before gem_now
+  rm -f "$gem_skip_file"
+  agy_mode quota
+  gem_now="$(date +%s)"
+  gem_run --hash 9e1a0104 >/dev/null 2>"$gem_err"
+  gem_rc=$?
+  check "gemini quota: the first run fails and says skipped until" "$gem_rc/$(grep -c 'skipped until [0-9][0-9]:[0-9][0-9]' "$gem_err")" "1/1"
+  check "gemini quota: the skip file holds now plus the reset time" "$(awk -v now="$gem_now" '{d = $1 - now; print (d >= 4180 && d <= 4210) ? "ok" : "bad:" d}' "$gem_skip_file" 2>/dev/null)" "ok"
+  agy_mode ok
+  gem_runs_before="$(jq -c 'select(.type == "run")' "$gem_root/metrics.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+  gem_run --hash 9e1a0105 >/dev/null 2>"$gem_err"
+  gem_rc=$?
+  check "gemini quota: the next run exits 1 and says skipped until" "$gem_rc/$(grep -c 'skipped until [0-9][0-9]:[0-9][0-9]' "$gem_err")" "1/1"
+  check "gemini quota: the next run never calls agy" "$(wc -c <"$agy_dir/args.log" | tr -d ' ')" "0"
+  check "gemini quota: a skip leaves no run line" "$(jq -c 'select(.type == "run")' "$gem_root/metrics.jsonl" 2>/dev/null | wc -l | tr -d ' ')" "$gem_runs_before"
+  printf '%s' "$(( $(date +%s) - 5 ))" >"$gem_skip_file"
+  gem_run --hash 9e1a0106 >/dev/null 2>&1
+  check "gemini quota: after the time passes agy is called again" "$(gem_state 9e1a0106)" "reviewed"
+  printf 'garbage' >"$gem_skip_file"
+  gem_run --hash 9e1a0107 >/dev/null 2>&1
+  check "gemini quota: a malformed skip file is ignored" "$(gem_state 9e1a0107)" "reviewed"
+  rm -f "$gem_skip_file"
+
+  #     Timeout with a partial answer that has findings is published degraded.
+  local partial_mode partial_hash=9e1a0110
+  for partial_mode in partial_plain partial_bold partial_numbered; do
+    agy_mode "$partial_mode"
+    gem_out="$(gem_run --hash "$partial_hash" 2>"$gem_err")"
+    gem_rc=$?
+    check "gemini partial ($partial_mode): published degraded with the timeout error" "$gem_rc/$(gem_last '"\(.status)/\(.error)"' | cut -c1-17)" "0/degraded/timeout:"
+    check "gemini partial ($partial_mode): the report ends with the timeout caveat" "$(printf '%s' "$gem_out" | grep -c -E '^crosscheck: this audit timed out after [0-9]+s and the answer is partial')" "1"
+    check "gemini partial ($partial_mode): the hash is reviewed" "$(gem_state "$partial_hash")" "reviewed"
+    partial_hash="$(printf '9e1a01%02d' $(( 10#${partial_hash#9e1a01} + 1 )))"
+  done
+  for partial_mode in partial_nofinding partial_noproof printtimeout; do
+    agy_mode "$partial_mode"
+    partial_hash="$(printf '9e1a01%02d' $(( 10#${partial_hash#9e1a01} + 1 )))"
+    gem_run --hash "$partial_hash" >/dev/null 2>&1
+    gem_rc=$?
+    check "gemini partial ($partial_mode): without a proven finding it stays a timeout failure" "$gem_rc/$(gem_last .status)/$(gem_state "$partial_hash")" "1/timeout/none"
+  done
   agy_mode ok
 
   # 51. Parallel: claude, codex and gemini run concurrently on one hash, one
@@ -4642,7 +4853,8 @@ MM_CLAUDE_EOF
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.12.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.12.0"
+  check "the CHANGELOG top entry is 3.13.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.13.0"
+  check "the README badge says 3.13.0" "$(grep -c -F 'badge/version-3.13.0-' "$readme_md" 2>/dev/null)" "1"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.

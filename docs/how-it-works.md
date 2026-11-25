@@ -80,8 +80,15 @@ find out; you're never blocked indefinitely.
   plugin) and `--tools Read,Grep,Glob` (no Bash, Edit or Write), a fresh
   context and your normal Claude login. It is read-only by tool restriction,
   not by an OS sandbox.
-- **Gemini** runs the Antigravity CLI read-only (`--mode plan --sandbox
-  --disable-slash-commands`). `agy` (1.5.6) has no flag to turn off MCP
+- **Gemini** runs the Antigravity CLI read-only (`--mode plan --sandbox`;
+  `--disable-slash-commands` is not used because `agy` then ignores
+  `--mode plan`). `agy` only reads the directory you launched from and its own
+  task directory, so when you launch from a subdirectory of a git repo the
+  repo root is added as well (never `/`, never your home directory, and paths
+  a task names outside that root stay denied, with the path in the log). A
+  quota error (429) marks Gemini skipped until the time `agy` gives, and later
+  rounds skip it without calling `agy`. A run that times out with a partial
+  answer that already has findings is published as degraded. `agy` (1.5.6) has no flag to turn off MCP
   servers, extensions, hooks or workspace rule files, so those load as they
   would in your own `agy` session. `agy` has no stdin mode for the prompt, so
   the task goes through a `0600` file the run deletes afterwards, and the task

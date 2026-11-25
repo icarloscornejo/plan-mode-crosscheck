@@ -1,7 +1,7 @@
 {
   "name": "plan-mode-crosscheck",
   "displayName": "Plan Mode Crosscheck",
-  "version": "3.12.0",
+  "version": "3.13.0",
   "description": "Get an independent second opinion on a finished Plan Mode plan before you see it, or on demand via /crosscheck: from Codex CLI (default), a Claude model (any alias or model ID), Gemini through the Antigravity CLI (agy), or several in parallel. Pick with /crosscheck-setup. Each CLI is only required if an engine uses it.",
   "author": {
     "name": "Carlos Cornejo"

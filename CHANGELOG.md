@@ -2,6 +2,50 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.13.0
+
+Gemini audits that were failing for avoidable reasons now work, or skip cleanly.
+
+- **Plan mode is really on.** `agy` printed `--mode plan has no effect while
+  slash command expansion is disabled` because the run passed `--mode plan`
+  together with `--disable-slash-commands`, so only `--sandbox` was in force.
+  The run now passes `--mode plan --sandbox` and no `--disable-slash-commands`.
+  The only prompt `agy` gets from the plugin is a fixed sentence starting with
+  "Read the file", never `/...`, so no slash command or skill can be triggered
+  from task text. What `agy --help` says: `--disable-slash-commands` disables
+  "slash command and skill expansion in print mode", `--mode` takes
+  accept-edits, auto or plan. The sandbox is the only write guard proven live;
+  plan mode taking effect was not re-checked live (Gemini quota was exhausted
+  while this was built), only that the cancelling flag pair is gone.
+- **`denied: read_file`, real cause.** The request files were not the cause
+  (the request is inlined into the task file inside the task directory).
+  `agy`'s log shows its workspace is only the directory you launched from plus
+  the task directory, and print mode soft-denies every read outside them. A
+  run started from a subdirectory of a repo (a ticket folder) could not read
+  the rest of the repo. The git root of that directory is now added with
+  `--add-dir` (never `/`, never your home directory, never a repo that holds
+  the task directory). A path a task names outside that root stays denied on
+  purpose, since `agy` sends what it reads to Google. The second logged denial
+  started in a directory that is already a repo root, so its target is unknown.
+- **Denied paths in the log.** A failed or degraded Gemini run now says
+  `denied: <actions>; paths: /a,/b`, or `agy gave no path`. Paths are any
+  absolute path string inside a denied entry; whether `agy` fills one in could
+  not be checked live.
+- **Quota.** A 429 `RESOURCE_EXHAUSTED` writes `gemini-skip-until` in the state
+  directory from `agy`'s own "Resets in 1h9m50s" (30 minutes when there is
+  none). Until then `--run --engine gemini` exits 1 with `gemini skipped until
+  HH:MM (quota)`, without calling `agy` and without a run line. Quota is per
+  account, so another instance with its own state directory takes one 429
+  before it skips too.
+- **Partial answer on timeout.** When `agy` times out but its JSON already has a
+  reply that passes the read check and has at least one finding line (markdown
+  around the severity is fine), it is published as `degraded` with a closing
+  line `crosscheck: this audit timed out after Ns and the answer is partial`.
+  Otherwise it stays a timeout failure. Not verified live: that `agy` really
+  includes the partial reply in its timeout JSON.
+- The selftest covers all of it with captured `agy` outputs and fails if the
+  stub `agy` prints the plan-mode warning.
+
 ## 3.12.0
 
 An audit whose engine could not read the repo is no longer logged as a success.

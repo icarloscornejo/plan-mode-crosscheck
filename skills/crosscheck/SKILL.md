@@ -229,7 +229,8 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
       report (small reports inline directly) or a note pointing at an
       artifact file (large reports do not inline, `Read` that file instead).
       A report that ends with a line starting `crosscheck: ` and naming failed
-      or denied tool calls is a degraded audit: say so at the top of that
+      or denied tool calls, or saying the audit timed out and the answer is
+      partial, is a degraded audit: say so at the top of that
       engine's findings, with the line's numbers.
       Follow "Relaying a round's findings" below,
       then "Recommending: one more round, or show the plan" to decide what
@@ -530,7 +531,8 @@ first.
    (typically within "Edge cases and risks"). With several engines, give one answer
    with that same structure, merging the reports and marking where the
    engines disagreed. A report ending with a `crosscheck: ` line about failed
-   or denied tool calls is degraded: say so with its numbers.
+   or denied tool calls, or about a timeout with a partial answer, is
+   degraded: say so with its numbers.
 
    **Exception, a plan audit round:** when the request carries a `ROUND:`
    line and `PRIOR ROUNDS` (the shape Doer sends) and the reports carry
