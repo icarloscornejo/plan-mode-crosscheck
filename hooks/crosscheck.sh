@@ -294,6 +294,12 @@ Original request and proposed plan follow:
 # reads them as instructions. The auditor labels Kind, never the orchestrator.
 kind_instructions="If you report findings with a severity, add to each one a line 'Kind: change' when the defect is in what the plan delivers (code, stage text, logic, tests of that behavior, data contract), or 'Kind: process' when it is only about how the work is run, measured, approved or worded. A stale, contradictory or wrong DESCRIPTION of what will be built (design steps, test specs, data contract, expected values) is 'change', wherever it sits in the plan. When in doubt, change."
 
+# Task of `--mode check` (the real call behind `--config check`): as small as
+# an audit call can be, still through the audit's own flags and sandbox.
+check_instructions="This is a connectivity check, not a review. Reply with the single word OK and nothing else, except that when you are told to begin your reply with a READ-CHECK line you must still do that first. Do not read any other file and do not run any command.
+
+The request:"
+
 delta_instructions="SCOPED ROUND. Earlier rounds (see PRIOR ROUNDS) already swept this plan in full, and the findings of the last round were about process. For THIS round the 'only review' rule applies to: (a) every defect in the text listed under CHANGES SINCE LAST ROUND; (b) unchanged text that those changes contradict or make stale; (c) any defect in what the request delivers, anywhere in the plan or in the code it changes, INCLUDING unchanged text. A stale, contradictory or wrong description of what will be built (design steps, test specs, data contract, expected values) counts under (c) even when the changes did not cause it. The only thing excluded is PROCESS topics (how the work is run, measured, approved or worded) in unchanged text: do not sweep for those. When in doubt, report. Everything else in these instructions (evidence, severity, Kind, no padding, Coverage line) applies unchanged."
 
 # Resolves which timeout wrapper to use: prefers GNU `timeout`, falls back to
@@ -336,8 +342,10 @@ run_codex() {
   # whole builtin exit 2 and write nothing, silently, because of the
   # 2>/dev/null right after it.
   printf -- '--- %s run ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$STDERR_LOG_FILE" 2>/dev/null
+  local -a model_args=()
+  [ "$CROSSCHECK_MODEL" = "$MODEL_DEFAULT" ] || model_args=(-m "$CROSSCHECK_MODEL")
   printf '%s' "$task" | "$timeout_bin" "$budget" codex exec --json \
-    -m "$CROSSCHECK_MODEL" \
+    ${model_args[@]+"${model_args[@]}"} \
     -c "model_reasoning_effort=\"$CROSSCHECK_EFFORT\"" \
     -s read-only \
     --skip-git-repo-check \
@@ -436,9 +444,11 @@ run_claude() {
   local instructions="$1" body="$2" budget="$3" out_file="$4" timeout_bin="$5" model="$6" effort="$7" task rc
   task="$(assemble_task "$instructions" "$body")"
   printf -- '--- %s run (claude) ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$STDERR_LOG_FILE" 2>/dev/null
+  local -a model_args=()
+  [ "$model" = "$MODEL_DEFAULT" ] || model_args=(--model "$model")
   printf '%s' "$task" | "$timeout_bin" "$budget" claude -p \
     --safe-mode \
-    --model "$model" \
+    ${model_args[@]+"${model_args[@]}"} \
     --effort "$effort" \
     --output-format json \
     --no-session-persistence \
@@ -495,9 +505,11 @@ run_gemini() {
     [ "$print_timeout" -lt $(( 10#$budget / 2 )) ] && print_timeout=$(( 10#$budget / 2 ))
     print_timeout_args=(--print-timeout "${print_timeout}s")
   fi
+  local -a model_args=()
+  [ "$model" = "$MODEL_DEFAULT" ] || model_args=(--model "$model")
   "$timeout_bin" -k 30 "$budget" agy \
     -p "Read the file $task_path and follow the instructions in it exactly. Reply with your final answer only." \
-    --model "$model" \
+    ${model_args[@]+"${model_args[@]}"} \
     --effort "$effort" \
     --mode plan \
     --sandbox \
@@ -646,7 +658,7 @@ record_user_answers() {
 # "codex_effort": "low"|"medium"|"high"|"xhigh",
 # "claude_effort"|"gemini_effort": "low"|"medium"|"high"|"xhigh"|"max"} (the
 # efforts and the gemini fields are optional on read: a config saved before
-# they existed resolves to "medium", and to gemini-4-argon / "high").
+# they existed resolves to "medium", and to "default" / "high").
 # Models are opaque IDs, never an enum: new ones ship all the time and
 # `claude --model` / `codex -m` are the ones that know which exist. The claude
 # engine runs as a nested `claude -p` (see run_claude), not through the Agent
@@ -657,7 +669,11 @@ CONFIG_CLAUDE_EFFORTS="low medium high xhigh max"
 CONFIG_GEMINI_EFFORTS="low medium high xhigh max"
 # Canonical order everywhere engines are listed, written or launched.
 ENGINE_ORDER="claude codex gemini"
-GEMINI_DEFAULT_MODEL="gemini-4-argon"
+# `default` is a reserved model value, not an id: the engine is started WITHOUT
+# its model flag and uses whatever its own CLI picks. Built-in fallbacks use it
+# so no hand-kept id can go stale.
+MODEL_DEFAULT="default"
+GEMINI_DEFAULT_MODEL="$MODEL_DEFAULT"
 GEMINI_DEFAULT_EFFORT="high"
 
 # Canonical engines of a config/metrics engine value, space separated: one
@@ -730,13 +746,13 @@ valid_model_id() {
 # Resolves the effective config: config.json overlaid by the CROSSCHECK_MODEL
 # and CROSSCHECK_EFFORT env vars (matching the existing precedence those
 # variables already had before config.json existed), defaulting to today's only behavior
-# (codex/gpt-6-astra/fable) when config.json doesn't exist yet. Prints one
+# (codex/default/fable) when config.json doesn't exist yet. Prints one
 # JSON object on stdout. Returns nonzero, printing nothing, if config.json
 # exists but is corrupt or holds an invalid value: never falls back silently,
 # so a broken config is always visible rather than quietly resolving to some
 # default the user never chose.
 resolve_config() {
-  local engine="codex" codex_model="gpt-6-astra" claude_model="fable" codex_effort="medium"
+  local engine="codex" codex_model="$MODEL_DEFAULT" claude_model="fable" codex_effort="medium"
   local codex_effort_source="default" claude_effort="medium" claude_effort_source="default"
   local gemini_model="$GEMINI_DEFAULT_MODEL" gemini_effort="$GEMINI_DEFAULT_EFFORT" gemini_effort_source="default"
   if [ -s "$CONFIG_FILE" ]; then
@@ -800,6 +816,224 @@ resolve_config() {
       codex_effort_source:$codex_effort_source, gemini_effort_source:$gemini_effort_source}'
 }
 
+# --- Model ids: listing, concrete model, audit-time message ---
+
+# An engine's own error text that means "this account cannot use this model".
+# The wording comes from real recorded failures: Codex (`model_not_found`, "not
+# supported when using Codex with a ChatGPT account"), Claude Code ("issue with
+# the selected model"), agy ("invalid model selection"). Anything else (usage
+# limit, auth, timeout) is NOT a model problem and keeps its raw text.
+# $1 = model as configured, $2 = the engine's error text. Prints the one-line
+# message and returns 0 on a match, prints nothing and returns 1 otherwise.
+model_unavailable_line() {
+  printf '%s' "$2" | grep -q -i -E 'model_not_found|not supported when using|issue with the selected model|invalid model selection|unrecognized_model' || return 1
+  printf 'model %s not available for this account, run /crosscheck-setup' "$1"
+}
+
+# Listing parsers read the engine's own output on stdin and print one valid id
+# per line, newest first, no duplicates. An id that fails valid_model_id is
+# dropped, never printed: the output is what setup offers and later passes on.
+keep_valid_model_ids() {
+  local model_id
+  while IFS= read -r model_id; do
+    valid_model_id "$model_id" && printf '%s\n' "$model_id"
+  done | awk '!seen[$0]++'
+}
+
+# `agy models`: a progress line, then `id<TAB>name` rows. The ids carry an
+# effort suffix, but the plugin stores the base id and passes --effort apart.
+parse_models_agy() {
+  awk -F'\t' 'NF >= 2 { print $1 }' | sed -E 's/-(low|medium|high|xhigh|max)$//' | keep_valid_model_ids
+}
+
+# `codex debug models`: JSON catalog. Hidden entries are internal, `priority` 1
+# is the newest. The catalog is advisory: it lists models an account may still
+# reject, which is why setup runs a real call before saving.
+parse_models_codex() {
+  jq -r '[.models[]? | select(.visibility == "list")] | sort_by(.priority // 9999) | .[] | .slug // empty' 2>/dev/null | keep_valid_model_ids
+}
+
+# --- `--config models <engine>`: what the engine's own CLI says it can run ---
+cmd_models() {
+  local engine="${1:-}" timeout_bin listing
+  case "$engine" in
+    claude)
+      # Claude Code has no listing command, so the aliases it resolves itself.
+      echo "crosscheck --config models: Claude Code has no model listing, showing its aliases." >&2
+      printf '%s\n' fable opus sonnet haiku
+      return 0 ;;
+    codex|gemini) : ;;
+    *) echo "crosscheck --config models: unknown engine '$engine' (want claude|codex|gemini)" >&2; return 2 ;;
+  esac
+  local binary="$engine"
+  [ "$engine" = "gemini" ] && binary="agy"
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --config models: jq not found on PATH" >&2; return 1; }
+  command -v "$binary" >/dev/null 2>&1 || { echo "crosscheck --config models: $binary not found on PATH, no listing for $engine" >&2; return 1; }
+  timeout_bin="$(resolve_timeout_bin)" || { echo "crosscheck --config models: neither 'timeout' nor 'gtimeout' found on PATH" >&2; return 1; }
+  if [ "$engine" = "codex" ]; then
+    listing="$("$timeout_bin" 60 codex debug models 2>/dev/null </dev/null | parse_models_codex)"
+  else
+    listing="$("$timeout_bin" 60 agy models 2>/dev/null </dev/null | parse_models_agy)"
+  fi
+  [ -n "$listing" ] || { echo "crosscheck --config models: $binary gave no model list (signed out, offline or an unknown output shape)" >&2; return 1; }
+  printf '%s\n' "$listing"
+}
+
+# The model an engine actually ran, for the report header (best effort, one
+# measured source per engine). Always validated: it comes from CLI output.
+# $1 = claude result JSON ($2 unused for it). Prints the id or nothing.
+claude_ran_model() {
+  local ran
+  ran="$(printf '%s' "$1" | jq -r '(.modelUsage // {}) | to_entries | max_by(.value.outputTokens // 0) | .key // empty' 2>/dev/null)"
+  valid_model_id "$ran" && printf '%s' "$ran"
+}
+
+# Codex writes its own session file per thread, named after the thread id and
+# holding the model it used. Read-only lookup; the id must be plain before it
+# goes into a glob. $1 = path to the raw `--json` stream.
+codex_ran_model() {
+  local thread sessions_root file ran
+  thread="$(jq -r 'select(.type == "thread.started") | .thread_id // empty' "$1" 2>/dev/null | head -n 1)"
+  [[ "$thread" =~ ^[A-Za-z0-9-]+$ ]] || return 0
+  sessions_root="${CODEX_HOME:-$HOME/.codex}/sessions"
+  for file in "$sessions_root"/*/*/*/rollout-*-"$thread".jsonl; do
+    [ -r "$file" ] || continue
+    ran="$(grep -o -m 1 '"model":"[^"]*"' "$file" 2>/dev/null | head -n 1 | sed -E 's/^"model":"(.*)"$/\1/')"
+    valid_model_id "$ran" && printf '%s' "$ran"
+    return 0
+  done
+}
+
+# Sets RUN_MODEL_LINE (printed above the report) and RUN_MODEL_RAN. Only said
+# when it adds something: the concrete model differs from what was saved, or
+# the saved value was `default` and nothing could say what ran.
+# $1 = engine, $2 = configured model, $3 = concrete model (may be empty).
+set_model_line() {
+  RUN_MODEL_LINE="" RUN_MODEL_RAN="$3"
+  if [ -n "$3" ] && [ "$3" != "$2" ]; then
+    RUN_MODEL_LINE="crosscheck-model: $1 ran $3 (configured $2)"
+  elif [ -z "$3" ] && [ "$2" = "$MODEL_DEFAULT" ]; then
+    RUN_MODEL_LINE="crosscheck-model: $1 ran unknown (configured $2)"
+  fi
+}
+RUN_MODEL_LINE="" RUN_MODEL_RAN=""
+
+# --- `--config check`: one tiny real call per engine, through `--run` ---
+# Candidate mode (--engine/--model[/--effort]) never reads the saved config, so
+# a corrupt one cannot block the setup that repairs it. Saved mode (no flags)
+# checks every saved engine with its saved model and effort. The throwaway
+# state dir keeps the call out of the real metrics, reports and logs; engines
+# run in parallel and a cancelled check kills their whole process tree (GNU
+# timeout moves its child into a group of its own, so a group kill misses it).
+cmd_check() {
+  local candidate_engine="" candidate_model="" candidate_effort=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --engine) candidate_engine="${2:-}"; shift 2 ;;
+      --model) candidate_model="${2:-}"; shift 2 ;;
+      --effort) candidate_effort="${2:-}"; shift 2 ;;
+      *) echo "crosscheck --config check: unknown flag '$1'" >&2; return 2 ;;
+    esac
+  done
+  local budget="${CROSSCHECK_CHECK_TIMEOUT:-300}"
+  [[ "$budget" =~ ^[1-9][0-9]*$ ]] || { echo "crosscheck --config check: CROSSCHECK_CHECK_TIMEOUT must be a positive integer" >&2; return 2; }
+  command -v jq >/dev/null 2>&1 || { echo "crosscheck --config check: jq not found on PATH" >&2; return 1; }
+
+  local -a engines=()
+  local claude_model="fable" codex_model="$MODEL_DEFAULT" gemini_model="$GEMINI_DEFAULT_MODEL"
+  local claude_effort="medium" codex_effort="medium" gemini_effort="$GEMINI_DEFAULT_EFFORT"
+  if [ -n "$candidate_engine" ] || [ -n "$candidate_model" ] || [ -n "$candidate_effort" ]; then
+    case "$candidate_engine" in
+      claude|codex|gemini) : ;;
+      *) echo "crosscheck --config check: --engine must be claude, codex or gemini" >&2; return 2 ;;
+    esac
+    valid_model_id "$candidate_model" || { echo "crosscheck --config check: --model is invalid (empty, starts with '-', or contains whitespace or shell metacharacters)" >&2; return 2; }
+    case "$candidate_engine" in
+      claude) [ -z "$candidate_effort" ] || valid_claude_effort "$candidate_effort" || { echo "crosscheck --config check: --effort must be one of: $CONFIG_CLAUDE_EFFORTS" >&2; return 2; }
+              claude_model="$candidate_model"; claude_effort="${candidate_effort:-$claude_effort}" ;;
+      codex)  [ -z "$candidate_effort" ] || valid_effort "$candidate_effort" || { echo "crosscheck --config check: --effort must be one of: $CONFIG_EFFORTS" >&2; return 2; }
+              codex_model="$candidate_model"; codex_effort="${candidate_effort:-$codex_effort}" ;;
+      gemini) [ -z "$candidate_effort" ] || valid_gemini_effort "$candidate_effort" || { echo "crosscheck --config check: --effort must be one of: $CONFIG_GEMINI_EFFORTS" >&2; return 2; }
+              gemini_model="$candidate_model"; gemini_effort="${candidate_effort:-$gemini_effort}" ;;
+    esac
+    engines=("$candidate_engine")
+  else
+    local resolved engine_name
+    resolved="$(resolve_config)" || { echo "config corrupt, run /crosscheck-setup"; return 1; }
+    while IFS= read -r engine_name; do engines+=("$engine_name"); done < <(printf '%s' "$resolved" | jq -r '.engines[]')
+    claude_model="$(printf '%s' "$resolved" | jq -r '.claude_model')"; claude_effort="$(printf '%s' "$resolved" | jq -r '.claude_effort')"
+    codex_model="$(printf '%s' "$resolved" | jq -r '.codex_model')"; codex_effort="$(printf '%s' "$resolved" | jq -r '.codex_effort')"
+    gemini_model="$(printf '%s' "$resolved" | jq -r '.gemini_model')"; gemini_effort="$(printf '%s' "$resolved" | jq -r '.gemini_effort')"
+  fi
+
+  # Absolute path before any cd: a relative $0 (./hooks/crosscheck.sh) must still resolve.
+  local self
+  self="$(cd "$(dirname -- "$0")" && pwd)/$(basename -- "$0")"
+  local check_dir
+  check_dir="$(mktemp -d "${TMPDIR:-/tmp}/crosscheck-check.XXXXXX")" || { echo "crosscheck --config check: could not create a temporary directory" >&2; return 1; }
+  local -a check_pids=()
+  check_kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do check_kill_tree "$child"; done
+    kill -TERM "$1" 2>/dev/null
+  }
+  check_cleanup() {
+    local pid
+    for pid in ${check_pids[@]+"${check_pids[@]}"}; do check_kill_tree "$pid"; done
+    wait 2>/dev/null
+    rm -rf "$check_dir"
+  }
+  trap 'check_cleanup; exit 143' TERM INT
+  trap 'check_cleanup' EXIT
+
+  jq -n --arg engine "$(IFS=,; printf '%s' "${engines[*]}")" --arg cm "$claude_model" --arg xm "$codex_model" --arg gm "$gemini_model" \
+    --arg ce "$claude_effort" --arg xe "$codex_effort" --arg ge "$gemini_effort" \
+    '{engine:$engine, claude_model:$cm, codex_model:$xm, gemini_model:$gm, claude_effort:$ce, codex_effort:$xe, gemini_effort:$ge}' >"$check_dir/config.json"
+  printf 'ROUND: 1\n\nConnectivity check.\n' >"$check_dir/prompt.md"
+
+  local engine_name
+  for engine_name in "${engines[@]}"; do
+    (
+      cd "$check_dir" || exit 1
+      env -u CROSSCHECK_MODEL -u CROSSCHECK_EFFORT CROSSCHECK_STATE_DIR="$check_dir" CROSSCHECK_TIMEOUT="$budget" \
+        "$self" --run --mode check --engine "$engine_name" --prompt-file "$check_dir/prompt.md" \
+        >"$check_dir/$engine_name.out" 2>"$check_dir/$engine_name.err" </dev/null
+    ) &
+    check_pids+=("$!")
+  done
+
+  local index=0 worst=0 pid run_line status model reason ran first_line
+  for engine_name in "${engines[@]}"; do
+    pid="${check_pids[$index]}"
+    index=$((index + 1))
+    wait "$pid"
+    case "$engine_name" in claude) model="$claude_model" ;; codex) model="$codex_model" ;; *) model="$gemini_model" ;; esac
+    run_line="$(jq -c --arg e "$engine_name" 'select(.type == "run" and .engine == $e)' "$check_dir/metrics.jsonl" 2>/dev/null | tail -n 1)"
+    status="$(printf '%s' "$run_line" | jq -r '.status // empty' 2>/dev/null)"
+    if [ "$status" = "success" ]; then
+      first_line="$(head -n 1 "$check_dir/$engine_name.out" 2>/dev/null)"
+      ran=""
+      if [[ "$first_line" =~ ^crosscheck-model:\ [a-z]+\ ran\ ([^\ ]+)\ \( ]] && [ "${BASH_REMATCH[1]}" != "unknown" ]; then
+        ran=" (ran ${BASH_REMATCH[1]})"
+      fi
+      printf '%s: ok %s%s\n' "$engine_name" "$model" "$ran"
+    elif [ "$status" = "timeout" ]; then
+      printf '%s: TIMEOUT %s: could not confirm within %ss\n' "$engine_name" "$model" "$budget"
+      worst=1
+    else
+      reason="$(printf '%s' "$run_line" | jq -r '.error // empty' 2>/dev/null)"
+      # A setup failure (CLI missing, no timeout binary) leaves no run line: its
+      # stderr line is the reason, without the throwaway path.
+      [ -n "$reason" ] || reason="$(head -n 1 "$check_dir/$engine_name.err" 2>/dev/null | sed "s#$check_dir#<check>#g")"
+      printf '%s: FAIL %s: %s\n' "$engine_name" "$model" "$(printf '%s' "${reason:-no answer}" | tr '\n\r' '  ' | head -c 300)"
+      worst=1
+    fi
+  done
+  trap - TERM INT EXIT
+  check_cleanup
+  return "$worst"
+}
+
 # --- `--config get|set`: read or persist the engine/model choice ---
 cmd_config() {
   local sub="${1:-}"
@@ -858,8 +1092,10 @@ cmd_config() {
       log "config set engine=$engine claude_model=$claude_model codex_model=$codex_model gemini_model=$gemini_model claude_effort=$claude_effort codex_effort=$codex_effort gemini_effort=$gemini_effort"
       resolve_config
       ;;
+    models) cmd_models "$@" ;;
+    check) cmd_check "$@" ;;
     *)
-      echo "crosscheck --config: unknown subcommand '$sub' (want get|set)" >&2
+      echo "crosscheck --config: unknown subcommand '$sub' (want get|set|models|check)" >&2
       return 2
       ;;
   esac
@@ -902,6 +1138,7 @@ publish_report() {
   local mode="$1" hash="$2" artifact_file="$3" body="$4" engine="$5"
   local round="${6:-}" model="${7:-}" effort="${8:-}" extra="${9:-}"
   [ -n "$extra" ] || extra="{}"
+  [ -z "$RUN_MODEL_RAN" ] || extra="$(jq -c --arg m "$RUN_MODEL_RAN" '. + {model_ran: $m}' <<<"$extra" 2>/dev/null || printf '%s' "$extra")"
 
   if ! artifact_file="$(confine_to_state_root "$artifact_file")"; then
     log "publish ($mode) engine=$engine refused to publish: --out no longer resolves under $STATE_ROOT"
@@ -936,6 +1173,7 @@ publish_report() {
     '{type:"run", ts:$ts, mode:$mode, engine:$engine, model:$model, effort:$effort,
       round:$round, hash:(if $hash == "" then null else $hash end), repo:$repo} + $extra' 2>/dev/null)"
 
+  [ -z "$RUN_MODEL_LINE" ] || printf '%s\n' "$RUN_MODEL_LINE"
   local body_bytes
   body_bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if [ "$body_bytes" -le "$STDOUT_INLINE_MAX_BYTES" ]; then
@@ -989,11 +1227,13 @@ cmd_run() {
   case "$mode" in
     research) instructions="$research_instructions"; marker="The request to research:" ;;
     plan-review) instructions="$plan_review_instructions"; marker="Original request and proposed plan follow:" ;;
-    *) echo "crosscheck --run: unknown --mode '$mode' (want research|plan-review)" >&2; return 2 ;;
+    check) instructions="$check_instructions"; marker="The request:" ;;
+    *) echo "crosscheck --run: unknown --mode '$mode' (want research|plan-review|check)" >&2; return 2 ;;
   esac
   # Everything inserted goes above the marker sentence: below it the auditor
   # treats text as data. `%` cuts at the last marker, the one closing the template.
   local instructions_head inserted="$kind_instructions"$'\n\n'
+  [ "$mode" = "check" ] && inserted=""
   [ "$scope" = "delta" ] && inserted="$inserted$delta_instructions"$'\n\n'
   [ "$engine" = "gemini" ] && inserted="$inserted$gemini_read_check_instructions"$'\n\n'"$gemini_no_shell_instructions"$'\n\n'
   instructions_head="${instructions%"$marker"*}"
@@ -1160,16 +1400,23 @@ cmd_run() {
       fi
     fi
     if [ -n "$gemini_reason" ]; then
+      # One capped line of agy's own error, never its whole stderr (it can echo task text).
+      local gemini_log_line gemini_clean
+      gemini_log_line="$(grep -m 1 '^error:' "$gemini_dir/stderr.txt" 2>/dev/null | tr '\r' ' ' | head -c 300)"
+      # A model this account cannot use is said once, clearly, instead of agy's wording.
+      if gemini_clean="$(model_unavailable_line "$engine_model" "$gemini_reason $gemini_log_line")"; then
+        gemini_reason="$gemini_clean"
+        gemini_log_line=""
+      fi
       gemini_reason="$(printf '%s' "$gemini_reason" | tr '\n\r' '  ' | head -c 300)"
       log "run ($mode) engine=gemini failed rc=$rc reason=$gemini_reason"
       echo "crosscheck --run: agy failed: $gemini_reason" >&2
-      # One capped line of agy's own error, never its whole stderr (it can echo task text).
-      local gemini_log_line
-      gemini_log_line="$(grep -m 1 '^error:' "$gemini_dir/stderr.txt" 2>/dev/null | tr '\r' ' ' | head -c 300)"
       printf '%s\n' "${gemini_log_line:-$gemini_reason}" >>"$STDERR_LOG_FILE" 2>/dev/null
       record_failed_run "$mode" gemini "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$([ $rc -eq 124 ] && echo 124 || echo 1)" "$gemini_reason" "$gemini_usage" "$scope"
       return 1
     fi
+    # agy's result and log name no model, so with `default` it stays unknown.
+    set_model_line gemini "$engine_model" ""
     publish_report "$mode" "$hash" "$artifact_file" "$gemini_body" "gemini" "$round" "$engine_model" "$engine_effort" \
       "$(run_extra_json success "$run_started" "$run_ended" "" "$gemini_usage" "$scope")"
     rc=$?
@@ -1184,13 +1431,14 @@ cmd_run() {
     rc=$?
     run_ended="$(date +%s)"
     if [ $rc -ne 0 ]; then
-      log "run ($mode) engine=claude failed rc=$rc"
-      echo "crosscheck --run: claude -p failed (rc=$rc). See $STDERR_LOG_FILE." >&2
       # A failing claude can still print a JSON result with the real message
       # and what the run cost.
-      local failed_result failed_message
+      local failed_result failed_message failed_clean
       failed_result="$(claude_result_json "$json_file")"
       failed_message="$(printf '%s' "$failed_result" | jq -r '.result // empty' 2>/dev/null)"
+      if failed_clean="$(model_unavailable_line "$engine_model" "$failed_message")"; then failed_message="$failed_clean"; fi
+      log "run ($mode) engine=claude failed rc=$rc${failed_message:+ error=$(printf '%s' "$failed_message" | tr '\n\r' '  ' | head -c 300)}"
+      echo "crosscheck --run: claude -p failed (rc=$rc).${failed_message:+ Claude said: $(printf '%s' "$failed_message" | tr '\n\r' '  ' | head -c 300)} See $STDERR_LOG_FILE." >&2
       record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" \
         "${failed_message:-claude -p exited $rc}" "$([ -n "$failed_result" ] && claude_usage_json "$failed_result" || printf null)" "$scope"
       return 1
@@ -1202,7 +1450,9 @@ cmd_run() {
       claude_usage="$(claude_usage_json "$claude_result")"
       claude_is_error="$(printf '%s' "$claude_result" | jq -r '.is_error // false' 2>/dev/null)"
       if [ "$claude_is_error" = "true" ]; then
-        log "run ($mode) engine=claude reported an error result"
+        local error_clean
+        if error_clean="$(model_unavailable_line "$engine_model" "$claude_output")"; then claude_output="$error_clean"; fi
+        log "run ($mode) engine=claude reported an error result: $(printf '%s' "$claude_output" | tr '\n\r' '  ' | head -c 300)"
         echo "crosscheck --run: claude reported an error: $(printf '%s' "$claude_output" | head -c 300). See $STDERR_LOG_FILE." >&2
         record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$claude_output" "$claude_usage" "$scope"
         return 1
@@ -1216,6 +1466,7 @@ cmd_run() {
       record_failed_run "$mode" claude "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "empty output" "$claude_usage" "$scope"
       return 1
     fi
+    set_model_line claude "$engine_model" "$([ -n "$claude_result" ] && claude_ran_model "$claude_result")"
     publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" \
       "$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage" "$scope")"
     rc=$?
@@ -1232,8 +1483,9 @@ cmd_run() {
   # Everything past this point is a genuine Codex-side outcome: setup already
   # succeeded, so rc and auth_status are meaningful and safe to report.
   if [ $rc -ne 0 ] || [ ! -s "$json_file" ]; then
-    local codex_error
+    local codex_error codex_clean
     codex_error="$(codex_stream_error "$json_file")"
+    if codex_clean="$(model_unavailable_line "$engine_model" "$codex_error")"; then codex_error="$codex_clean"; fi
     log "run ($mode) failed rc=$rc auth=$(auth_status) error=${codex_error:-none}"
     echo "crosscheck --run: codex exec failed (rc=$rc, auth=$(auth_status)).${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
     record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" "$rc" "${codex_error:-codex exec exited $rc}" "$(codex_usage_json "$json_file")" "$scope"
@@ -1244,8 +1496,9 @@ cmd_run() {
   research_output="$(jq -c 'select(.type=="item.completed" and .item.type=="agent_message")' "$json_file" 2>/dev/null | tail -1 | jq -r '.item.text // ""' 2>/dev/null)"
 
   if [ -z "$research_output" ]; then
-    local codex_error
+    local codex_error codex_clean
     codex_error="$(codex_stream_error "$json_file")"
+    if codex_clean="$(model_unavailable_line "$engine_model" "$codex_error")"; then codex_error="$codex_clean"; fi
     log "run ($mode) produced empty output error=${codex_error:-none}"
     echo "crosscheck --run: codex produced no output.${codex_error:+ Codex said: $codex_error} See $STDERR_LOG_FILE." >&2
     record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "${codex_error:-empty output}" "$(codex_usage_json "$json_file")" "$scope"
@@ -1256,6 +1509,7 @@ cmd_run() {
   # take several minutes, long enough for an ancestor directory to have been
   # replaced with a symlink since the first check. publish_report repeats the
   # check on its own, which is fine, it's cheap.
+  set_model_line codex "$engine_model" "$(codex_ran_model "$json_file")"
   publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort" \
     "$(run_extra_json success "$run_started" "$run_ended" "" "$(codex_usage_json "$json_file")" "$scope")"
   rc=$?
@@ -1893,7 +2147,7 @@ run_selftest() {
   # directory instead of $tmp_home, including its DISABLED sentinel if one
   # happens to be set, silently making every check below fail in a way that
   # looks like a logic bug, not an environment leak. Confirmed the hard way.
-  unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR CROSSCHECK_MODEL CROSSCHECK_EFFORT
+  unset CLAUDE_CONFIG_DIR CROSSCHECK_STATE_DIR CROSSCHECK_MODEL CROSSCHECK_EFFORT CODEX_HOME CROSSCHECK_CHECK_TIMEOUT
   tmp_home="$(mktemp -d -t crosscheck-selftest.XXXXXX)" || {
     echo "selftest: mktemp -d failed" >&2
     return 1
@@ -2408,15 +2662,15 @@ AGY_STUB_EOF
   {
     echo '#!/usr/bin/env bash'
     echo 'cat >/dev/null'
-    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"turn.failed", error:{message:"model_not_found: not supported with this account"}}')'"
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"turn.failed", error:{message:"rate_limit_exceeded: slow down"}}')'"
     echo 'exit 1'
   } >"$codex_api_error_dir/codex"
   chmod +x "$codex_api_error_dir/codex"
   out="$(HOME="$tmp_home" PATH="$codex_api_error_dir:$PATH" "$run" --run --mode plan-review --prompt-file "$prompt_file" --hash codexapierrorhash1 2>&1 >/dev/null)"
   rc=$?
   check "codex api error: --run exits nonzero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
-  check "codex api error: message carries what Codex said" "$(printf '%s' "$out" | grep -c 'Codex said: model_not_found')" "1"
-  check "codex api error: the log records it too" "$(grep -c 'error=model_not_found' "$tmp_home/.claude/plan-mode-crosscheck/logs/crosscheck.log" 2>/dev/null)" "1"
+  check "codex api error: message carries what Codex said" "$(printf '%s' "$out" | grep -c 'Codex said: rate_limit_exceeded')" "1"
+  check "codex api error: the log records it too" "$(grep -c 'error=rate_limit_exceeded' "$tmp_home/.claude/plan-mode-crosscheck/logs/crosscheck.log" 2>/dev/null)" "1"
 
   # 22. A prompt file that exists (passes -s) but can't actually be read is a
   #     setup failure: Codex is never invoked over an empty/partial task that
@@ -2563,7 +2817,7 @@ AGY_STUB_EOF
   rc=$?
   check "config get with no file exits 0" "$rc" "0"
   check "config get with no file defaults to engine=codex" "$(printf '%s' "$out" | jq -r '.engine')" "codex"
-  check "config get with no file defaults to codex_model=gpt-6-astra" "$(printf '%s' "$out" | jq -r '.codex_model')" "gpt-6-astra"
+  check "config get with no file defaults to codex_model=default" "$(printf '%s' "$out" | jq -r '.codex_model')" "default"
   check "config get with no file defaults to claude_model=fable" "$(printf '%s' "$out" | jq -r '.claude_model')" "fable"
   check "config get with no file reports codex_model_source=default" "$(printf '%s' "$out" | jq -r '.codex_model_source')" "default"
   check "config get with no file defaults to codex_effort=medium" "$(printf '%s' "$out" | jq -r '.codex_effort')" "medium"
@@ -3538,9 +3792,9 @@ AGY_STUB_EOF
   gem_cfg_set codex >/dev/null
   gem_cfg_rc=$?
   check "gemini config: set without the gemini flags still exits 0" "$gem_cfg_rc" "0"
-  check "gemini config: the gemini fields fall back to their defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)"' 2>/dev/null)" "gemini-4-argon/high"
+  check "gemini config: the gemini fields fall back to their defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)"' 2>/dev/null)" "default/high"
   printf '{"engine":"codex","codex_model":"gpt-a","claude_model":"fable","codex_effort":"medium","claude_effort":"medium"}' >"$gem_cfg_file"
-  check "gemini config: an old config without gemini fields resolves defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)/\(.gemini_effort_source)"' 2>/dev/null)" "gemini-4-argon/high/default"
+  check "gemini config: an old config without gemini fields resolves defaults" "$(gem_cfg get | jq -r '"\(.gemini_model)/\(.gemini_effort)/\(.gemini_effort_source)"' 2>/dev/null)" "default/high/default"
   check "gemini config: an old config keeps its single engine in engines" "$(gem_cfg get | jq -c '.engines' 2>/dev/null)" '["codex"]'
   #     Key order: claude before codex before gemini, in get, in the file and in the error text.
   gem_cfg_set claude,codex,gemini --gemini-model gemini-4-argon --gemini-effort high >/dev/null
@@ -3909,6 +4163,272 @@ TIMEOUT_K_EOF
   check "next-round: show after a scoped round still holds with gemini configured" "$(next_round claude,codex,gemini --round 3 --scoped-streak 1 --item HIGH:process:incorporated)" "$show_none"
   check "next-round: the legacy both still launches claude then codex" "$(next_round both --round 2 --scoped-streak 0 --item CRITICAL:process:incorporated)" "$full_both"
 
+  # 52b. Model ids that are listed live, validated by a real call before they
+  #      are saved, and reported cleanly when an account cannot use them. Every
+  #      CLI here is a stub fed with recorded real output, no network.
+  local mm_dir="$tmp_home/cc8" mm_root="$tmp_home/cc8/root"
+  mkdir -p "$mm_dir/bin" "$mm_dir/tmp" "$mm_root"
+  local mm_bin="$mm_dir/bin"
+  printf 'Fetching available models...\ngemini-4-neon-high\tGemini 4 Neon (High)\ngemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\ngemini-4-neon-low\tGemini 4 Neon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\ngemini-pro-orchestrator\tOrchestrator (Carbon)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\ngemini-x;touch-high\tbad id\n' >"$mm_dir/agy-models.txt"
+  cat >"$mm_dir/codex-models.json" <<'MM_CODEX_MODELS_EOF'
+{"models":[
+ {"slug":"gpt-6.1-terra","display_name":"GPT-6.1 Terra","visibility":"list","priority":3},
+ {"slug":"gpt-6.2-sol","display_name":"GPT-6.2-Sol","visibility":"list","priority":1},
+ {"slug":"gpt-reserve","display_name":"GPT-Reserve","visibility":"hide","priority":4},
+ {"slug":"gpt-6.2-astra","display_name":"GPT-6.2-Astra","visibility":"list","priority":2},
+ {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","priority":6}
+]}
+MM_CODEX_MODELS_EOF
+  cat >"$mm_bin/agy" <<'MM_AGY_EOF'
+#!/usr/bin/env bash
+d="${M_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$d/agy.args"
+if [ "${1:-}" = "models" ]; then cat "$d/agy-models.txt"; exit 0; fi
+prompt="" model=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="${2:-}"; shift 2 ;;
+    --model) model="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+task="${prompt#Read the file }"
+task="${task%% and follow*}"
+[ -r "$task" ] && cp "$task" "$d/agy.task"
+nonce_line="$(tail -n 1 "$task" 2>/dev/null)"
+case "$(cat "$d/agy.mode" 2>/dev/null)" in
+  bad)
+    message="invalid model selection (--model \"$model\" --effort \"high\"): --effort is not supported for model \"$model\""
+    echo "error: $message" >&2
+    jq -nc --arg e "$message" '{conversation_id:"",status:"ERROR",response:"",error:$e,finished_reason:"error"}'
+    exit 1 ;;
+  rc124) exit 124 ;;
+  sleep) exec sleep 4711 ;;
+  *) jq -nc --arg r "$nonce_line"$'\nOK' '{conversation_id:"s",status:"SUCCESS",response:$r,usage:{input_tokens:1,output_tokens:1,total_tokens:2}}' ;;
+esac
+MM_AGY_EOF
+  cat >"$mm_bin/codex" <<'MM_CODEX_EOF'
+#!/usr/bin/env bash
+d="${M_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$d/codex.args"
+if [ "${1:-} ${2:-}" = "debug models" ]; then cat "$d/codex-models.json"; exit 0; fi
+model="" previous=""
+for argument in "$@"; do
+  [ "$previous" = "-m" ] && model="$argument"
+  previous="$argument"
+done
+cat >/dev/null
+jq -nc --arg t "$(cat "$d/codex.thread" 2>/dev/null || echo stubthread01)" '{type:"thread.started",thread_id:$t}'
+case "$(cat "$d/codex.mode" 2>/dev/null)" in
+  modelerr)
+    text="{\"detail\":\"The '$model' model is not supported when using Codex with a ChatGPT account.\",\"code\":\"model_not_found\"}"
+    jq -nc --arg m "$text" '{type:"error",message:$m}'
+    jq -nc --arg m "$text" '{type:"turn.failed",error:{message:$m}}'
+    exit 1 ;;
+  usage)
+    text="You've hit your usage limit. Try again later."
+    jq -nc --arg m "$text" '{type:"error",message:$m}'
+    jq -nc --arg m "$text" '{type:"turn.failed",error:{message:$m}}'
+    exit 1 ;;
+  *)
+    jq -nc '{type:"item.completed",item:{type:"agent_message",text:"OK"}}'
+    jq -nc '{type:"turn.completed",usage:{input_tokens:3,output_tokens:2,cached_input_tokens:0}}' ;;
+esac
+MM_CODEX_EOF
+  cat >"$mm_bin/claude" <<'MM_CLAUDE_EOF'
+#!/usr/bin/env bash
+d="${M_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$d/claude.args"
+cat >/dev/null
+model="" previous=""
+for argument in "$@"; do
+  [ "$previous" = "--model" ] && model="$argument"
+  previous="$argument"
+done
+case "$(cat "$d/claude.mode" 2>/dev/null)" in
+  bad)
+    jq -nc --arg r "There's an issue with the selected model ($model). It may not exist or you may not have access to it. Run --model to pick a different model." \
+      '{type:"result",is_error:true,result:$r,terminal_reason:"api_error",usage:{input_tokens:0,output_tokens:0},modelUsage:{}}' ;;
+  fail)
+    jq -nc '{type:"result",is_error:true,result:"authentication failed: run claude login"}'
+    exit 1 ;;
+  *)
+    jq -nc '{type:"result",is_error:false,result:"OK",usage:{input_tokens:3,output_tokens:2},modelUsage:{"claude-stub-1":{outputTokens:5},"claude-other":{outputTokens:1}}}' ;;
+esac
+MM_CLAUDE_EOF
+  chmod +x "$mm_bin/agy" "$mm_bin/codex" "$mm_bin/claude"
+  printf 'ok' >"$mm_dir/agy.mode"; printf 'ok' >"$mm_dir/codex.mode"; printf 'ok' >"$mm_dir/claude.mode"
+  local -a mm_envv=(HOME="$tmp_home" CROSSCHECK_STATE_DIR="$mm_root" M_STUB_DIR="$mm_dir" TMPDIR="$mm_dir/tmp" PATH="$mm_bin:$PATH")
+  mm() { env "${mm_envv[@]}" "$run" "$@"; }
+  local mm_prompt="$tmp_home/mm-prompt.md" mm_out mm_rc mm_err="$tmp_home/mm.err"
+  printf 'ROUND: 1\n\nORIGINAL REQUEST:\nmmrequest\n\nPROPOSED PLAN:\nmmplan\n' >"$mm_prompt"
+  mm_set() {
+    mm --config set --engine "${1:-claude,codex,gemini}" --codex-model "${2:-gpt-ok}" --claude-model "${3:-opus-x}" \
+      --codex-effort medium --claude-effort medium --gemini-model "${4:-gem-ok}" --gemini-effort high >/dev/null 2>&1 </dev/null
+  }
+  mm_log_count() { grep -c -F -- "$1" "$mm_root/logs/crosscheck.log" 2>/dev/null | tr -d ' '; }
+
+  # Listing: parsers fed with recorded outputs, newest first, no hidden or invalid ids.
+  mm_out="$(mm --config models gemini 2>/dev/null </dev/null)"
+  check "models gemini: effort suffix stripped, deduped, invalid id dropped" "$(printf '%s' "$mm_out" | tr '\n' ' ')" "gemini-4-neon gemini-4-argon gemini-pro-orchestrator claude-opus-5-5"
+  mm_out="$(mm --config models codex 2>/dev/null </dev/null)"
+  check "models codex: ordered by priority, hidden models dropped" "$(printf '%s' "$mm_out" | tr '\n' ' ')" "gpt-6.2-sol gpt-6.2-astra gpt-6.1-terra gpt-6-astra"
+  mm_out="$(mm --config models claude 2>"$mm_err" </dev/null)"
+  mm_rc=$?
+  check "models claude: aliases, exit 0, a stderr note that there is no listing" "$(printf '%s' "$mm_out" | tr '\n' ' ')/$mm_rc/$(grep -c -i 'no model listing' "$mm_err")" "fable opus sonnet haiku/0/1"
+  mm --config models bogus >/dev/null 2>&1 </dev/null
+  check "models with an unknown engine exits 2" "$?" "2"
+  local mm_tools="$tmp_home/cc8/tools"
+  mkdir -p "$mm_tools"
+  ln -sf "$(command -v jq)" "$mm_tools/jq"
+  ln -sf "$(command -v timeout || command -v gtimeout)" "$mm_tools/timeout"
+  mm_out="$(env "${mm_envv[@]}" PATH="$mm_tools:/usr/bin:/bin" "$run" --config models codex 2>&1 </dev/null)"
+  mm_rc=$?
+  check "models codex without the codex binary exits 1 with one stderr line" "$mm_rc/$(printf '%s' "$mm_out" | grep -c -i 'codex not found')" "1/1"
+  local mm_gt_dir="$tmp_home/cc8/gtonly"
+  mkdir -p "$mm_gt_dir"
+  printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' >"$mm_gt_dir/gtimeout"
+  chmod +x "$mm_gt_dir/gtimeout"
+  mm_out="$(env "${mm_envv[@]}" PATH="$mm_bin:$mm_gt_dir:$(strip_cmd_dir timeout "$(strip_cmd_dir gtimeout "$PATH")")" "$run" --config models gemini 2>/dev/null </dev/null | head -n 1)"
+  check "models works with only gtimeout on PATH" "$mm_out" "gemini-4-neon"
+
+  # The default sentinel: saved as given, no model flag passed to the engine.
+  check "config get with no file defaults codex and gemini to default" "$(mm --config get | jq -r '"\(.codex_model)/\(.gemini_model)"')" "default/default"
+  mm_set claude,codex,gemini default default default
+  check "config set keeps default as given" "$(mm --config get | jq -r '"\(.codex_model)/\(.claude_model)/\(.gemini_model)"')" "default/default/default"
+  : >"$mm_dir/codex.args"; : >"$mm_dir/claude.args"; : >"$mm_dir/agy.args"
+  mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  mm --run --engine gemini --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  check "default: codex gets no -m" "$(grep -c -e ' -m ' -e '^-m ' "$mm_dir/codex.args")" "0"
+  check "default: claude gets no --model" "$(grep -c -e '--model' "$mm_dir/claude.args")" "0"
+  check "default: agy gets no --model" "$(grep -c -e '--model' "$mm_dir/agy.args")" "0"
+  mm_set claude,codex,gemini gpt-ok opus-x gem-ok
+  : >"$mm_dir/codex.args"; : >"$mm_dir/claude.args"; : >"$mm_dir/agy.args"
+  mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  mm --run --engine gemini --mode plan-review --prompt-file "$mm_prompt" >/dev/null 2>&1 </dev/null
+  check "explicit model: codex gets -m, claude and agy get --model" "$(grep -c -e '-m gpt-ok' "$mm_dir/codex.args")/$(grep -c -e '--model opus-x' "$mm_dir/claude.args")/$(grep -c -e '--model gem-ok' "$mm_dir/agy.args")" "1/1/1"
+
+  # The concrete model that ran, printed only when it differs from what was saved.
+  mm_set claude,codex,gemini gpt-ok opus gem-ok
+  mm_out="$(mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "claude alias: first stdout line names the concrete model from modelUsage" "$(printf '%s' "$mm_out" | head -n 1)" "crosscheck-model: claude ran claude-stub-1 (configured opus)"
+  mm_set claude,codex,gemini gpt-ok claude-stub-1 gem-ok
+  mm_out="$(mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "claude full id equal to the concrete one adds no model line" "$(printf '%s' "$mm_out" | grep -c '^crosscheck-model:')" "0"
+  mm_set claude,codex,gemini default opus-x default
+  mkdir -p "$tmp_home/.codex/sessions/2026/11/24"
+  printf '{"type":"turn_context","payload":{"model":"gpt-stub-9"}}\n' >"$tmp_home/.codex/sessions/2026/11/24/rollout-2026-11-24T00-00-00-stubthread01.jsonl"
+  printf 'stubthread01' >"$mm_dir/codex.thread"
+  mm_out="$(mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "codex default: the concrete model comes from the session file of the thread" "$(printf '%s' "$mm_out" | head -n 1)" "crosscheck-model: codex ran gpt-stub-9 (configured default)"
+  printf '{"payload":{"model":"a;b"}}\n' >"$tmp_home/.codex/sessions/2026/11/24/rollout-2026-11-24T00-00-00-stubthread01.jsonl"
+  mm_out="$(mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "codex default: an invalid concrete id is reported as unknown" "$(printf '%s' "$mm_out" | head -n 1)" "crosscheck-model: codex ran unknown (configured default)"
+  printf '../x' >"$mm_dir/codex.thread"
+  mm_out="$(mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "codex default: a thread id with path characters is never used in a lookup" "$(printf '%s' "$mm_out" | head -n 1)" "crosscheck-model: codex ran unknown (configured default)"
+  rm -f "$mm_dir/codex.thread"
+  mm_out="$(mm --run --engine gemini --mode plan-review --prompt-file "$mm_prompt" 2>/dev/null </dev/null)"
+  check "gemini default: nothing exposes the model, reported as unknown" "$(printf '%s' "$mm_out" | head -n 1)" "crosscheck-model: gemini ran unknown (configured default)"
+
+  # Audit time: a model the account cannot use gets one clear line, other failures stay raw.
+  local mm_msg
+  mm_set claude,codex,gemini gpt-6-astra badclaude badgem
+  printf 'modelerr' >"$mm_dir/codex.mode"; printf 'bad' >"$mm_dir/claude.mode"; printf 'bad' >"$mm_dir/agy.mode"
+  : >"$mm_root/logs/crosscheck.log"; rm -f "$mm_root/metrics.jsonl"
+  mm_msg="model gpt-6-astra not available for this account, run /crosscheck-setup"
+  mm_out="$(mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" 2>&1 >/dev/null </dev/null)"
+  check "audit codex: stderr carries the clean model line, not raw JSON" "$(printf '%s' "$mm_out" | grep -c -F "$mm_msg")/$(printf '%s' "$mm_out" | grep -c 'model_not_found')" "1/0"
+  check "audit codex: the log has the clean line" "$(mm_log_count "$mm_msg")" "1"
+  check "audit codex: the failed run line has the clean error" "$(jq -r 'select(.engine == "codex") | .error' "$mm_root/metrics.jsonl" | tail -1)" "$mm_msg"
+  mm_out="$(mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" 2>&1 >/dev/null </dev/null)"
+  check "audit claude: stderr carries the clean model line" "$(printf '%s' "$mm_out" | grep -c -F 'model badclaude not available for this account, run /crosscheck-setup')" "1"
+  check "audit claude: the log and the failed run line carry it" "$(mm_log_count 'model badclaude not available for this account')/$(jq -r 'select(.engine == "claude") | .error' "$mm_root/metrics.jsonl" | tail -1)" "1/model badclaude not available for this account, run /crosscheck-setup"
+  mm_out="$(mm --run --engine gemini --mode plan-review --prompt-file "$mm_prompt" 2>&1 >/dev/null </dev/null)"
+  check "audit gemini: stderr carries the clean model line" "$(printf '%s' "$mm_out" | grep -c -F 'model badgem not available for this account, run /crosscheck-setup')" "1"
+  check "audit gemini: the log and the failed run line carry it" "$(mm_log_count 'model badgem not available for this account')/$(jq -r 'select(.engine == "gemini") | .error' "$mm_root/metrics.jsonl" | tail -1)" "1/model badgem not available for this account, run /crosscheck-setup"
+  printf 'usage' >"$mm_dir/codex.mode"; printf 'fail' >"$mm_dir/claude.mode"
+  mm_out="$(mm --run --engine codex --mode plan-review --prompt-file "$mm_prompt" 2>&1 >/dev/null </dev/null)"
+  check "audit codex: a usage limit stays raw and is not called a model problem" "$(printf '%s' "$mm_out" | grep -c -i 'usage limit')/$(printf '%s' "$mm_out" | grep -c 'not available for this account')" "1/0"
+  mm_out="$(mm --run --engine claude --mode plan-review --prompt-file "$mm_prompt" 2>&1 >/dev/null </dev/null)"
+  check "audit claude: an auth failure stays raw" "$(printf '%s' "$mm_out" | grep -c 'not available for this account')" "0"
+  printf 'ok' >"$mm_dir/codex.mode"; printf 'ok' >"$mm_dir/claude.mode"; printf 'ok' >"$mm_dir/agy.mode"
+
+  # --config check: one line per engine, a real call through the audit's own path.
+  mm_set claude,codex,gemini gpt-ok opus-x gem-ok
+  local mm_metrics_before mm_reports_before
+  mm_metrics_before="$(wc -l <"$mm_root/metrics.jsonl" 2>/dev/null | tr -d ' ')"
+  mm_reports_before="$(ls "$mm_root/state/reports" 2>/dev/null | wc -l | tr -d ' ')"
+  mm_out="$(mm --config check 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (saved config): one line per engine in order, exit 0" "$(printf '%s' "$mm_out" | tr '\n' '|')/$mm_rc" "claude: ok opus-x (ran claude-stub-1)|codex: ok gpt-ok|gemini: ok gem-ok/0"
+  check "check leaves no metrics line and no report in the real state dir" "$(wc -l <"$mm_root/metrics.jsonl" 2>/dev/null | tr -d ' ')/$(ls "$mm_root/state/reports" 2>/dev/null | wc -l | tr -d ' ')" "$mm_metrics_before/$mm_reports_before"
+  check "check output never names its throwaway directory" "$(printf '%s' "$mm_out" | grep -c -F "$mm_dir/tmp")" "0"
+  check "check leaves no throwaway directory behind" "$(ls "$mm_dir/tmp" | wc -l | tr -d ' ')" "0"
+  check "check's gemini task carries the check text and the read-check line" "$(grep -c -F 'Reply with the single word OK' "$mm_dir/agy.task")/$(grep -c '^READ-CHECK: ' "$mm_dir/agy.task")" "1/1"
+  mm_out="$(mm --config check --engine codex --model gpt-6-astra --effort medium 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (candidate): a ok model prints one ok line" "$mm_out/$mm_rc" "codex: ok gpt-6-astra/0"
+  printf 'modelerr' >"$mm_dir/codex.mode"
+  mm_out="$(mm --config check --engine codex --model gpt-6-astra --effort medium 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (candidate): a rejected model is one FAIL line with the model message, exit 1" "$mm_out/$mm_rc" "codex: FAIL gpt-6-astra: model gpt-6-astra not available for this account, run /crosscheck-setup/1"
+  check "check (candidate): checking does not save anything" "$(mm --config get | jq -r '.codex_model')" "gpt-ok"
+  mm_out="$(mm --config check 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (saved config): one failing engine gives three lines, FAIL on codex, exit 1" "$(printf '%s\n' "$mm_out" | grep -c '')/$(printf '%s' "$mm_out" | grep -c '^codex: FAIL gpt-ok: ')/$mm_rc" "3/1/1"
+  printf 'ok' >"$mm_dir/codex.mode"
+  printf 'rc124' >"$mm_dir/agy.mode"
+  mm_out="$(env "${mm_envv[@]}" CROSSCHECK_CHECK_TIMEOUT=5 "$run" --config check --engine gemini --model gem-ok 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check: a timeout is its own TIMEOUT line, never a model rejection" "$(printf '%s' "$mm_out" | grep -c '^gemini: TIMEOUT gem-ok: could not confirm')/$(printf '%s' "$mm_out" | grep -c 'not available')/$mm_rc" "1/0/1"
+  printf 'ok' >"$mm_dir/agy.mode"
+  printf 'fail' >"$mm_dir/claude.mode"
+  mm_out="$(mm --config check --engine claude --model opus-x 2>&1 </dev/null)"
+  check "check: a claude failure shows the engine's own message on the FAIL line" "$(printf '%s' "$mm_out" | grep -c -F 'claude: FAIL opus-x: authentication failed')" "1"
+  printf 'ok' >"$mm_dir/claude.mode"
+  # A corrupt saved config must not block the repair path.
+  printf '{ not json' >"$mm_root/config.json"
+  mm_out="$(mm --config check --engine codex --model gpt-ok 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (candidate) works while the saved config is corrupt" "$mm_out/$mm_rc" "codex: ok gpt-ok/0"
+  mm_out="$(mm --config check 2>&1 </dev/null)"
+  mm_rc=$?
+  check "check (saved config) with a corrupt config is one clear line, exit 1" "$mm_out/$mm_rc" "config corrupt, run /crosscheck-setup/1"
+  mm_set claude,codex,gemini gpt-ok opus-x gem-ok
+  check "a config set repairs the corrupt file" "$(mm --config get | jq -r '.codex_model')" "gpt-ok"
+  mm --config check --engine codex --model 'a;b' >/dev/null 2>&1 </dev/null
+  check "check rejects an invalid model id with exit 2" "$?" "2"
+  mm_out="$(cd "$(dirname "$run")/.." && env "${mm_envv[@]}" ./hooks/crosscheck.sh --config check --engine codex --model gpt-ok 2>&1 </dev/null)"
+  check "check works when the script is called by a relative path" "$mm_out" "codex: ok gpt-ok"
+  # Cancelling a check leaves nothing running and nothing behind.
+  printf 'sleep' >"$mm_dir/agy.mode"
+  env "${mm_envv[@]}" "$run" --config check --engine gemini --model gem-ok >/dev/null 2>&1 </dev/null &
+  local mm_pid=$!
+  sleep 3
+  kill -TERM "$mm_pid" 2>/dev/null
+  wait "$mm_pid" 2>/dev/null
+  sleep 1
+  check "a terminated check leaves no engine process alive" "$(pgrep -f 'sleep 4711' | wc -l | tr -d ' ')" "0"
+  check "a terminated check leaves no throwaway directory" "$(ls "$mm_dir/tmp" | wc -l | tr -d ' ')" "0"
+  printf 'ok' >"$mm_dir/agy.mode"
+
+  # The setup skill no longer carries a hand-kept id list and documents the new flow.
+  check "setup SKILL.md has no literal gpt, gemini or claude model id" "$(grep -c -E 'gpt-[0-9]|gemini-[0-9]|claude-[a-z]+-[0-9]' "$(dirname "$run")/../skills/crosscheck-setup/SKILL.md")" "0"
+  for phrase in "--config models" "--config check" "default" "not saved"; do
+    check "setup SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../skills/crosscheck-setup/SKILL.md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "setup SKILL.md no longer says to save when agy is missing" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../skills/crosscheck-setup/SKILL.md" 2>/dev/null | grep -c -i 'still save')" "0"
+  for phrase in "crosscheck-model:" "not available for this account"; do
+    check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+  check "SKILL.md no longer names gpt-6-astra as the default" "$(grep -c -F 'gpt-6-astra' "$skill_md")" "0"
+  for phrase in "--config check" "own default"; do
+    check "configuration docs name: $phrase" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/configuration.md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
+  done
+
   # 53. Docs and skills carry the Gemini decisions as literal text.
   local setup_skill_md readme_md changelog_md plugin_json
   setup_skill_md="$(dirname "$run")/../skills/crosscheck-setup/SKILL.md"
@@ -3918,7 +4438,7 @@ TIMEOUT_K_EOF
   for phrase in "Gemini" "Claude, Codex, Gemini" "--config get | jq .engines" "claude+gemini" "gemini:<model>" "some engines failed" "agy"; do
     check "SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
   done
-  for phrase in "Which engines?" "Gemini" "--gemini-model" "--gemini-effort" "gemini-4-argon" "command -v agy" "agy models" "authentication required"; do
+  for phrase in "Which engines?" "Gemini" "--gemini-model" "--gemini-effort" "command -v agy" "agy models" "authentication required"; do
     check "setup SKILL.md names: $phrase" "$(tr -s '[:space:]' ' ' <"$setup_skill_md" 2>/dev/null | grep -q -F -- "$phrase" && echo yes || echo no)" "yes"
   done
   check "README names the Antigravity CLI binary agy" "$(grep -c -F 'agy' "$readme_md" 2>/dev/null | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
@@ -3926,7 +4446,7 @@ TIMEOUT_K_EOF
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.10.1" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.10.1"
+  check "the CHANGELOG top entry is 3.11.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.11.0"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.

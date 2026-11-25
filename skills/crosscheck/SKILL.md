@@ -48,8 +48,9 @@ Claude, Codex, Gemini; read this one, it is what you launch), `claude_model`,
 `codex_effort`, `gemini_effort` (`low` | `medium` | `high` | `xhigh` | `max`),
 and `codex_model_source`. To get just the list run `crosscheck --config get`
 and read the field `engines` (`crosscheck --config get | jq .engines`). No
-config file just means defaults (`codex`, `gpt-6-astra`, `fable`,
-`gemini-4-argon`; efforts `medium`, `high` for Gemini).
+config file just means defaults (`codex`, model `default` for Codex and Gemini
+and `fable` for Claude; efforts `medium`, `high` for Gemini). The model value
+`default` means the engine runs without a model flag, on its own default.
 
 If it exits nonzero, the config file is corrupt or invalid. Do not try to fix
 it here and do not run any engine:
@@ -88,8 +89,8 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
    independent audit of this plan before it's shown? Yes/No (with the skip
    marker in the question text, see above), one question,
    naming the configured engine(s) and models (for example "auditoria con
-   Codex gpt-6-astra", "con Claude fable", "con Gemini gemini-4-argon" or
-   "con Claude fable + Codex gpt-6-astra"). No need to over-explain: the deny reason already told you why
+   Codex <codex_model>", "con Claude <claude_model>", "con Gemini
+   <gemini_model>" or "con Claude + Codex", using the saved values). No need to over-explain: the deny reason already told you why
    you're asking.
 
    **Exception: if this denial is on a hash produced by editing the plan to
@@ -202,7 +203,7 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
       ```
       and make the whole call `run_in_background: true`, with a `description`
       that says what's actually happening, something like `"Codex auditando
-      el plan, ronda N (gpt-6-astra, medium)"` or `"Claude auditando el plan,
+      el plan, ronda N (<codex_model>, <codex_effort>)"` or `"Claude auditando el plan,
       ronda N (<claude_model>, <claude_effort>)"`. The tmp-dir lookup and the
       heredoc write are near-instant; backgrounding the whole script just
       means the slow part (`--run`) doesn't block.
@@ -246,6 +247,12 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
         `agy`'s own message, for example "authentication required" when `agy`
         runs over ssh and cannot reach the macOS keychain). That still counts
         as a completed audit.
+      - **A model the account cannot use** comes back from `--run` as one
+        stderr line, `model <id> not available for this account, run
+        /crosscheck-setup`. Put that line, word for word, in the round summary
+        next to the engine's name (never the raw JSON, and never "the engine
+        failed" alone), and tell the user to run `/crosscheck-setup` for that
+        engine. Do not retry it with another model: that decision is theirs.
       - If every configured engine failed (Codex not installed, not logged
         in, timed out, `claude -p` failed or returned nothing, `agy` missing,
         etc.), do not leave the
@@ -307,6 +314,14 @@ relayed as `Kind: unknown` (it counts as change); when two engines disagree on
 a merged finding it is `change`; a CRITICAL is never `process`. A rejected
 change HIGH is relayed as "rejected change finding, your decision": the user,
 not you, decides to show the plan anyway.
+
+**Header of the relay.** When a report's stdout starts with a line `crosscheck-model:
+<engine> ran <model> (configured <value>)`, the model that ran is in that line
+(a saved alias or `default` resolves to it): name that concrete model in the
+relay header and in the `Source:` of that engine's findings, instead of the
+saved value. `ran unknown` means the engine's CLI does not say which model it
+used; write the saved value and say it is unconfirmed. Without that line the
+saved model is what ran.
 
 Do this even if there are many findings and even if severity is low. Never
 substitute this with a count or a trend ("findings went from 12 down to 5"):
@@ -533,7 +548,7 @@ first.
 ## Notes
 
 - `CROSSCHECK_MODEL` (overrides `codex_model` from the config; default
-  `gpt-6-astra`), `CROSSCHECK_EFFORT` (default `medium`, deliberately: see
+  `default`, Codex's own), `CROSSCHECK_EFFORT` (default `medium`, deliberately: see
   the plugin's `CHANGELOG.md` for why `high` is not the default), and
   `CROSSCHECK_TIMEOUT` (default `600` seconds) are environment variables the
   user may already have set; don't override them unless asked to. Engine and

@@ -16,7 +16,7 @@ crosscheck --config set --engine E --claude-model C --codex-model M \
 ```
 
 - The first five flags are required. The Gemini pair is optional and defaults
-  to `gemini-4-argon` and `high`. `set` replaces the file whole, which also
+  to `default` and `high`. `set` replaces the file whole, which also
   repairs a corrupt one.
 - `E` is one engine, the legacy `both` (Claude and Codex), or a comma list in
   any order (`claude,gemini`), saved in the order Claude, Codex, Gemini.
@@ -25,8 +25,42 @@ crosscheck --config set --engine E --claude-model C --codex-model M \
 - Model IDs are opaque strings: they may not be empty, start with `-`, or
   contain whitespace or shell metacharacters. If you compose the command by
   hand, single-quote every value.
-- Gemini model IDs are base IDs (`gemini-4-argon`); the effort goes in its own
-  flag. `agy models` lists what your account has.
+- Gemini model IDs are base IDs (no `-high` or `-low` suffix); the effort goes
+  in its own flag.
+- The model value `default` means "start the engine without a model flag": it
+  uses the engine's own default model, so it never goes stale. It is the
+  built-in fallback for Codex and Gemini when nothing is saved. The saved
+  config keeps `default` as typed; the audit prints a
+  `crosscheck-model: <engine> ran <model> (configured <value>)` line above the
+  report whenever it can tell which model actually ran (Claude and Codex can;
+  `agy` names none, so Gemini says `ran unknown`).
+
+### Listing and checking models
+
+```bash
+crosscheck --config models <claude|codex|gemini>
+crosscheck --config check [--engine E --model M [--effort F]]
+```
+
+- `models` asks the engine's own CLI for what it can run, newest first:
+  `agy models` for Gemini (effort suffixes stripped), `codex debug models` for
+  Codex (hidden entries dropped). Claude Code has no listing, so it prints its
+  aliases (`fable`, `opus`, `sonnet`, `haiku`). A listing is a suggestion: an
+  account can still be refused a listed model, which only a real call shows.
+  `codex debug models` refreshes Codex's own `models_cache.json`, as every
+  `codex exec` does; nothing in `~/.codex/config.toml` or the login is touched.
+- `check` runs one tiny real call per engine through the same command an audit
+  uses (same flags, read-only, same account), in a throwaway state directory,
+  so it leaves no report, log or metrics line behind. With no flags it checks
+  every saved engine, one line each: `codex: ok MODEL`, `codex: FAIL MODEL:
+  reason`, or `codex: TIMEOUT MODEL: could not confirm`; exit 0 only when all
+  are ok. With `--engine/--model` it checks one candidate and never reads the
+  saved config, so a corrupt one cannot block `/crosscheck-setup`.
+  `/crosscheck-setup` runs it before saving and saves nothing that fails. The
+  budget is 300 seconds per engine (`CROSSCHECK_CHECK_TIMEOUT`).
+- At audit time, an engine refused for its model reports `model MODEL not
+  available for this account, run /crosscheck-setup` in the round summary and
+  the log. The other engines carry on and no other model is tried.
 
 ## Environment variables
 
@@ -34,16 +68,16 @@ Optional, read by `hooks/crosscheck.sh --run`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CROSSCHECK_MODEL` | from `config.json`, else `gpt-6-astra` | Model passed to `codex exec -m`. Overrides the saved choice. |
+| `CROSSCHECK_MODEL` | from `config.json`, else `default` (Codex's own default) | Model passed to `codex exec -m`. Overrides the saved choice. |
 | `CROSSCHECK_EFFORT` | from `config.json`, else `medium` | `model_reasoning_effort` passed to Codex (`low`, `medium`, `high`, `xhigh`). Overrides the saved choice. |
 | `CROSSCHECK_TIMEOUT` | by effort: `low`/`medium` 600, `high` 1200, `xhigh`/`max` 1800 | Budget, in seconds, for each engine call (Claude, Codex or Gemini, by that engine's effort). Set explicitly, it wins over the effort-based default. Runs in the background, so this only matters if an engine is genuinely stuck. |
 | `CROSSCHECK_STATE_DIR` | unset | Override where logs and state live entirely. |
 
-**About the default Codex model:** `gpt-6-astra` is what the author uses day to
-day; it may not be available on every Codex CLI account or region. The previous
-default, `gpt-5.6-sol`, is a known-good fallback. If Codex fails with the
-default and you don't know why, set `CROSSCHECK_MODEL` to whatever model your
-own `codex exec` normally uses.
+**About the default Codex model:** with nothing saved, Codex runs without a
+model flag and uses its own default, which is always one your account can use.
+A specific model that your ChatGPT account does not support fails with `model
+MODEL not available for this account, run /crosscheck-setup`; pick another one
+there, or use `default`.
 
 **About the default Codex effort:** `medium`, not `high`, unless you pick
 otherwise in `/crosscheck-setup`. Measured in practice, `high` took Codex up to

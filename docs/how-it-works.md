@@ -59,7 +59,13 @@ several engines, if some failed and at least one worked, it carries on with
 the ones that worked. An `agy` run that succeeds with an empty answer counts
 as failed, never as a clean review. If every configured engine fails, it marks
 that plan's hash `skipped` so you aren't stuck waiting on a broken tool, and
-continues. A corrupt `config.json` is handled the same way (`--skip` never
+continues. A model the account cannot use is reported as `model MODEL not
+available for this account, run /crosscheck-setup` (from Codex's `model_not_found`,
+Claude Code's "issue with the selected model" or `agy`'s "invalid model
+selection"), in the round summary and the log; no other model is tried, and the
+other engines carry on. `/crosscheck-setup` prevents it by checking each chosen
+model with one tiny real call before saving, and `crosscheck --config check`
+repeats that check on the saved models. A corrupt `config.json` is handled the same way (`--skip` never
 reads the config) and is repaired by re-running `/crosscheck-setup`. You always
 find out; you're never blocked indefinitely.
 

@@ -2,6 +2,35 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.11.0
+
+Model IDs in `/crosscheck-setup` come from the engines themselves, are checked
+before they are saved, and a model your account cannot use is reported clearly.
+
+- **Live listing, no hand-kept IDs.** `crosscheck --config models <engine>`
+  reads `agy models` for Gemini (effort suffixes stripped) and `codex debug
+  models` for Codex (hidden entries dropped), newest first; Claude Code has no
+  listing, so it offers its aliases. Every ID from CLI output goes through the
+  existing ID validation. The setup skill no longer carries any model ID.
+- **`default` never goes stale.** A model value of `default` starts the engine
+  without its model flag (Codex, Gemini and Claude use their own default). It
+  is the built-in fallback for Codex and Gemini, replacing `gpt-6-astra` and
+  `gemini-4-argon`, and is saved as typed. When the audit can tell which model
+  ran (Claude and Codex), a `crosscheck-model:` line above the report names
+  it; Gemini's CLI exposes none, so it says `unknown`.
+- **Checked before saving.** `crosscheck --config check` runs one tiny real
+  call per engine through the audit's own path, in a throwaway state
+  directory, and prints one line each (`ok`, `FAIL` with the engine's reason,
+  or `TIMEOUT`). `/crosscheck-setup` runs it for each chosen model and saves
+  nothing that fails; without arguments it checks the saved config. A corrupt
+  saved config cannot block that repair path, and a cancelled check kills
+  everything it started.
+- **Clear failure at audit time.** An engine refused for its model reports
+  `model <id> not available for this account, run /crosscheck-setup` in the
+  round summary and the log instead of raw JSON. Other engines carry on and no
+  other model is tried. Before this, a Codex model the ChatGPT account does not
+  support failed every round unnoticed.
+
 ## 3.10.1
 
 Gemini audits no longer die when the model reaches for a shell.

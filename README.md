@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.10.1-0071e3">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.11.0-0071e3">
   <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=anthropic&logoColor=white">
   <img alt="Engines" src="https://img.shields.io/badge/engines-Claude%20%7C%20Codex%20%7C%20Gemini-1d1d1f">
   <img alt="Read-only" src="https://img.shields.io/badge/auditors-read--only-5FA04E">
