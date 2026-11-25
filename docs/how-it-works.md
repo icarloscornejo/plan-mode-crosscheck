@@ -57,7 +57,10 @@ If an engine isn't available (Codex not installed, not logged in, timed out,
 tells you which one failed and why (for Gemini, `agy`'s own message). With
 several engines, if some failed and at least one worked, it carries on with
 the ones that worked. An `agy` run that succeeds with an empty answer counts
-as failed, never as a clean review. If every configured engine fails, it marks
+as failed, never as a clean review. So does a Codex run where every tool call
+failed: it never read the repo. If only some calls failed (or Claude or Gemini
+had actions denied) the report is published as `degraded`, with a line at the
+end saying so. If every configured engine fails, it marks
 that plan's hash `skipped` so you aren't stuck waiting on a broken tool, and
 continues. A model the account cannot use is reported as `model MODEL not
 available for this account, run /crosscheck-setup` (from Codex's `model_not_found`,

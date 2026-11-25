@@ -154,7 +154,8 @@ crosscheck --stats ~/.claude/plan-mode-crosscheck/metrics.jsonl \
 ```
 
 Each run line also carries when it started and ended, how long it took, whether
-it succeeded, failed or timed out (with the engine's error), and the tokens it
+it succeeded, was degraded (some tool calls failed or were denied, with their
+counts), failed or timed out (with the engine's error), and the tokens it
 used (Codex from its event stream, Claude and Gemini from their JSON result,
 Claude with cost, Gemini with cost `null` because `agy` reports none). After
 each round the skill records what it did with every finding (incorporated,
@@ -163,7 +164,8 @@ acceptance rate per engine and model. A finding with no reason stores `null`
 (older lines may hold `""`, read as the same thing). Successful research runs
 and legacy `--record` runs are listed in their own section, not in the audits
 table; failed or timed-out runs of any mode are counted in the failed section,
-apart from each other by mode. If a round's findings were never recorded, the
+apart from each other by mode. A degraded run is a published audit: it stays in
+the audits table and is also counted on its own line. If a round's findings were never recorded, the
 next `ExitPlanMode` hook call notes it as unknown and `--stats` counts those
 rounds apart, so they never skew the rates.
 

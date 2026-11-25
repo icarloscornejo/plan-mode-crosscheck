@@ -2,6 +2,29 @@
 
 All notable changes to Plan Mode Crosscheck. Follows SemVer.
 
+## 3.12.0
+
+An audit whose engine could not read the repo is no longer logged as a success.
+
+- **Failed when no tool call worked.** Codex 0.166.0 failed every tool call on
+  2026-11-24 ("timed out negotiating with the code-mode host", openai/codex#38816),
+  answered from the prompt alone, and the plugin logged six such audits as
+  `success`. Now a Codex audit where every tool call failed (or started and
+  never finished) ends as `failed`, with that reason in the log, on stderr and
+  in the run line, and no report is published. A command that ran and exited
+  non-zero is not a failed call.
+- **Degraded when some did.** If only some Codex tool calls failed, the report
+  is still published, ends with `crosscheck: N of M tool calls failed in this
+  audit, ...`, and the run line says `status: degraded` with `tool_calls_failed`
+  and `tool_calls_total`. `--stats` counts it as a run and shows how many audits
+  were degraded; `--config check` reports it as `ok`.
+- **Claude and Gemini where they say so.** Neither reports a call total, only
+  denied actions (`permission_denials`, `denied_actions`), so they can end
+  `degraded` with `N tool actions were denied`, never `failed` by this check.
+  An empty answer still fails first.
+- The Codex stream shape is written from Codex's documented event format, not
+  from a captured 0.166.0 run: the selftest fixtures are hand-written.
+
 ## 3.11.0
 
 Model IDs in `/crosscheck-setup` come from the engines themselves, are checked

@@ -396,9 +396,60 @@ claude_usage_json() {
       cost_usd: (.total_cost_usd // null) } end' 2>/dev/null || printf 'null'
 }
 
+# Tool calls of a Codex run, out of its `--json` stream. Prints
+# `<failed> <total> <first error>`. A tool call is a command_execution or
+# mcp_tool_call item. It failed when it started and never completed, or when it
+# completed as `failed` without having run to an exit code (an mcp call, no
+# exit code, or a negative one). A command that ran and exited non-zero is the
+# model's own business, never a failure. Only `error.message` is quoted, never
+# command output (it can be repo content). Items without an id still count one
+# by one. The stream is read line by line like codex_usage_json, so one
+# non-JSON line cannot make the counts silently zero.
+codex_tool_calls() {
+  jq -R -c 'fromjson? | select(type == "object")' "$1" 2>/dev/null | jq -rs '
+    def tool: (.item | type) == "object" and (.item.type == "command_execution" or .item.type == "mcp_tool_call");
+    [.[] | select((.type == "item.started" or .type == "item.completed") and tool)] as $events
+    | [$events[] | select(.type == "item.completed")] as $done
+    | ([$events[] | select(.type == "item.started" and (.item.id | type) == "string") | .item.id] | unique) as $started
+    | ([$done[] | select((.item.id | type) == "string") | .item.id] | unique) as $ended
+    | ($started - $ended | length) as $never
+    | [$done[] | select(.item.status == "failed"
+        and (.item.type == "mcp_tool_call" or .item.exit_code == null or ((.item.exit_code | type) == "number" and .item.exit_code < 0)))] as $failed_done
+    | "\(($failed_done | length) + $never) \(($done | length) + $never) \(([$failed_done[] | .item.error.message // empty] | first) // "tool call failed")"' 2>/dev/null
+}
+
+# How an audit that published a report ended, from its failed and total tool
+# calls. $1 = failed count, $2 = total ("" when the engine does not say):
+# prints failed (every call failed, only knowable with a total), degraded
+# (some failed or were denied) or ok.
+tool_call_verdict() {
+  if [ -n "${2:-}" ] && [ "$1" -gt 0 ] && [ "$1" -ge "$2" ]; then echo failed
+  elif [ "$1" -gt 0 ]; then echo degraded
+  else echo ok
+  fi
+}
+
+# The line a degraded report carries. $1 = failed count, $2 = total ("" when
+# unknown: Claude and Gemini only report denied actions).
+degraded_caveat() {
+  if [ -n "${2:-}" ]; then
+    printf 'crosscheck: %s of %s tool calls failed in this audit, parts of the repo may not have been read.' "$1" "$2"
+  else
+    printf 'crosscheck: %s tool actions were denied in this audit, parts of the repo may not have been read.' "$1"
+  fi
+}
+
+# run_extra_json for a degraded audit, plus the tool call counts. $1 = start
+# epoch, $2 = end epoch, $3 = usage JSON, $4 = scope, $5 = failed count,
+# $6 = total (empty when unknown, recorded as null).
+degraded_extra_json() {
+  run_extra_json degraded "$1" "$2" "" "$3" "$4" \
+    | jq -c --argjson failed "$5" --argjson total "${6:-null}" '. + {tool_calls_failed: $failed, tool_calls_total: $total}' 2>/dev/null || printf '{}'
+}
+
 # Extra fields for a `run` metrics line: when it started and ended, how long it
 # took, how it ended and the engine's token usage. $1 = status
-# (success|failed|timeout), $2 = start epoch, $3 = end epoch, $4 = error text
+# (success|degraded|failed|timeout), $2 = start epoch, $3 = end epoch, $4 = error text
 # (may be empty), $5 = usage JSON or null, $6 = scope (full|delta, default
 # full). The error is one line, capped: an
 # engine message, never the prompt or the report.
@@ -1010,7 +1061,7 @@ cmd_check() {
     case "$engine_name" in claude) model="$claude_model" ;; codex) model="$codex_model" ;; *) model="$gemini_model" ;; esac
     run_line="$(jq -c --arg e "$engine_name" 'select(.type == "run" and .engine == $e)' "$check_dir/metrics.jsonl" 2>/dev/null | tail -n 1)"
     status="$(printf '%s' "$run_line" | jq -r '.status // empty' 2>/dev/null)"
-    if [ "$status" = "success" ]; then
+    if [ "$status" = "success" ] || [ "$status" = "degraded" ]; then
       first_line="$(head -n 1 "$check_dir/$engine_name.out" 2>/dev/null)"
       ran=""
       if [[ "$first_line" =~ ^crosscheck-model:\ [a-z]+\ ran\ ([^\ ]+)\ \( ]] && [ "${BASH_REMATCH[1]}" != "unknown" ]; then
@@ -1417,8 +1468,18 @@ cmd_run() {
     fi
     # agy's result and log name no model, so with `default` it stays unknown.
     set_model_line gemini "$engine_model" ""
-    publish_report "$mode" "$hash" "$artifact_file" "$gemini_body" "gemini" "$round" "$engine_model" "$engine_effort" \
-      "$(run_extra_json success "$run_started" "$run_ended" "" "$gemini_usage" "$scope")"
+    # Denied actions (a shell command agy cannot approve) mean parts of the
+    # task went unread. agy gives no call total, so this can only degrade.
+    local gemini_denied_count gemini_extra
+    gemini_denied_count="$(jq -r '[.denied_actions[]?] | length' <<<"$gemini_result" 2>/dev/null)"
+    [[ "$gemini_denied_count" =~ ^[0-9]+$ ]] || gemini_denied_count=0
+    gemini_extra="$(run_extra_json success "$run_started" "$run_ended" "" "$gemini_usage" "$scope")"
+    if [ "$gemini_denied_count" -gt 0 ]; then
+      gemini_body="$gemini_body"$'\n\n'"$(degraded_caveat "$gemini_denied_count" "")"
+      gemini_extra="$(degraded_extra_json "$run_started" "$run_ended" "$gemini_usage" "$scope" "$gemini_denied_count" "")"
+      log "run ($mode) engine=gemini degraded: $gemini_denied_count denied actions"
+    fi
+    publish_report "$mode" "$hash" "$artifact_file" "$gemini_body" "gemini" "$round" "$engine_model" "$engine_effort" "$gemini_extra"
     rc=$?
     [ $rc -eq 0 ] || record_failed_run "$mode" gemini "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$gemini_usage" "$scope"
     return $rc
@@ -1467,8 +1528,20 @@ cmd_run() {
       return 1
     fi
     set_model_line claude "$engine_model" "$([ -n "$claude_result" ] && claude_ran_model "$claude_result")"
-    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" \
-      "$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage" "$scope")"
+    # Tool actions the read-only sandbox denied. claude -p gives no call
+    # total, so this can only degrade. Plain-text output has no such list.
+    local claude_denied_count=0 claude_extra
+    if [ -n "$claude_result" ]; then
+      claude_denied_count="$(printf '%s' "$claude_result" | jq -r '[.permission_denials[]?] | length' 2>/dev/null)"
+      [[ "$claude_denied_count" =~ ^[0-9]+$ ]] || claude_denied_count=0
+    fi
+    claude_extra="$(run_extra_json success "$run_started" "$run_ended" "" "$claude_usage" "$scope")"
+    if [ "$claude_denied_count" -gt 0 ]; then
+      claude_output="$claude_output"$'\n\n'"$(degraded_caveat "$claude_denied_count" "")"
+      claude_extra="$(degraded_extra_json "$run_started" "$run_ended" "$claude_usage" "$scope" "$claude_denied_count" "")"
+      log "run ($mode) engine=claude degraded: $claude_denied_count denied tool actions"
+    fi
+    publish_report "$mode" "$hash" "$artifact_file" "$claude_output" "claude" "$round" "$engine_model" "$engine_effort" "$claude_extra"
     rc=$?
     # The engine ran (and was billed) but the report could not be published:
     # still a failed run in the metrics.
@@ -1509,9 +1582,31 @@ cmd_run() {
   # take several minutes, long enough for an ancestor directory to have been
   # replaced with a symlink since the first check. publish_report repeats the
   # check on its own, which is fine, it's cheap.
+  # The report exists, but did Codex read anything? A Codex whose tool calls
+  # all failed (2026-11-24, "timed out negotiating with the code-mode host")
+  # answers from the prompt alone: that is a failed audit, not a success.
+  local tool_failed=0 tool_total=0 tool_error="" codex_usage codex_extra
+  read -r tool_failed tool_total tool_error <<<"$(codex_tool_calls "$json_file")"
+  [[ "$tool_failed" =~ ^[0-9]+$ ]] || tool_failed=0
+  [[ "$tool_total" =~ ^[0-9]+$ ]] || tool_total=0
+  codex_usage="$(codex_usage_json "$json_file")"
+  local tool_verdict
+  tool_verdict="$(tool_call_verdict "$tool_failed" "$tool_total")"
+  if [ "$tool_verdict" = "failed" ]; then
+    local tool_reason="every tool call failed ($tool_failed of $tool_total): $tool_error"
+    log "run ($mode) engine=codex could not read the repo: $tool_reason"
+    echo "crosscheck --run: codex could not read the repo, $tool_reason. See $STDERR_LOG_FILE." >&2
+    record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "$tool_reason" "$codex_usage" "$scope"
+    return 1
+  fi
+  codex_extra="$(run_extra_json success "$run_started" "$run_ended" "" "$codex_usage" "$scope")"
+  if [ "$tool_verdict" = "degraded" ]; then
+    research_output="$research_output"$'\n\n'"$(degraded_caveat "$tool_failed" "$tool_total")"
+    codex_extra="$(degraded_extra_json "$run_started" "$run_ended" "$codex_usage" "$scope" "$tool_failed" "$tool_total")"
+    log "run ($mode) engine=codex degraded: $tool_failed of $tool_total tool calls failed"
+  fi
   set_model_line codex "$engine_model" "$(codex_ran_model "$json_file")"
-  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort" \
-    "$(run_extra_json success "$run_started" "$run_ended" "" "$(codex_usage_json "$json_file")" "$scope")"
+  publish_report "$mode" "$hash" "$artifact_file" "$research_output" "codex" "$round" "$engine_model" "$engine_effort" "$codex_extra"
   rc=$?
   [ $rc -eq 0 ] || record_failed_run "$mode" codex "$engine_model" "$engine_effort" "$hash" "$round" "$run_started" 1 "publish failed" "$(codex_usage_json "$json_file")" "$scope"
   return $rc
@@ -1965,7 +2060,7 @@ record_missing_findings() {
         ({}; ("\($record.hash) \($record.round)") as $key | .[$key] = ([.[$key] // 0, $record.ts] | max))) as $recorded_at
     | [ .[] | select(type == "object" and .type == "run" and .mode == "plan-review"
           and (.hash | type) == "string" and (.round | type) == "number"
-          and ((.status // "success") == "success") and (.ts | type) == "number" and (.ts <= $now - 120) and (.ts >= $now - 604800))
+          and ((.status // "success") | IN("success", "degraded")) and (.ts | type) == "number" and (.ts <= $now - 120) and (.ts >= $now - 604800))
         | {hash, round, repo, ts} ]
     | group_by([.hash, .round]) | map(max_by(.ts)) | .[]
     | select(($recorded_at["\(.hash) \(.round)"] // 0) < .ts and (.round >= 1) and (.round == (.round | floor)))
@@ -2015,9 +2110,9 @@ map(if .type == "findings" then normalize_outcomes else . end)
 | map(select(.scope != "delta"))
 | (map(select(.type == "run"))) as $all_runs
 | ($all_runs | map(select(.mode == "plan-review" and (.model // "") != ""))) as $audit_runs
-| ($audit_runs | map(select((.status // "success") == "success"))) as $runs
-| ($all_runs | map(select((.status // "success") != "success"))) as $failed_runs
-| ($all_runs | map(select((.mode != "plan-review" or (.model // "") == "") and (.status // "success") == "success"))) as $other_runs
+| ($audit_runs | map(select((.status // "success") | IN("success", "degraded")))) as $runs
+| ($all_runs | map(select(((.status // "success") | IN("success", "degraded")) | not))) as $failed_runs
+| ($all_runs | map(select((.mode != "plan-review" or (.model // "") == "") and ((.status // "success") | IN("success", "degraded"))))) as $other_runs
 | (map(select(.type == "findings")) | group_by([.hash, .round]) | map(last)) as $round_records
 | (map(select(.type == "findings")) | group_by(.hash) | map(last)) as $rounds
 | ($rounds | map(select(((.engines // "") | contains(",") | not) and .engines != "both"))) as $single_rounds
@@ -2029,6 +2124,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
     "Planes con mas de una ronda: \($rounds | map(select(.round == 2)) | length)",
     "Auditorias por motor y modelo:",
     ($runs | group_by([.engine, .model]) | .[] | "  \(.[0].engine) \(.[0].model): \(length)\(averages)"),
+    "Auditorias degradadas: \($runs | map(select(.status == "degraded")) | length)",
     "Corridas fallidas o con timeout: \($failed_runs | length)",
     ($failed_runs | group_by([(.mode == "plan-review" and (.model // "") != ""), .mode, .engine, .model]) | .[]
       | "  \(.[0].engine) \(.[0].model)\(if .[0].mode == "plan-review" and (.[0].model // "") != "" then "" else " (\(.[0].mode // "?"))" end): \(length) (timeout: \(map(select(.status == "timeout")) | length))"),
@@ -2070,7 +2166,7 @@ map(if .type == "findings" then normalize_outcomes else . end)
           | "    \(if $source | contains("+") then $source else "solo " + $source end): \(severity_line($mine)) (critical+high: \(critical_high($mine)))")),
     "Rondas acotadas (delta): \($delta_rounds | length)",
     ($delta_runs | group_by([.engine, .model]) | .[]
-      | (map(select((.status // "success") == "success"))) as $succeeded
+      | (map(select((.status // "success") | IN("success", "degraded")))) as $succeeded
       | "  \(.[0].engine) \(.[0].model): \($succeeded | length) corridas, \(length - ($succeeded | length)) fallidas\($succeeded | averages)"),
     ($delta_rounds | count_rows as $rows | "  hallazgos: \(severity_line($rows)) (critical+high: \(critical_high($rows)))")
   ] | .[]
@@ -2289,6 +2385,7 @@ case "$mode" in
     emit_json ERROR "" '{"error":"authentication required: run agy and sign in"}'
     exit 1 ;;
   emptysuccess) emit_json SUCCESS "" '{"denied_actions":[{"action":"command"}]}' ;;
+  denied_ok) emit_json SUCCESS "$nonce_line"$'\n'"$finding_body" '{"denied_actions":[{"action":"command"},{"action":"command"}]}' ;;
   printtimeout)
     emit_json ERROR "" '{"error":"print timeout reached","finished_reason":"print_timeout"}'
     exit 3 ;;
@@ -3383,6 +3480,99 @@ AGY_STUB_EOF
   check "usage: a failed codex run still writes a run line with status failed" "$(jq -r '"\(.status) \(.hash)"' "$usage_metrics" | tail -1)" "failed a11ce04"
   check "usage: a failed run records the engine error" "$(jq -r '.error' "$usage_metrics" | tail -1)" "model not supported on this account"
   check "usage: a failed run does not mark the hash reviewed" "$([ -s "$usage_root/state/plan-a11ce04.state" ] && echo yes || echo no)" "no"
+
+  # 41b. An engine that ran but could not read the repo. The streams below are
+  #      written by hand after the 2026-11-24 Codex 0.166.0 failure ("timed out
+  #      negotiating with the code-mode host"): no live Codex call is made.
+  #      Every tool call failed -> failed; some failed -> degraded, published
+  #      with a caveat line; a command that ran and exited non-zero is the
+  #      model's own business and never counts.
+  local tool_stub="$tmp_home/toolstub" tool_metrics="$usage_root/metrics.jsonl" tool_host_error="timed out negotiating with the code-mode host"
+  local tool_name
+  for tool_name in allfailed neverended partial exitcode noids; do mkdir -p "$tool_stub/$tool_name"; done
+  tool_codex_stub() { # $1 = dir name; stdin = the stream, one JSON object per line
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'cat >/dev/null'
+      while IFS= read -r tool_line; do printf '%s\n' "printf '%s\n' '$tool_line'"; done
+    } >"$tool_stub/$1/codex"
+    chmod +x "$tool_stub/$1/codex"
+  }
+  tool_mcp_failed() { jq -nc --arg id "$1" --arg m "$tool_host_error" '{type:"item.completed", item:{id:$id, type:"mcp_tool_call", status:"failed", error:{message:$m}}}'; }
+  tool_cmd_done() { jq -nc --arg id "$1" --argjson code "$2" --arg status "$3" '{type:"item.completed", item:{id:$id, type:"command_execution", status:$status, exit_code:$code, aggregated_output:"SECRETREPOTEXT"}}'; }
+  tool_message() { jq -nc '{type:"item.completed", item:{type:"agent_message", text:"codex tool finding"}}'; }
+  {
+    tool_mcp_failed t1; tool_mcp_failed t2; tool_cmd_done t3 null failed; tool_message
+  } | tool_codex_stub allfailed
+  {
+    jq -nc '{type:"item.started", item:{id:"t1", type:"command_execution", status:"in_progress"}}'
+    jq -nc '{type:"item.started", item:{id:"t2", type:"mcp_tool_call", status:"in_progress"}}'
+    tool_message
+  } | tool_codex_stub neverended
+  {
+    tool_mcp_failed t1; tool_mcp_failed t2; tool_cmd_done t3 0 completed; tool_cmd_done t4 0 completed; tool_message
+  } | tool_codex_stub partial
+  {
+    tool_cmd_done t1 1 failed; tool_cmd_done t2 2 failed; tool_message
+  } | tool_codex_stub exitcode
+  {
+    jq -nc '{type:"item.completed", item:{type:"mcp_tool_call", status:"failed", error:{message:"x"}}}'
+    jq -nc '{type:"item.completed", item:{type:"command_execution", status:"completed", exit_code:0}}'
+    tool_message
+  } | tool_codex_stub noids
+  local tool_hash tool_out tool_err tool_rc
+  tool_run() { # $1 = stub dir name, $2 = hash
+    tool_err="$("${usage_env[@]}" PATH="$tool_stub/$1:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash "$2" 2>&1 >"$tmp_home/tool.out")"
+    tool_rc=$?
+    tool_out="$(cat "$tmp_home/tool.out")"
+  }
+  tool_run allfailed b0071
+  check "tool calls: every call failed exits nonzero" "$([ "$tool_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "tool calls: every call failed ends as failed with the reason" "$(jq -r 'select(.hash == "b0071") | "\(.status) \(.error | contains("every tool call failed (3 of 3)")) \(.error | contains("code-mode host"))"' "$tool_metrics" | tail -1)" "failed true true"
+  check "tool calls: the reason reaches the user on stderr" "$(printf '%s' "$tool_err" | grep -c 'every tool call failed (3 of 3)')" "1"
+  check "tool calls: command output never reaches the metrics line" "$(grep -c 'SECRETREPOTEXT' "$tool_metrics")" "0"
+  check "tool calls: every call failed publishes no report and marks nothing reviewed" "$(printf '%s' "$tool_out" | grep -c 'codex tool finding')/$([ -s "$usage_root/state/plan-b0071.state" ] && echo yes || echo no)" "0/no"
+  tool_run neverended b0072
+  check "tool calls: calls that started and never ended count as failed" "$(jq -r 'select(.hash == "b0072") | "\(.status) \(.error | contains("(2 of 2)"))"' "$tool_metrics" | tail -1)" "failed true"
+  tool_run partial b0073
+  check "tool calls: some calls failed exits 0 and publishes the report" "$tool_rc/$(printf '%s' "$tool_out" | grep -c 'codex tool finding')" "0/1"
+  check "tool calls: some calls failed is degraded with the counts" "$(jq -r 'select(.hash == "b0073") | "\(.status) \(.tool_calls_failed)/\(.tool_calls_total)"' "$tool_metrics" | tail -1)" "degraded 2/4"
+  check "tool calls: the degraded report carries the caveat line" "$(printf '%s' "$tool_out" | grep -c '^crosscheck: 2 of 4 tool calls failed in this audit')" "1"
+  check "tool calls: a degraded report still marks the hash reviewed" "$(jq -r '.status' "$usage_root/state/plan-b0073.state" 2>/dev/null)" "reviewed"
+  tool_run exitcode b0074
+  check "tool calls: commands that ran and exited non-zero are not failures" "$(jq -r 'select(.hash == "b0074") | .status' "$tool_metrics" | tail -1)/$(printf '%s' "$tool_out" | grep -c '^crosscheck: ')" "success/0"
+  tool_run noids b0075
+  check "tool calls: items without an id are still counted, never merged into one" "$(jq -r 'select(.hash == "b0075") | "\(.status) \(.tool_calls_failed)/\(.tool_calls_total)"' "$tool_metrics" | tail -1)" "degraded 1/2"
+  mkdir -p "$tool_stub/claudedenied" "$tool_stub/claudedeniedempty"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"result", is_error:false, result:"claude denied finding", permission_denials:[{tool_name:"Bash"},{tool_name:"Bash"}], usage:{input_tokens:1, output_tokens:1}}')'"
+  } >"$tool_stub/claudedenied/claude"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'cat >/dev/null'
+    printf '%s\n' "printf '%s\n' '$(jq -nc '{type:"result", is_error:false, result:"", permission_denials:[{tool_name:"Bash"}], usage:{input_tokens:1, output_tokens:1}}')'"
+  } >"$tool_stub/claudedeniedempty/claude"
+  chmod +x "$tool_stub"/claude*/claude
+  tool_err="$("${usage_env[@]}" PATH="$tool_stub/claudedenied:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash b0076 2>&1 >"$tmp_home/tool.out")"
+  tool_out="$(cat "$tmp_home/tool.out")"
+  check "tool calls: claude with denied tool actions is degraded, total unknown" "$(jq -r 'select(.hash == "b0076") | "\(.status) \(.tool_calls_failed)/\(.tool_calls_total)"' "$tool_metrics" | tail -1)" "degraded 2/null"
+  check "tool calls: the claude caveat line names the denied actions" "$(printf '%s' "$tool_out" | grep -c '^crosscheck: 2 tool actions were denied in this audit')" "1"
+  "${usage_env[@]}" PATH="$tool_stub/claudedeniedempty:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash b0077 >/dev/null 2>&1
+  check "tool calls: the caveat never turns an empty claude answer into a published report" "$(jq -r 'select(.hash == "b0077") | "\(.status) \(.error)"' "$tool_metrics" | tail -1)" "failed empty output"
+
+  # 41c. Stats: a degraded run is a published run, not a failure.
+  local stats_degraded="$tmp_home/stats-degraded.jsonl"
+  {
+    echo '{"type":"run","ts":1,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"d1","repo":"r","status":"success","duration_s":40}'
+    echo '{"type":"run","ts":2,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"d2","repo":"r","status":"degraded","duration_s":20,"tool_calls_failed":2,"tool_calls_total":4}'
+    echo '{"type":"run","ts":3,"mode":"plan-review","engine":"codex","model":"gpt-a","effort":"medium","round":1,"hash":"d3","repo":"r","status":"failed","error":"every tool call failed (3 of 3)"}'
+  } >"$stats_degraded"
+  out="$("$run" --stats "$stats_degraded")"
+  check "stats: a degraded run counts in the audits table" "$(printf '%s' "$out" | grep -c '^  codex gpt-a: 2 ')" "1"
+  check "stats: a degraded run is not counted as failed" "$(printf '%s' "$out" | grep -c '^Corridas fallidas o con timeout: 1$')" "1"
+  check "stats: degraded runs get their own line" "$(printf '%s' "$out" | grep -c '^Auditorias degradadas: 1$')" "1"
   "${usage_env[@]}" PATH="$usage_stub/codextimeout:$PATH" "$run" --run --mode plan-review --prompt-file "$usage_prompt" --hash a11ce05 >/dev/null 2>&1
   check "usage: a timeout is recorded as timeout" "$(jq -r '.status' "$usage_metrics" | tail -1)" "timeout"
   "${usage_env[@]}" PATH="$usage_stub/claudeerror:$usage_stub/codexok:$PATH" "$run" --run --engine claude --mode plan-review --prompt-file "$usage_prompt" --hash a11ce06 >/dev/null 2>&1
@@ -4061,6 +4251,12 @@ TIMEOUT_K_EOF
   gem_expect_fail "gemini non-JSON output" nonjson 9e1a0074 failed "no JSON"
   gem_expect_fail "gemini exit 1 with no output" rc1 9e1a0075 failed "exited 1"
   gem_expect_fail "gemini killed by the outer timeout (exit 124)" rc124 9e1a0076 timeout "timeout"
+  agy_mode denied_ok
+  gem_out="$(gem_run --hash 9e1a0079 2>"$gem_err")"
+  gem_rc=$?
+  check "gemini denied actions with a real answer: published as degraded, total unknown" "$gem_rc/$(gem_last '"\(.status) \(.tool_calls_failed)/\(.tool_calls_total)"')" "0/degraded 2/null"
+  check "gemini denied actions: the caveat line follows the report" "$(printf '%s' "$gem_out" | grep -c '^crosscheck: 2 tool actions were denied in this audit')" "1"
+  check "gemini denied actions: the hash is still reviewed" "$(gem_state 9e1a0079)" "reviewed"
   check "gemini failure: the run line keeps the usage tokens when agy printed them" "$(agy_mode printtimeout; gem_run --hash 9e1a0077 >/dev/null 2>&1; gem_last '"\(.input_tokens)/\(.output_tokens)"')" "100/40"
   check "gemini failure: the run line error is the agy error text, one capped line" "$(agy_mode error; gem_run --hash 9e1a0078 >/dev/null 2>&1; gem_last '.error | select(. != null) | if (length <= 300 and (contains("\n") | not) and contains("authentication required")) then "ok" else "bad" end')" "ok"
   #     A failed engine never blocks another: a later good run of the same hash publishes.
@@ -4446,7 +4642,7 @@ MM_CLAUDE_EOF
   check "CHANGELOG has a 3.10.0 entry that mentions agy" "$(awk '/^## 3\.10\.0/{f=1; next} /^## /{f=0} f' "$changelog_md" 2>/dev/null | grep -c -F 'agy' | awk '{print ($1 > 0) ? "yes" : "no"}')" "yes"
   check "how-it-works says shell is denied for Gemini" "$(tr -s '[:space:]' ' ' <"$(dirname "$run")/../docs/how-it-works.md" 2>/dev/null | grep -q -F 'denies every shell command' && echo yes || echo no)" "yes"
   check "plugin.json version equals the CHANGELOG top entry" "$(jq -r '.version' "$plugin_json" 2>/dev/null)" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')"
-  check "the CHANGELOG top entry is 3.11.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.11.0"
+  check "the CHANGELOG top entry is 3.12.0" "$(grep -m1 '^## ' "$changelog_md" 2>/dev/null | sed -E 's/^## ([0-9.]+).*/\1/')" "3.12.0"
 
   # 54. Hygiene: the sentinel agy was never called, so no test above reached
   #     a real or unstubbed Antigravity CLI.

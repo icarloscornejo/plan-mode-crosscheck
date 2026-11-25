@@ -228,6 +228,9 @@ it yourself): `! crosscheck --skip --hash <hash> --manual`, or
    e. **On success:** for each engine the tool result is either the full
       report (small reports inline directly) or a note pointing at an
       artifact file (large reports do not inline, `Read` that file instead).
+      A report that ends with a line starting `crosscheck: ` and naming failed
+      or denied tool calls is a degraded audit: say so at the top of that
+      engine's findings, with the line's numbers.
       Follow "Relaying a round's findings" below,
       then "Recommending: one more round, or show the plan" to decide what
       happens next. If a finding changes the plan, fix the root: the same defect in
@@ -526,7 +529,8 @@ first.
    items in severity order where the auditor itself classified them that way
    (typically within "Edge cases and risks"). With several engines, give one answer
    with that same structure, merging the reports and marking where the
-   engines disagreed.
+   engines disagreed. A report ending with a `crosscheck: ` line about failed
+   or denied tool calls is degraded: say so with its numbers.
 
    **Exception, a plan audit round:** when the request carries a `ROUND:`
    line and `PRIOR ROUNDS` (the shape Doer sends) and the reports carry
